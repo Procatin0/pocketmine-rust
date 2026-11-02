@@ -8,3 +8,10 @@ bedrock-protocol = { path = "../bedrock-protocol" }
 bedrock-world = { path = "../bedrock-world" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1.92"
+

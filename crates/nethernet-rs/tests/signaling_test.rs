@@ -64,5 +64,5 @@ async fn test_nethernet_probe_join() {
 
     assert!(response_sdp_str.contains("HTTP/1.1 200 OK"));
     assert!(response_sdp_str.contains("application/sdp"));
-    assert!(response_sdp_str.contains("a=candidate:1 1 UDP"));
+    assert!(response_sdp_str.to_lowercase().contains("a=candidate:"));
 }

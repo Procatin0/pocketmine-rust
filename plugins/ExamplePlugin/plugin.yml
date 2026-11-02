@@ -1,0 +1,11 @@
+name: ExamplePlugin
+version: "1.0.0"
+main: pocketmine\example\Main
+api: ["4.0.0", "5.0.0"]
+author: Antigravity
+description: Test PocketMine plugin loaded by Rust core
+commands:
+  hello:
+    description: Says hello from plugin
+    usage: /hello
+    aliases: ["hi"]

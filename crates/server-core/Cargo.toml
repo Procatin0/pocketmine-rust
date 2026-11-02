@@ -8,6 +8,7 @@ bedrock-protocol = { path = "../bedrock-protocol" }
 nethernet-rs = { path = "../nethernet-rs" }
 raklib-rs = { path = "../raklib-rs" }
 bedrock-world = { path = "../bedrock-world" }
+php-plugin-bridge = { path = "../php-plugin-bridge" }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

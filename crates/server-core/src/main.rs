@@ -49,7 +49,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_manager = Arc::new(SessionManager::new());
     info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
-    // 3. Iniciar listener de RakNet en UDP 19132 (fallback para clientes sin NetherNet)
+    // 3. Inicializar motor y puente de plugins (php-plugin-bridge)
+    let plugin_manager = Arc::new(php_plugin_bridge::PluginManager::new());
+    let _ = plugin_manager.init_runtime().await;
+    match plugin_manager.load_plugins_from_directory("plugins").await {
+        Ok(count) => {
+            info!("PluginManager loaded {} plugin(s) from 'plugins/'", count);
+            if let Err(e) = plugin_manager.enable_plugins().await {
+                tracing::error!("Failed enabling plugins: {}", e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Could not load plugins directory: {}", e);
+        }
+    }
+
+    // 4. Iniciar listener de RakNet en UDP 19132 (fallback para clientes sin NetherNet)
     let server_id: u64 = 0x12345678_aabbccdd;
     let raknet_port = 19132;
     let raknet_addr: SocketAddr = format!("0.0.0.0:{}", raknet_port).parse()?;
@@ -92,10 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(" -> UDP 19132: RakNet Fallback Transport");
     info!(" -> TCP 19133: CLOSED (WebRTC is UDP-only, matches Axolotl)");
     info!(" -> Whitelist: DISABLED");
+    info!(" -> Plugins: READY ({} active)", plugin_manager.plugin_count());
     info!("============================================================");
 
     // Mantener corriendo hasta Ctrl+C
     tokio::signal::ctrl_c().await?;
     info!("Shutting down server gracefully.");
+    let _ = plugin_manager.disable_plugins().await;
     Ok(())
 }
