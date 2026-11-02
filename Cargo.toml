@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/bedrock-protocol",
+    "crates/nethernet-rs",
     "crates/raklib-rs",
     "crates/bedrock-world",
     "crates/server-core",
