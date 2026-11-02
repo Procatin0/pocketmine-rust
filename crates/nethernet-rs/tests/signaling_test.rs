@@ -1,5 +1,6 @@
-use nethernet_rs::{ServerInfo, SignalingServer};
+use nethernet_rs::{NetherNetIdentity, ServerInfo, SignalingServer};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -16,7 +17,8 @@ async fn test_nethernet_probe_join() {
         ..Default::default()
     };
 
-    let server = SignalingServer::new(local_addr, info, 19132);
+    let identity = Arc::new(NetherNetIdentity::new());
+    let server = SignalingServer::new(local_addr, info, 19132, identity);
     tokio::spawn(async move {
         server.run().await.unwrap();
     });

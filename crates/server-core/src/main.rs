@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
-use nethernet_rs::{ServerInfo, SignalingServer};
+use nethernet_rs::{NetherNetIdentity, ServerInfo, SignalingServer};
 use raklib_rs::{RakNetEvent, RakNetListener};
 use server_core::{ServerConfig, SessionManager};
 
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_info = ServerInfo {
         name: config.motd.clone(),
         max_players: config.max_players,
-        online_auth: false,
+        online_auth: true,
         self_signed_auth: true,
         whitelist: false,
         allow_list: false,
@@ -35,10 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let udp_ports = vec![19133, 19132];
 
+    let identity = Arc::new(NetherNetIdentity::new());
     let signaling_server = SignalingServer::with_multiple_ports(
         signaling_addrs,
         server_info,
         udp_ports.clone(),
+        identity,
     );
     tokio::spawn(async move {
         if let Err(e) = signaling_server.run().await {
