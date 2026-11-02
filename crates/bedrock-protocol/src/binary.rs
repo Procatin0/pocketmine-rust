@@ -60,6 +60,25 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn read_u32_be(&mut self) -> Result<u32, CodecError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn read_i64_le(&mut self) -> Result<i64, CodecError> {
+        let b = self.read_bytes(8)?;
+        Ok(i64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    pub fn read_u64_le(&mut self) -> Result<u64, CodecError> {
+        let b = self.read_bytes(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
     pub fn read_f32_le(&mut self) -> Result<f32, CodecError> {
         let b = self.read_bytes(4)?;
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -86,10 +105,37 @@ impl<'a> Reader<'a> {
         Ok(((raw >> 1) as i32) ^ (-((raw & 1) as i32)))
     }
 
+    pub fn read_var_u64(&mut self) -> Result<u64, CodecError> {
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = self.read_byte()?;
+            value |= ((byte & 0x7F) as u64) << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+            if shift >= 70 {
+                return Err(CodecError::InvalidVarInt);
+            }
+        }
+    }
+
+    pub fn read_var_i64(&mut self) -> Result<i64, CodecError> {
+        let raw = self.read_var_u64()?;
+        Ok(((raw >> 1) as i64) ^ (-((raw & 1) as i64)))
+    }
+
     pub fn read_string(&mut self) -> Result<String, CodecError> {
         let len = self.read_var_u32()? as usize;
         let bytes = self.read_bytes(len)?;
         Ok(String::from_utf8(bytes.to_vec())?)
+    }
+
+    pub fn read_byte_array(&mut self) -> Result<Vec<u8>, CodecError> {
+        let len = self.read_var_u32()? as usize;
+        let bytes = self.read_bytes(len)?;
+        Ok(bytes.to_vec())
     }
 
     pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], CodecError> {
@@ -156,6 +202,18 @@ impl Writer {
         self.buf.put_u32_le(val);
     }
 
+    pub fn write_u32_be(&mut self, val: u32) {
+        self.buf.put_u32(val);
+    }
+
+    pub fn write_i64_le(&mut self, val: i64) {
+        self.buf.put_i64_le(val);
+    }
+
+    pub fn write_u64_le(&mut self, val: u64) {
+        self.buf.put_u64_le(val);
+    }
+
     pub fn write_f32_le(&mut self, val: f32) {
         self.buf.put_f32_le(val);
     }
@@ -173,9 +231,27 @@ impl Writer {
         self.write_var_u32(raw);
     }
 
+    pub fn write_var_u64(&mut self, mut value: u64) {
+        while (value & !0x7F) != 0 {
+            self.buf.put_u8(((value & 0x7F) | 0x80) as u8);
+            value >>= 7;
+        }
+        self.buf.put_u8(value as u8);
+    }
+
+    pub fn write_var_i64(&mut self, value: i64) {
+        let raw = ((value << 1) ^ (value >> 63)) as u64;
+        self.write_var_u64(raw);
+    }
+
     pub fn write_string(&mut self, s: &str) {
         self.write_var_u32(s.len() as u32);
         self.buf.put_slice(s.as_bytes());
+    }
+
+    pub fn write_byte_array(&mut self, bytes: &[u8]) {
+        self.write_var_u32(bytes.len() as u32);
+        self.buf.put_slice(bytes);
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {

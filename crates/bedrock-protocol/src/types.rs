@@ -1,6 +1,6 @@
 use crate::binary::{CodecError, Reader, Writer};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector3f {
     pub x: f32,
     pub y: f32,
@@ -27,7 +27,7 @@ impl Vector3f {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct BlockPos {
     pub x: i32,
     pub y: i32,

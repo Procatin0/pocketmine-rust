@@ -5,6 +5,8 @@ pub mod types;
 pub mod packets;
 
 pub use binary::{Reader, Writer};
+pub use packets::*;
+pub use types::*;
 
 pub trait Packet: Send + Sync {
     fn packet_id(&self) -> u32;

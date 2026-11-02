@@ -299,6 +299,7 @@ dependencies = [
  "nethernet-rs",
  "parking_lot",
  "raklib-rs",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

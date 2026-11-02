@@ -2,6 +2,7 @@ use crate::binary::{CodecError, Reader, Writer};
 use crate::Packet;
 
 /// Packet ID 0x05: DisconnectPacket
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectPacket {
     pub reason: i32,
     pub skip_message: bool,

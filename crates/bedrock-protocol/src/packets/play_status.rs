@@ -2,6 +2,7 @@ use crate::binary::{CodecError, Reader, Writer};
 use crate::Packet;
 
 /// Packet ID 0x02: PlayStatusPacket
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayStatusPacket {
     pub status: i32,
 }

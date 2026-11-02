@@ -2,6 +2,7 @@ use crate::binary::{CodecError, Reader, Writer};
 use crate::Packet;
 
 /// Packet ID 0xC1 (193): RequestNetworkSettingsPacket
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestNetworkSettingsPacket {
     pub client_protocol_version: i32,
 }
@@ -24,6 +25,7 @@ impl Packet for RequestNetworkSettingsPacket {
 }
 
 /// Packet ID 0x8F (143): NetworkSettingsPacket
+#[derive(Debug, Clone, PartialEq)]
 pub struct NetworkSettingsPacket {
     pub compression_threshold: u16,
     pub compression_algorithm: u16,

@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::info;
 use nethernet_rs::{ServerInfo, SignalingServer};
 use raklib_rs::RakNetListener;
+use server_core::SessionManager;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,6 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_id: u64 = 0x12345678_aabbccdd;
     let raknet_listener = RakNetListener::bind(raknet_addr, server_id).await?;
     info!("RakNet (Legacy UDP Fallback) active on {}", raknet_listener.local_addr()?);
+
+    // 3. Inicializar gestor de sesiones de jugadores
+    let session_manager = Arc::new(SessionManager::new());
+    info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
     info!("Server is ready for Bedrock clients (NetherNet + RakNet fallback)");
 
