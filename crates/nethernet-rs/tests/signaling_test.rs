@@ -48,8 +48,8 @@ async fn test_nethernet_probe_join() {
     let response_root_str = String::from_utf8(response_root).unwrap();
 
     assert!(response_root_str.contains("HTTP/1.1 200 OK"));
-    assert!(response_root_str.contains("PocketMine-Rust"));
-    assert!(response_root_str.contains("text/html"));
+    assert!(response_root_str.contains("Test PocketMine-Rust Server"));
+    assert!(response_root_str.contains("application/json"));
 
     // 3. Send HTTP POST /v1/join/12345678 (SDP offer negotiation)
     let mut client_sdp = TcpStream::connect(local_addr).await.unwrap();

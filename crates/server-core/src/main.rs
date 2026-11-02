@@ -20,58 +20,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_info = ServerInfo {
         name: config.motd.clone(),
         max_players: config.max_players,
-        online_auth: config.xbox_auth,
+        online_auth: false,
+        self_signed_auth: true,
+        whitelist: false,
+        allow_list: false,
         ..Default::default()
     };
 
-    // 1. Iniciar transporte primario: NetherNet HTTP Signaling (WebRTC)
-    if config.builtin_signaling_enabled {
-        let nethernet_addr: SocketAddr = format!("0.0.0.0:{}", config.signaling_port_tcp).parse()?;
-        let signaling_server = SignalingServer::new(nethernet_addr, server_info, config.server_port_udp);
-        tokio::spawn(async move {
-            if let Err(e) = signaling_server.run().await {
-                tracing::error!("NetherNet Signaling Server failed: {}", e);
-            }
-        });
-        info!("NetherNet (Primary WebRTC Transport) active on TCP :{}", config.signaling_port_tcp);
-    }
+    // 1. Iniciar transporte primario: NetherNet HTTP Signaling en AMBOS puertos (19132 y 19133)
+    // para garantizar conectividad total sin importar cuál puerto configure el cliente
+    let signaling_addrs: Vec<SocketAddr> = vec![
+        "0.0.0.0:19132".parse()?,
+        "0.0.0.0:19133".parse()?,
+    ];
+    let udp_ports = vec![19133, 19132];
 
-    // 2. Iniciar transporte secundario / fallback: RakNet UDP (puerto diferente al TCP)
-    let raknet_addr: SocketAddr = format!("0.0.0.0:{}", config.server_port_udp).parse()?;
-    let server_id: u64 = 0x12345678_aabbccdd;
-    let raknet_listener = Arc::new(RakNetListener::bind(raknet_addr, server_id).await?);
-    raknet_listener.set_motd(format!(
-        "MCPE;{};748;1.21.20;0;{};{};Survival;1;{};{};",
-        config.motd, config.max_players, server_id, config.server_port_udp, config.server_port_v6_udp
-    ));
+    let signaling_server = SignalingServer::with_multiple_ports(
+        signaling_addrs,
+        server_info,
+        udp_ports.clone(),
+    );
+    tokio::spawn(async move {
+        if let Err(e) = signaling_server.run().await {
+            tracing::error!("NetherNet Signaling Server failed: {}", e);
+        }
+    });
 
-    // 3. Inicializar gestor de sesiones de jugadores
+    // 2. Inicializar gestor de sesiones de jugadores
     let session_manager = Arc::new(SessionManager::new());
     info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
-    let raknet_runner = Arc::clone(&raknet_listener);
-    let session_mgr = Arc::clone(&session_manager);
-    tokio::spawn(async move {
-        loop {
-            match raknet_runner.poll_event().await {
-                Ok(event) => match event {
-                    RakNetEvent::Offline { packet, src, .. } => {
-                        tracing::info!("RakNet Offline Handshake from {}: {:?}", src, packet);
-                        let _ = session_mgr.create_session(src);
+    // 3. Iniciar listeners de UDP gameplay (RakNet / WebRTC) en ambos puertos
+    let server_id: u64 = 0x12345678_aabbccdd;
+    for &port in &udp_ports {
+        let raknet_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+        let listener = match RakNetListener::bind(raknet_addr, server_id).await {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
+                tracing::warn!("Could not bind RakNet on UDP port {}: {}", port, e);
+                continue;
+            }
+        };
+
+        listener.set_motd(format!(
+            "MCPE;{};2225;1.26.60;0;{};{};Survival;1;{};{};",
+            config.motd, config.max_players, server_id, port, port
+        ));
+
+        let raknet_runner = Arc::clone(&listener);
+        let session_mgr = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            loop {
+                match raknet_runner.poll_event().await {
+                    Ok(event) => match event {
+                        RakNetEvent::Offline { packet, src, .. } => {
+                            tracing::info!("RakNet Offline Handshake on :{} from {}: {:?}", port, src, packet);
+                            let _ = session_mgr.create_session(src);
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("RakNet listener error on : {}: {}", port, e);
                     }
-                },
-                Err(e) => {
-                    tracing::warn!("RakNet listener error: {}", e);
                 }
             }
-        }
-    });
-    info!("RakNet (UDP Transport) active on {}", raknet_listener.local_addr()?);
+        });
+        info!("RakNet (UDP Transport) active on :{}", port);
+    }
 
     info!("============================================================");
-    info!(" Server READY: Connect your Bedrock client to:");
-    info!(" -> UDP Gameplay (RakNet):  port {}", config.server_port_udp);
-    info!(" -> TCP Signaling (NetherNet): port {}", config.signaling_port_tcp);
+    info!(" Server READY on ALL Bedrock ports:");
+    info!(" -> TCP Signaling: listening on 19132 & 19133 (returns JSON)");
+    info!(" -> UDP Gameplay:  listening on 19132 & 19133 (WebRTC/RakNet)");
+    info!(" -> Whitelist:     DISABLED (OFF)");
     info!("============================================================");
 
     // Mantener corriendo hasta Ctrl+C
