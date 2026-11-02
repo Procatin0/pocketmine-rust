@@ -55,6 +55,11 @@ impl<'a> Reader<'a> {
         Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn read_u32_le(&mut self) -> Result<u32, CodecError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     pub fn read_f32_le(&mut self) -> Result<f32, CodecError> {
         let b = self.read_bytes(4)?;
         Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -145,6 +150,10 @@ impl Writer {
 
     pub fn write_i32_le(&mut self, val: i32) {
         self.buf.put_i32_le(val);
+    }
+
+    pub fn write_u32_le(&mut self, val: u32) {
+        self.buf.put_u32_le(val);
     }
 
     pub fn write_f32_le(&mut self, val: f32) {

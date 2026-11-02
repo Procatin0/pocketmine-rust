@@ -22,6 +22,7 @@ dependencies = [
 name = "bedrock-world"
 version = "0.1.0"
 dependencies = [
+ "bedrock-protocol",
  "bytes",
  "parking_lot",
  "thiserror",

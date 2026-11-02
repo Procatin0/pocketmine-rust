@@ -1,10 +1,14 @@
+use crate::network::{self, SubChunkNetworkError};
 use crate::paletted_block_array::PalettedBlockArray;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubChunk {
     pub layers: Vec<PalettedBlockArray>,
 }
 
 impl SubChunk {
+    pub const CURRENT_VERSION: u8 = network::CURRENT_VERSION;
+
     pub fn new(fill_entry: u32) -> Self {
         Self {
             layers: vec![PalettedBlockArray::new(fill_entry)],
@@ -23,5 +27,28 @@ impl SubChunk {
             self.layers.resize_with(layer + 1, || PalettedBlockArray::new(0));
         }
         self.layers[layer].set(x, y, z, block_id);
+    }
+
+    /// Serializes this SubChunk into network format as a byte vector.
+    pub fn serialize_network(&self) -> Vec<u8> {
+        let mut writer = bedrock_protocol::Writer::new();
+        network::serialize_subchunk(self, &mut writer);
+        writer.into_bytes().to_vec()
+    }
+
+    /// Serializes this SubChunk into the provided `bedrock_protocol::Writer`.
+    pub fn serialize_network_to(&self, writer: &mut bedrock_protocol::Writer) {
+        network::serialize_subchunk(self, writer);
+    }
+
+    /// Deserializes a SubChunk from network format bytes.
+    pub fn deserialize_network(data: &[u8]) -> Result<Self, SubChunkNetworkError> {
+        let mut reader = bedrock_protocol::Reader::new(data);
+        network::deserialize_subchunk(&mut reader)
+    }
+
+    /// Deserializes a SubChunk from a `bedrock_protocol::Reader`.
+    pub fn deserialize_network_from(reader: &mut bedrock_protocol::Reader) -> Result<Self, SubChunkNetworkError> {
+        network::deserialize_subchunk(reader)
     }
 }

@@ -1,4 +1,5 @@
 /// PalettedBlockArray for Bedrock subchunks (4096 blocks = 16x16x16)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PalettedBlockArray {
     bits_per_block: u8,
     words: Vec<u32>,
@@ -47,6 +48,21 @@ impl PalettedBlockArray {
         }
     }
 
+    pub fn words_count_for_bpb(bpb: u8) -> Option<usize> {
+        match bpb {
+            0 => Some(0),
+            1 => Some(128),
+            2 => Some(256),
+            3 => Some(410),
+            4 => Some(512),
+            5 => Some(683),
+            6 => Some(820),
+            8 => Some(1024),
+            16 => Some(2048),
+            _ => None,
+        }
+    }
+
     fn check_resize(&mut self) {
         let palette_len = self.palette.len();
         let needed_bits = match palette_len {
@@ -57,7 +73,8 @@ impl PalettedBlockArray {
             9..=16 => 4,
             17..=32 => 5,
             33..=64 => 6,
-            _ => 8,
+            65..=256 => 8,
+            _ => 16,
         };
 
         if needed_bits > self.bits_per_block {
@@ -70,15 +87,19 @@ impl PalettedBlockArray {
         let old_words = std::mem::take(&mut self.words);
         self.bits_per_block = new_bits;
 
-        let words_count = (Self::SIZE * new_bits as usize + 31) / 32;
+        let words_count = Self::words_count_for_bpb(new_bits).unwrap_or_else(|| {
+            let bpw = 32 / new_bits.max(1) as usize;
+            (Self::SIZE + bpw - 1) / bpw
+        });
         self.words = vec![0u32; words_count];
 
         if old_bits > 0 {
+            let old_bpw = 32 / old_bits as usize;
+            let old_mask = (1 << old_bits) - 1;
             for i in 0..Self::SIZE {
-                let blocks_per_word = 32 / old_bits as usize;
-                let word_idx = i / blocks_per_word;
-                let sub_idx = i % blocks_per_word;
-                let val = (old_words[word_idx] >> (sub_idx * old_bits as usize)) & ((1 << old_bits) - 1);
+                let word_idx = i / old_bpw;
+                let sub_idx = i % old_bpw;
+                let val = (old_words[word_idx] >> (sub_idx * old_bits as usize)) & old_mask;
                 self.write_word_bits(i, val);
             }
         }
@@ -103,7 +124,23 @@ impl PalettedBlockArray {
         self.words[word_idx] = (self.words[word_idx] & !mask) | ((val & ((1 << bpb) - 1)) << (sub_idx * bpb));
     }
 
+    pub fn bits_per_block(&self) -> u8 {
+        self.bits_per_block
+    }
+
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
     pub fn palette(&self) -> &[u32] {
         &self.palette
+    }
+
+    pub fn from_raw(bits_per_block: u8, words: Vec<u32>, palette: Vec<u32>) -> Self {
+        Self {
+            bits_per_block,
+            words,
+            palette,
+        }
     }
 }
