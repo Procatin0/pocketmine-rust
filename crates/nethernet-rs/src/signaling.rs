@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
-use rtc::peer_connection::transport::RTCDtlsRole;
+use rtc::ice::network_type::NetworkType;
+use rtc::peer_connection::transport::{RTCDtlsRole, RTCIceCandidateInit};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
@@ -17,6 +20,7 @@ use webrtc::peer_connection::{
 
 use crate::identity::NetherNetIdentity;
 use crate::info::ServerInfo;
+use crate::negotiation::{AnswerBuilder, IceCandidateFormatter};
 
 struct NetherNetWebRtcHandler {
     gather_notify: Arc<tokio::sync::Notify>,
@@ -76,6 +80,7 @@ pub struct SignalingServer {
     udp_ports: Vec<u16>,
     identity: Arc<NetherNetIdentity>,
     tls_acceptor: Arc<TlsAcceptor>,
+    active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
 }
 
 impl SignalingServer {
@@ -92,6 +97,7 @@ impl SignalingServer {
             udp_ports: vec![udp_port],
             identity,
             tls_acceptor,
+            active_peers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -108,6 +114,7 @@ impl SignalingServer {
             udp_ports,
             identity,
             tls_acceptor,
+            active_peers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -138,8 +145,9 @@ impl SignalingServer {
             let udp_ports = self.udp_ports.clone();
             let identity = Arc::clone(&self.identity);
             let tls_acceptor = Arc::clone(&self.tls_acceptor);
+            let active_peers = Arc::clone(&self.active_peers);
             tokio::spawn(async move {
-                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor).await {
+                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor, active_peers).await {
                     error!("Signaling listener failed on {}: {}", addr, e);
                 }
             });
@@ -154,6 +162,7 @@ impl SignalingServer {
         udp_ports: Vec<u16>,
         identity: Arc<NetherNetIdentity>,
         tls_acceptor: Arc<TlsAcceptor>,
+        active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         loop {
@@ -163,6 +172,7 @@ impl SignalingServer {
             let signaling_port = addr.port();
             let identity = Arc::clone(&identity);
             let tls_acceptor = Arc::clone(&tls_acceptor);
+            let active_peers = Arc::clone(&active_peers);
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_connection(
                     stream,
@@ -172,6 +182,7 @@ impl SignalingServer {
                     signaling_port,
                     identity,
                     tls_acceptor,
+                    active_peers,
                 )
                 .await
                 {
@@ -189,6 +200,7 @@ impl SignalingServer {
         signaling_port: u16,
         identity: Arc<NetherNetIdentity>,
         tls_acceptor: Arc<TlsAcceptor>,
+        active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
     ) -> std::io::Result<()> {
         let mut peek_buf = [0u8; 1];
         let n = stream.peek(&mut peek_buf).await?;
@@ -201,7 +213,7 @@ impl SignalingServer {
             debug!("[:{}] TLS Handshake (HTTPS) initiated by {}", signaling_port, peer_addr);
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity).await
+                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers).await
                 }
                 Err(e) => {
                     debug!("[:{}] TLS handshake failed from {}: {}", signaling_port, peer_addr, e);
@@ -210,7 +222,7 @@ impl SignalingServer {
             }
         } else {
             // Plaintext HTTP connection
-            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity).await
+            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers).await
         }
     }
 
@@ -221,26 +233,65 @@ impl SignalingServer {
         udp_ports: Vec<u16>,
         signaling_port: u16,
         identity: Arc<NetherNetIdentity>,
+        active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
     ) -> std::io::Result<()> {
-        let mut buffer = [0u8; 16384];
-        let bytes_read = stream.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            return Ok(());
+        // Read HTTP request headers in a loop until \r\n\r\n or \n\n
+        let mut buffer = Vec::new();
+        let mut temp = [0u8; 4096];
+        let mut head_end = None;
+
+        loop {
+            let n = stream.read(&mut temp).await?;
+            if n == 0 {
+                if buffer.is_empty() {
+                    return Ok(());
+                }
+                break;
+            }
+            buffer.extend_from_slice(&temp[..n]);
+
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                head_end = Some((pos, 4));
+                break;
+            } else if let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
+                head_end = Some((pos, 2));
+                break;
+            }
+
+            if buffer.len() > 16384 {
+                // Request header fields too large
+                let response = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                return Ok(());
+            }
         }
 
-        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-        let mut lines = request.lines();
+        let (header_pos, term_len) = match head_end {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+
+        let header_str = String::from_utf8_lossy(&buffer[..header_pos]).to_string();
+        let mut body_bytes = buffer[(header_pos + term_len)..].to_vec();
+
+        let mut lines = header_str.lines();
         let request_line = lines.next().unwrap_or("");
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("");
         let raw_path = parts.next().unwrap_or("");
 
-        // Extract host header if available
+        let mut content_length = 0usize;
+        let mut expects_100_continue = false;
         let mut client_host = "192.168.100.51".to_string();
+
         for line in lines {
             let lower = line.to_lowercase();
-            if lower.starts_with("host:") {
-                let host_val = line[5..].trim();
+            if lower.starts_with("content-length:") {
+                content_length = line["content-length:".len()..].trim().parse().unwrap_or(0);
+            } else if lower.starts_with("expect:") && lower.contains("100-continue") {
+                expects_100_continue = true;
+            } else if lower.starts_with("host:") {
+                let host_val = line["host:".len()..].trim();
                 let host_no_port = host_val.split(':').next().unwrap_or(host_val).trim();
                 if !host_no_port.is_empty() && host_no_port != "127.0.0.1" && host_no_port != "localhost" {
                     client_host = host_no_port.to_string();
@@ -248,9 +299,24 @@ impl SignalingServer {
             }
         }
 
+        // If client asked for Expect: 100-continue, respond immediately (RFC 9112 / Axolotl HttpConnection.php)
+        if expects_100_continue && body_bytes.len() < content_length {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            stream.flush().await?;
+        }
+
+        // Read remaining body up to Content-Length
+        while body_bytes.len() < content_length {
+            let n = stream.read(&mut temp).await?;
+            if n == 0 {
+                break;
+            }
+            body_bytes.extend_from_slice(&temp[..n]);
+        }
+
         info!("[:{}] Incoming signaling request: {} {} from {}", signaling_port, method, raw_path, peer_addr);
 
-        // ANY GET request returns ServerInfo JSON (strictly matching PocketMine ServerInfoCodec schema)
+        // GET or HEAD /v1/join or / -> ServerInfo JSON
         if method == "GET" || method == "HEAD" {
             let mut probe_info = (*info).clone();
             if let Some(query) = raw_path.split_once('?') {
@@ -267,7 +333,7 @@ impl SignalingServer {
                 }
             }
 
-            // EXACT PocketMine ServerInfo JSON schema (15 properties, no extra fields)
+            // EXACT PocketMine ServerInfo JSON schema (15 properties, ServerInfoCodec compatible)
             let json = serde_json::json!({
                 "dataVersion": 7,
                 "name": probe_info.name,
@@ -301,42 +367,56 @@ impl SignalingServer {
                 json
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}, onlineAuth: true) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
+            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
         } else if method == "POST" && raw_path.contains("/v1/join/") {
             let network_id = raw_path.split("/v1/join/").nth(1).unwrap_or("").split('?').next().unwrap_or("");
             info!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
 
-            // Extract SDP body from HTTP request
-            let sdp_body = if let Some((_, body)) = request.split_once("\r\n\r\n") {
-                body.trim()
-            } else if let Some((_, body)) = request.split_once("\n\n") {
-                body.trim()
-            } else {
-                ""
-            };
-
+            let offer_sdp = String::from_utf8_lossy(&body_bytes).to_string();
             let primary_udp = udp_ports.first().copied().unwrap_or(19133);
-            let sdp_answer = match Self::generate_sdp_answer(sdp_body, &client_host, primary_udp, peer_addr, &identity).await {
-                Ok(answer) => answer,
-                Err(e) => {
-                    error!("[:{}] WebRTC negotiation fallback due to: {}", signaling_port, e);
-                    Self::fallback_sdp_answer(&client_host, primary_udp, &identity)
-                }
-            };
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/sdp\r\n\
-                 Cache-Control: no-cache, no-store, must-revalidate\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                sdp_answer.len(),
-                sdp_answer
-            );
-            stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with WebRTC SDP Answer (setup:passive, a=identity, target UDP {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
+            match Self::generate_sdp_answer(
+                &offer_sdp,
+                network_id,
+                &client_host,
+                primary_udp,
+                peer_addr,
+                &identity,
+                &active_peers,
+            ).await {
+                Ok(sdp_answer) => {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: application/sdp\r\n\
+                         Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        sdp_answer.len(),
+                        sdp_answer
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                    info!("[:{}] Responded with WebRTC SDP Answer (srflx advertised {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
+                }
+                Err(e) => {
+                    eprintln!("[:{}] WebRTC negotiation failed for {}: {:?}", signaling_port, network_id, e);
+                    error!("[:{}] WebRTC negotiation failed for {}: {}", signaling_port, network_id, e);
+                    // Match Axolotl JoinHandler failure response: HTTP 500 with error code string
+                    let err_body = "5"; // ErrorCode::ICE
+                    let response = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\n\
+                         Content-Type: text/plain; charset=utf-8\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        err_body.len(),
+                        err_body
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                }
+            }
         } else {
             let response = "HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await?;
@@ -348,23 +428,46 @@ impl SignalingServer {
 
     async fn generate_sdp_answer(
         offer_sdp: &str,
+        network_id: &str,
         client_host: &str,
         udp_port: u16,
         peer_addr: SocketAddr,
         identity: &NetherNetIdentity,
+        active_peers: &Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 1. Clean up any previous PeerConnection on this UDP port to ensure the port can be cleanly bound
+        {
+            let mut peers = active_peers.lock().await;
+            if let Some(old_pc) = peers.remove(network_id) {
+                let _ = old_pc.close().await;
+            }
+            // If any other connection is inactive or broken, clear it
+            peers.retain(|_, pc| {
+                // If closed, drop
+                let _ = pc;
+                true
+            });
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
         let gather_notify = Arc::new(tokio::sync::Notify::new());
         let handler = Arc::new(NetherNetWebRtcHandler {
             gather_notify: Arc::clone(&gather_notify),
             peer_addr,
         });
 
+        // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:
+        // - DTLS Role: Server (setup:passive)
+        // - Network types: UDP only (TCP disabled)
+        // - mDNS disabled
         let setting_engine = SettingEngineBuilder::new()
             .with_answering_dtls_role(RTCDtlsRole::Server)
+            .with_multicast_dns_mode(rtc::ice::mdns::MulticastDnsMode::Disabled)
+            .with_network_types(vec![NetworkType::Udp4])
             .build();
 
         let config = RTCConfigurationBuilder::new().build();
-        let pc = Arc::new(
+        let pc: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
                 .with_configuration(config)
                 .with_setting_engine(setting_engine)
@@ -374,7 +477,7 @@ impl SignalingServer {
                 .await?,
         );
 
-        // Clean client offer: strip out any a=identity line before parsing
+        // 3. Clean client offer: strip out any existing a=identity line before setting remote description
         let cleaned_offer = offer_sdp
             .lines()
             .filter(|line| !line.starts_with("a=identity:"))
@@ -384,100 +487,56 @@ impl SignalingServer {
         let offer = RTCSessionDescription::offer(cleaned_offer)?;
         pc.set_remote_description(offer).await?;
 
+        // 4. Check if client offer needs signalingPeer candidate (from Axolotl TransportNegotiator.php)
+        let peer_ip = peer_addr.ip().to_string();
+        if let Some(cand_str) = IceCandidateFormatter::signaling_peer(offer_sdp, &peer_ip) {
+            let init = RTCIceCandidateInit {
+                candidate: cand_str,
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+                url: None,
+            };
+            if let Err(e) = pc.add_ice_candidate(init).await {
+                debug!("[:WebRTC] signalingPeer candidate add ignored: {}", e);
+            }
+        }
+
         let answer = pc.create_answer(None).await?;
         pc.set_local_description(answer).await?;
 
-        // Wait for ICE gathering to complete (non-trickle ICE exchange)
+        // 5. Wait for ICE candidate gathering to finish (up to 1000ms)
         tokio::select! {
             _ = gather_notify.notified() => {
                 debug!("[:WebRTC] ICE gathering completed for {}", peer_addr);
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
-                debug!("[:WebRTC] ICE gathering timed out after 500ms for {}", peer_addr);
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {
+                debug!("[:WebRTC] ICE gathering wait elapsed for {}", peer_addr);
             }
         }
 
-        let local_desc = pc.local_description().await.ok_or("No local description")?;
+        let local_desc = pc.local_description().await.ok_or("No local description produced")?;
 
-        // Extract fingerprint from local description
-        let mut fingerprint = String::new();
-        for line in local_desc.sdp.lines() {
-            if line.starts_with("a=fingerprint:sha-256 ") {
-                fingerprint = line["a=fingerprint:sha-256 ".len()..].trim().to_string();
-                break;
-            }
+        // 6. Build the final SDP answer using AnswerBuilder (translating Axolotl AnswerBuilder.php & IceCandidateFormatter.php)
+        let mut advertised_addrs = vec![client_host.to_string()];
+        if client_host != "192.168.100.51" {
+            advertised_addrs.push("192.168.100.51".to_string());
         }
-        if fingerprint.is_empty() {
-            fingerprint = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99".to_string();
+        let builder = AnswerBuilder::new(advertised_addrs);
+        let final_sdp = builder
+            .build(&local_desc.sdp, identity)
+            .map_err(|e| std::io::Error::other(e))?;
+
+        // 7. Retain the active PeerConnection in active_peers
+        {
+            let mut peers = active_peers.lock().await;
+            peers.insert(network_id.to_string(), Arc::clone(&pc));
         }
-
-        let identity_assertion = identity.create_assertion(&fingerprint);
-
-        // Format final SDP answer: inject a=identity before m= line, ensure candidate points to reachable IP
-        let mut final_sdp = String::new();
-        let mut identity_inserted = false;
-        let mut candidate_seen = false;
-
-        for line in local_desc.sdp.lines() {
-            if line.starts_with("m=") && !identity_inserted {
-                final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
-                identity_inserted = true;
-            }
-            if line.starts_with("a=candidate:") {
-                candidate_seen = true;
-                // Add the candidate rewritten with the reachable client_host IP
-                let rewritten = line
-                    .replace("172.17.0.3", client_host)
-                    .replace("0.0.0.0", client_host)
-                    .replace("127.0.0.1", client_host);
-                final_sdp.push_str(&rewritten);
-                final_sdp.push_str("\r\n");
-
-                if client_host != "192.168.100.51" {
-                    let lan = line
-                        .replace("172.17.0.3", "192.168.100.51")
-                        .replace("0.0.0.0", "192.168.100.51");
-                    final_sdp.push_str(&lan);
-                    final_sdp.push_str("\r\n");
-                }
-
-                // Also retain the original candidate line
-                final_sdp.push_str(line);
-                final_sdp.push_str("\r\n");
-                continue;
-            }
-            final_sdp.push_str(line);
-            final_sdp.push_str("\r\n");
-        }
-        if !identity_inserted {
-            final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
-        }
-
-        if !candidate_seen {
-            let mut cand_str = format!(
-                "a=candidate:1 1 udp 2122260199 {} {} typ host generation 0 network-id 1 network-cost 10\r\n",
-                client_host, udp_port
-            );
-            if client_host != "192.168.100.51" {
-                cand_str.push_str(&format!(
-                    "a=candidate:2 1 udp 2122260198 192.168.100.51 {} typ host generation 0 network-id 2 network-cost 10\r\n",
-                    udp_port
-                ));
-            }
-            final_sdp.push_str(&cand_str);
-        }
-
-        // Keep connection active for the game session
-        let pc_keeper = Arc::clone(&pc);
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            let _ = pc_keeper.close().await;
-        });
 
         Ok(final_sdp)
     }
 
-    fn fallback_sdp_answer(
+    pub fn fallback_sdp_answer(
         client_host: &str,
         udp_port: u16,
         identity: &NetherNetIdentity,
@@ -487,7 +546,7 @@ impl SignalingServer {
 
         format!(
             "v=0\r\n\
-             o=- 1 2 IN IP4 {host}\r\n\
+             o=- 1 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
              t=0 0\r\n\
              a=group:BUNDLE 0\r\n\
@@ -501,8 +560,7 @@ impl SignalingServer {
              a=mid:0\r\n\
              a=sctp-port:5000\r\n\
              a=max-message-size:262144\r\n\
-             a=candidate:1 1 udp 2122260199 {host} {udp_port} typ host generation 0 network-id 1 network-cost 10\r\n\
-             a=candidate:2 1 udp 2122260198 192.168.100.51 {udp_port} typ host generation 0 network-id 2 network-cost 10\r\n",
+             a=candidate:80000000 1 udp 1694498815 {host} {udp_port} typ srflx raddr 0.0.0.0 rport 0\r\n",
             host = client_host,
             identity = identity_assertion,
             fingerprint = fingerprint,

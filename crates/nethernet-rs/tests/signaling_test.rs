@@ -18,7 +18,7 @@ async fn test_nethernet_probe_join() {
     };
 
     let identity = Arc::new(NetherNetIdentity::new());
-    let server = SignalingServer::new(local_addr, info, 19132, identity);
+    let server = SignalingServer::new(local_addr, info, 0, identity);
     tokio::spawn(async move {
         server.run().await.unwrap();
     });
@@ -54,15 +54,37 @@ async fn test_nethernet_probe_join() {
     assert!(response_root_str.contains("application/json"));
 
     // 3. Send HTTP POST /v1/join/12345678 (SDP offer negotiation)
+    let sdp_offer = "v=0\r\n\
+o=- 7752464448080962985 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+m=application 39240 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=ice-ufrag:+/RF\r\n\
+a=ice-pwd:cLVVKgIMcsGZGxK7pW5G+B7J\r\n\
+a=fingerprint:sha-256 22:AC:EC:B0:D1:62:E9:CA:BE:0B:FC:9B:8A:2A:3F:A2:FB:05:1C:80:A7:6C:85:25:1C:40:5D:C7:19:8B:AF:66\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sctp-port:5000\r\n\
+a=max-message-size:262144\r\n\
+a=candidate:1 1 udp 2122260199 127.0.0.1 39240 typ host\r\n";
+
     let mut client_sdp = TcpStream::connect(local_addr).await.unwrap();
-    let request_sdp = "POST /v1/join/12345678 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sdp\r\nContent-Length: 4\r\n\r\nv=0\r\n";
+    let request_sdp = format!(
+        "POST /v1/join/12345678 HTTP/1.1\r\nHost: 192.168.100.51\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+        sdp_offer.len(),
+        sdp_offer
+    );
     client_sdp.write_all(request_sdp.as_bytes()).await.unwrap();
 
     let mut response_sdp = Vec::new();
     client_sdp.read_to_end(&mut response_sdp).await.unwrap();
     let response_sdp_str = String::from_utf8(response_sdp).unwrap();
+    println!("DEBUG RESPONSE SDP: >>>\n{}\n<<<", response_sdp_str);
 
     assert!(response_sdp_str.contains("HTTP/1.1 200 OK"));
     assert!(response_sdp_str.contains("application/sdp"));
-    assert!(response_sdp_str.to_lowercase().contains("a=candidate:"));
+    assert!(response_sdp_str.contains("a=identity:"));
+    assert!(response_sdp_str.contains("a=candidate:80000000 1 udp 1694498815 192.168.100.51"));
 }

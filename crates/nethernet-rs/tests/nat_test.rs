@@ -27,6 +27,7 @@ async fn test_nat_gathering() {
 
     let setting_engine = SettingEngineBuilder::new()
         .with_answering_dtls_role(RTCDtlsRole::Server)
+        .with_multicast_dns_mode(rtc::ice::mdns::MulticastDnsMode::Disabled)
         .with_nat_1to1_ips(vec!["192.168.100.51".to_string()], RTCIceCandidateType::Host)
         .build();
 

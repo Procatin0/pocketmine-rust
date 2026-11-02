@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::RwLock;
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub const RAKNET_PROTOCOL_VERSION: u8 = 11;
 pub const OFFLINE_MESSAGE_DATA_ID: [u8; 16] = [
