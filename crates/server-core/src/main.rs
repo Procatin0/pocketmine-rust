@@ -1,23 +1,42 @@
 use std::net::SocketAddr;
 use tracing::info;
+use nethernet_rs::{ServerInfo, SignalingServer};
 use raklib_rs::RakNetListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    info!("Starting PocketMine-Rust High Performance Bedrock Server...");
-    info!("Initializing Tokio Async Network & Tick Loop Engine...");
+    info!("============================================================");
+    info!(" Starting PocketMine-Rust High Performance Bedrock Server   ");
+    info!("============================================================");
 
-    let bind_addr: SocketAddr = "0.0.0.0:19132".parse()?;
+    let server_info = ServerInfo {
+        name: "Dedicated PocketMine-Rust Server".to_string(),
+        max_players: 1000,
+        ..Default::default()
+    };
+
+    // 1. Iniciar transporte primario: NetherNet HTTP Signaling (WebRTC)
+    let nethernet_addr: SocketAddr = "0.0.0.0:19132".parse()?;
+    let signaling_server = SignalingServer::new(nethernet_addr, server_info);
+    tokio::spawn(async move {
+        if let Err(e) = signaling_server.run().await {
+            tracing::error!("NetherNet Signaling Server failed: {}", e);
+        }
+    });
+    info!("NetherNet (Primary WebRTC Transport) active on {}", nethernet_addr);
+
+    // 2. Iniciar transporte secundario / fallback: RakNet UDP
+    let raknet_addr: SocketAddr = "0.0.0.0:19133".parse()?;
     let server_id: u64 = 0x12345678_aabbccdd;
-    let listener = RakNetListener::bind(bind_addr, server_id).await?;
+    let raknet_listener = RakNetListener::bind(raknet_addr, server_id).await?;
+    info!("RakNet (Legacy UDP Fallback) active on {}", raknet_listener.local_addr()?);
 
-    info!("Server listening for Bedrock clients on {}", listener.local_addr()?);
-    info!("Ready for parallel worker threads and plugin dispatch!");
+    info!("Server is ready for Bedrock clients (NetherNet + RakNet fallback)");
 
-    // Keep running
+    // Mantener corriendo hasta Ctrl+C
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down PocketMine-Rust server gracefully.");
+    info!("Shutting down server gracefully.");
     Ok(())
 }

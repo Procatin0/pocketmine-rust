@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bedrock-protocol = { path = "../bedrock-protocol" }
+nethernet-rs = { path = "../nethernet-rs" }
 raklib-rs = { path = "../raklib-rs" }
 bedrock-world = { path = "../bedrock-world" }
 tokio = { workspace = true }

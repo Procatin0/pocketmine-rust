@@ -295,6 +295,7 @@ dependencies = [
  "bedrock-protocol",
  "bedrock-world",
  "bytes",
+ "nethernet-rs",
  "parking_lot",
  "raklib-rs",
  "tokio",
