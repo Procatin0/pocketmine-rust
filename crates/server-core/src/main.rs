@@ -20,20 +20,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_info = ServerInfo {
         name: config.motd.clone(),
         max_players: config.max_players,
-        online_auth: true,
+        online_auth: false,
         self_signed_auth: true,
         whitelist: false,
         allow_list: false,
         ..Default::default()
     };
 
-    // 1. Iniciar transporte primario: NetherNet HTTP Signaling en AMBOS puertos (19132 y 19133)
-    // para garantizar conectividad total sin importar cuál puerto configure el cliente
+    // 1. Iniciar transporte primario: NetherNet HTTP/HTTPS Signaling en el puerto principal 19132
+    // y fallback en 19133
     let signaling_addrs: Vec<SocketAddr> = vec![
         "0.0.0.0:19132".parse()?,
         "0.0.0.0:19133".parse()?,
     ];
-    let udp_ports = vec![19133, 19132];
+    let udp_ports = vec![19132, 19133];
 
     let identity = Arc::new(NetherNetIdentity::new());
     let signaling_server = SignalingServer::with_multiple_ports(

@@ -1,7 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::ServerConfig;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
 use crate::identity::NetherNetIdentity;
@@ -12,15 +15,23 @@ pub struct SignalingServer {
     info: Arc<ServerInfo>,
     udp_ports: Vec<u16>,
     identity: Arc<NetherNetIdentity>,
+    tls_acceptor: Arc<TlsAcceptor>,
 }
 
 impl SignalingServer {
-    pub fn new(addr: SocketAddr, info: ServerInfo, udp_port: u16, identity: Arc<NetherNetIdentity>) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        info: ServerInfo,
+        udp_port: u16,
+        identity: Arc<NetherNetIdentity>,
+    ) -> Self {
+        let tls_acceptor = Arc::new(Self::create_self_signed_tls_acceptor());
         Self {
             addrs: vec![addr],
             info: Arc::new(info),
             udp_ports: vec![udp_port],
             identity,
+            tls_acceptor,
         }
     }
 
@@ -30,12 +41,34 @@ impl SignalingServer {
         udp_ports: Vec<u16>,
         identity: Arc<NetherNetIdentity>,
     ) -> Self {
+        let tls_acceptor = Arc::new(Self::create_self_signed_tls_acceptor());
         Self {
             addrs,
             info: Arc::new(info),
             udp_ports,
             identity,
+            tls_acceptor,
         }
+    }
+
+    fn create_self_signed_tls_acceptor() -> TlsAcceptor {
+        let subject_alt_names = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "192.168.100.51".to_string(),
+        ];
+        let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("Failed to generate self-signed TLS cert");
+        let cert_der = certified_key.cert.der().to_vec();
+        let certs = vec![CertificateDer::from(cert_der)];
+        let key: PrivateKeyDer = certified_key.signing_key.into();
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("Valid TLS server config");
+
+        TlsAcceptor::from(Arc::new(server_config))
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
@@ -43,12 +76,13 @@ impl SignalingServer {
             let info = Arc::clone(&self.info);
             let udp_ports = self.udp_ports.clone();
             let identity = Arc::clone(&self.identity);
+            let tls_acceptor = Arc::clone(&self.tls_acceptor);
             tokio::spawn(async move {
-                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity).await {
+                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor).await {
                     error!("Signaling listener failed on {}: {}", addr, e);
                 }
             });
-            info!("NetherNet HTTP signaling listening on http://{}", addr);
+            info!("NetherNet HTTP/HTTPS signaling listening on {}", addr);
         }
         Ok(())
     }
@@ -58,6 +92,7 @@ impl SignalingServer {
         info: Arc<ServerInfo>,
         udp_ports: Vec<u16>,
         identity: Arc<NetherNetIdentity>,
+        tls_acceptor: Arc<TlsAcceptor>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         loop {
@@ -66,16 +101,60 @@ impl SignalingServer {
             let udp_ports = udp_ports.clone();
             let signaling_port = addr.port();
             let identity = Arc::clone(&identity);
+            let tls_acceptor = Arc::clone(&tls_acceptor);
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(stream, peer_addr, info, udp_ports, signaling_port, identity).await {
+                if let Err(e) = Self::handle_connection(
+                    stream,
+                    peer_addr,
+                    info,
+                    udp_ports,
+                    signaling_port,
+                    identity,
+                    tls_acceptor,
+                )
+                .await
+                {
                     debug!("Signaling connection closed from {}: {}", peer_addr, e);
                 }
             });
         }
     }
 
-    async fn handle_client(
-        mut stream: TcpStream,
+    async fn handle_connection(
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        info: Arc<ServerInfo>,
+        udp_ports: Vec<u16>,
+        signaling_port: u16,
+        identity: Arc<NetherNetIdentity>,
+        tls_acceptor: Arc<TlsAcceptor>,
+    ) -> std::io::Result<()> {
+        let mut peek_buf = [0u8; 1];
+        let n = stream.peek(&mut peek_buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Check if incoming connection is TLS (0x16 = ContentType Handshake)
+        if peek_buf[0] == 0x16 {
+            debug!("[:{}] TLS Handshake (HTTPS) initiated by {}", signaling_port, peer_addr);
+            match tls_acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity).await
+                }
+                Err(e) => {
+                    debug!("[:{}] TLS handshake failed from {}: {}", signaling_port, peer_addr, e);
+                    Ok(())
+                }
+            }
+        } else {
+            // Plaintext HTTP connection
+            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity).await
+        }
+    }
+
+    async fn handle_http<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
         peer_addr: SocketAddr,
         info: Arc<ServerInfo>,
         udp_ports: Vec<u16>,
@@ -85,16 +164,6 @@ impl SignalingServer {
         let mut buffer = [0u8; 8192];
         let bytes_read = stream.read(&mut buffer).await?;
         if bytes_read == 0 {
-            return Ok(());
-        }
-
-        // Sniff for TLS Handshake Record (ContentType 0x16, TLS Major Version 0x03)
-        // If received on plaintext HTTP port, close cleanly without invalid HTTP 400
-        if buffer[0] == 0x16 && bytes_read >= 3 && buffer[1] == 0x03 {
-            debug!(
-                "[:{}] TLS ClientHello probe from {}. Closing cleanly for plaintext fallback.",
-                signaling_port, peer_addr
-            );
             return Ok(());
         }
 
@@ -120,8 +189,7 @@ impl SignalingServer {
 
         info!("[:{}] Incoming signaling request: {} {} from {}", signaling_port, method, raw_path, peer_addr);
 
-        // ANY GET request returns ServerInfo JSON (required by user and Bedrock clients)
-        // This guarantees NO 404 is ever returned on /, /v1/join, /index.html, etc.
+        // ANY GET request returns ServerInfo JSON (strictly matching PocketMine ServerInfoCodec schema)
         if method == "GET" || method == "HEAD" {
             let mut probe_info = (*info).clone();
             if let Some(query) = raw_path.split_once('?') {
@@ -137,35 +205,24 @@ impl SignalingServer {
                     }
                 }
             }
-            probe_info.whitelist = false;
-            probe_info.allow_list = false;
 
-            // Generate comprehensive JSON payload matching PocketMine ServerInfoCodec
+            // EXACT PocketMine ServerInfo JSON schema (15 properties, no extra fields)
             let json = serde_json::json!({
-                "dataVersion": probe_info.data_version,
+                "dataVersion": 7,
                 "name": probe_info.name,
-                "serverName": probe_info.name,
                 "protocol": probe_info.protocol,
                 "version": probe_info.version,
-                "gameVersion": probe_info.version,
                 "level": probe_info.level,
-                "levelName": probe_info.level,
                 "players": probe_info.players,
-                "playerCount": probe_info.players,
                 "maxPlayers": probe_info.max_players,
-                "maxPlayerCount": probe_info.max_players,
                 "gameType": probe_info.game_type,
-                "editor": probe_info.editor,
-                "hardcore": probe_info.hardcore,
-                "onlineAuth": true,
+                "editor": false,
+                "hardcore": false,
+                "onlineAuth": false,
                 "selfSignedAuth": true,
-                "whitelist": false,
-                "white_list": false,
-                "allowList": false,
-                "allow_list": false,
-                "nonce": probe_info.nonce,
-                "transportLayer": probe_info.transport_layer,
-                "connection": probe_info.connection
+                "nonce": "",
+                "transportLayer": 2,
+                "connection": 4
             }).to_string();
 
             let response = format!(
@@ -180,14 +237,14 @@ impl SignalingServer {
                 json
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with JSON ServerInfo (v{}, p{}, onlineAuth: true) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
+            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}, selfSignedAuth: true) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
         } else if method == "POST" && raw_path.contains("/v1/join/") {
             let network_id = raw_path.split("/v1/join/").nth(1).unwrap_or("").split('?').next().unwrap_or("");
             info!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
-            debug!("[:{}] Client SDP offer:\n{}", signaling_port, request);
+            info!("[:{}] Client SDP offer:\n{}", signaling_port, request);
 
             // Construct standard NetherNet SDP DataChannel Answer
-            let primary_udp = udp_ports.first().copied().unwrap_or(19133);
+            let primary_udp = udp_ports.first().copied().unwrap_or(19132);
             let mut candidates = String::new();
             let mut cand_id = 1;
             for &port in &udp_ports {
@@ -216,11 +273,11 @@ impl SignalingServer {
                  a=group:BUNDLE 0\r\n\
                  a=identity:{identity}\r\n\
                  m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
-                 c=IN IP4 {host}\r\n\
+                 c=IN IP4 0.0.0.0\r\n\
                  a=ice-ufrag:rustnet\r\n\
                  a=ice-pwd:pocketminerustpwd123\r\n\
                  a=fingerprint:sha-256 {fingerprint}\r\n\
-                 a=setup:active\r\n\
+                 a=setup:passive\r\n\
                  a=mid:0\r\n\
                  a=sctp-port:5000\r\n\
                  a=max-message-size:262144\r\n\
@@ -242,7 +299,7 @@ impl SignalingServer {
                 sdp_answer
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with WebRTC SDP Answer (with a=identity, target UDP {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
+            info!("[:{}] Responded with WebRTC SDP Answer (setup:passive, a=identity, target UDP {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
         } else {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await?;

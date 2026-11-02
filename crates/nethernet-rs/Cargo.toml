@@ -14,3 +14,7 @@ p384 = { version = "0.14.0", features = ["ecdsa"] }
 base64 = "0.23.1"
 rand_core = "0.10.1"
 rand = "0.8"
+tokio-rustls = "0.26.6"
+rcgen = "0.14.10"
+rustls = "0.23.46"
+rustls-pki-types = "1.15.1"
