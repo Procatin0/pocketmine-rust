@@ -57,7 +57,6 @@ impl SignalingServer {
                 "TLS ClientHello received on plaintext HTTP signaling from {}. NetherNet is serving plain HTTP.",
                 peer_addr
             );
-            // Close connection cleanly
             return Ok(());
         }
 
@@ -66,9 +65,23 @@ impl SignalingServer {
         let request_line = lines.next().unwrap_or("");
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
+        let raw_path = parts.next().unwrap_or("");
+        let path = raw_path.split('?').next().unwrap_or("");
 
-        info!("Incoming signaling request: {} {} from {}", method, path, peer_addr);
+        // Extract host header if available
+        let mut client_host = "192.168.100.51".to_string();
+        for line in lines {
+            let lower = line.to_lowercase();
+            if lower.starts_with("host:") {
+                let host_val = line[5..].trim();
+                let host_no_port = host_val.split(':').next().unwrap_or(host_val).trim();
+                if !host_no_port.is_empty() && host_no_port != "127.0.0.1" && host_no_port != "localhost" {
+                    client_host = host_no_port.to_string();
+                }
+            }
+        }
+
+        info!("Incoming signaling request: {} {} from {}", method, raw_path, peer_addr);
 
         if method == "GET" && (path == "/" || path == "/index.html") {
             let html = format!(
@@ -105,7 +118,8 @@ impl SignalingServer {
     <div class="metric"><span class="metric-label">Nombre del Servidor</span><span class="metric-value">{}</span></div>
     <div class="metric"><span class="metric-label">Versión de Juego</span><span class="metric-value">{} (Protocolo {})</span></div>
     <div class="metric"><span class="metric-label">Señalización NetherNet (TCP)</span><span class="metric-value pill">:{}</span></div>
-    <div class="metric"><span class="metric-label">Gameplay RakNet (UDP)</span><span class="metric-value pill">:{}</span></div>
+    <div class="metric"><span class="metric-label">Gameplay WebRTC/RakNet (UDP)</span><span class="metric-value pill">:{}</span></div>
+    <div class="metric"><span class="metric-label">Lista Blanca (Whitelist)</span><span class="metric-value" style="color: #22c55e;">Desactivada</span></div>
     <div class="metric"><span class="metric-label">Probe NetherNet</span><a class="link metric-value" href="/v1/join">/v1/join</a></div>
   </div>
 </body>
@@ -124,8 +138,26 @@ impl SignalingServer {
             );
             stream.write_all(response.as_bytes()).await?;
         } else if method == "GET" && (path == "/v1/join" || path == "/v1/join/") {
-            // Client probe: return ServerInfo JSON
-            let json = info.to_json().map_err(|e| {
+            // Client probe: dynamically adapt protocol/version if specified in query
+            let mut probe_info = (*info).clone();
+            if let Some(query) = raw_path.split_once('?') {
+                for pair in query.1.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == "version" && !v.is_empty() {
+                            probe_info.version = v.to_string();
+                        } else if k == "protocol" {
+                            if let Ok(p) = v.parse::<i32>() {
+                                probe_info.protocol = p;
+                            }
+                        }
+                    }
+                }
+            }
+            // Explicitly ensure whitelist is disabled in probe response
+            probe_info.whitelist = false;
+            probe_info.allow_list = false;
+
+            let json = probe_info.to_json().map_err(|e| {
                 error!("Failed to serialize ServerInfo: {}", e);
                 std::io::Error::new(std::io::ErrorKind::Other, e)
             })?;
@@ -141,20 +173,21 @@ impl SignalingServer {
                 json
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("Responded to NetherNet probe from {}", peer_addr);
+            info!("Responded to NetherNet probe (v{}, p{}) from {}", probe_info.version, probe_info.protocol, peer_addr);
         } else if method == "POST" && path.starts_with("/v1/join/") {
             let network_id = path.trim_start_matches("/v1/join/");
             info!("Received NetherNet WebRTC offer from {} for networkId {}", peer_addr, network_id);
 
-            // Construct standard NetherNet SDP DataChannel Answer pointing to UDP gameplay port
+            // Construct standard NetherNet SDP DataChannel Answer
+            // Point candidate to the client_host (LAN Wi-Fi IP) on UDP gameplay port
             let sdp_answer = format!(
                 "v=0\r\n\
-                 o=- 1 2 IN IP4 {server_ip}\r\n\
+                 o=- 1 2 IN IP4 {host}\r\n\
                  s=-\r\n\
                  t=0 0\r\n\
                  a=group:BUNDLE 0\r\n\
                  m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
-                 c=IN IP4 {server_ip}\r\n\
+                 c=IN IP4 {host}\r\n\
                  a=ice-ufrag:rustnet\r\n\
                  a=ice-pwd:pocketminerustpwd123\r\n\
                  a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
@@ -162,8 +195,9 @@ impl SignalingServer {
                  a=mid:0\r\n\
                  a=sctp-port:5000\r\n\
                  a=max-message-size:262144\r\n\
-                 a=candidate:1 1 UDP 2122260223 {server_ip} {udp_port} typ host\r\n",
-                server_ip = peer_addr.ip(),
+                 a=candidate:1 1 UDP 2122260223 {host} {udp_port} typ host\r\n\
+                 a=candidate:2 1 UDP 2122260222 192.168.100.51 {udp_port} typ host\r\n",
+                host = client_host,
                 udp_port = udp_port
             );
 
@@ -178,7 +212,7 @@ impl SignalingServer {
                 sdp_answer
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("Responded with WebRTC SDP Answer to {}", peer_addr);
+            info!("Responded with WebRTC SDP Answer (target UDP {}:{}) to {}", client_host, udp_port, peer_addr);
         } else {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await?;

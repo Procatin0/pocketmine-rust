@@ -7,6 +7,7 @@ settings:
   query-plugins: true
   enable-profiling: false
   async-workers: auto
+  white-list: false
 
 network:
   batch-threshold: 256
@@ -16,6 +17,9 @@ network:
   enable-encryption: true
   upnp-forwarding: false
 
+player:
+  verify-xuid: false
+
 transport:
   # Network transport(s) used for player connections (comma-separated: nethernet,raknet)
   name: nethernet,raknet
@@ -24,12 +28,12 @@ transport:
     identity-domain: ""
     ice-udp-mux: false
     # UDP port range for NetherNet WebRTC connections
-    port-range: [19134, 19140]
+    port-range: [19133, 19140]
     mtu: 1200
     builtin-signaling:
       enabled: true
-      # TCP port for HTTP signaling (default 19133 to prevent collision with RakNet UDP 19132)
-      port: 19133
+      # Primary TCP signaling port (19132 is the principal entry point for Bedrock clients)
+      port: 19132
       tls:
         certificate: ""
         key: ""

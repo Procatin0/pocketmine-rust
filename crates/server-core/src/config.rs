@@ -11,6 +11,7 @@ pub struct ServerConfig {
     pub signaling_port_tcp: u16,
     pub max_players: i32,
     pub xbox_auth: bool,
+    pub white_list: bool,
     pub transports: Vec<String>,
     pub builtin_signaling_enabled: bool,
 }
@@ -19,11 +20,12 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             motd: "Dedicated PocketMine-Rust Server".to_string(),
-            server_port_udp: 19132,
+            server_port_udp: 19133,       // WebRTC DataChannel / RakNet UDP gameplay
             server_port_v6_udp: 19133,
-            signaling_port_tcp: 19133, // Default TCP signaling separated from UDP 19132
+            signaling_port_tcp: 19132,    // Primary port 19132 for TCP NetherNet signaling
             max_players: 1000,
             xbox_auth: false,
+            white_list: false,            // Whitelist disabled
             transports: vec!["nethernet".to_string(), "raknet".to_string()],
             builtin_signaling_enabled: true,
         }
@@ -32,8 +34,6 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Loads configuration from `server.properties` and `pocketmine.yml`.
-    /// Enforces that the UDP gameplay port and TCP signaling port are distinct
-    /// to adhere to the Bedrock transport protocol and avoid Terracotta connection error.
     pub fn load_or_create(base_dir: &Path) -> Self {
         let mut config = Self::default();
 
@@ -46,9 +46,11 @@ impl ServerConfig {
         } else {
             let default_props = "# Minecraft: Bedrock Edition Server Properties for PocketMine-Rust\n\
                 motd=Dedicated PocketMine-Rust Server\n\
-                server-port=19132\n\
+                server-port=19133\n\
                 server-portv6=19133\n\
                 max-players=1000\n\
+                white-list=0\n\
+                allow-list=0\n\
                 xbox-auth=off\n";
             let _ = fs::write(&props_path, default_props);
             info!("Created default server.properties");
@@ -67,24 +69,25 @@ impl ServerConfig {
                   nethernet:\n\
                     builtin-signaling:\n\
                       enabled: true\n\
-                      port: 19133\n";
+                      port: 19132\n";
             let _ = fs::write(&pm_path, default_pm);
             info!("Created default pocketmine.yml");
         }
 
-        // Protocol Validation: TCP signaling and UDP gameplay port MUST be distinct
+        // Protocol Validation: TCP signaling port and UDP gameplay port MUST be distinct
         if config.builtin_signaling_enabled && config.signaling_port_tcp == config.server_port_udp {
             warn!(
-                "Port collision detected: TCP signaling port and UDP game port are both {}. \
-                 Adjusting TCP signaling to 19133 to prevent Terracotta handshake errors.",
-                config.server_port_udp
+                "TCP signaling and UDP gameplay ports both configured as {}. \
+                 Assigning TCP signaling to 19132 and UDP gameplay to 19133 to prevent collision.",
+                config.signaling_port_tcp
             );
-            config.signaling_port_tcp = if config.server_port_udp == 19132 { 19133 } else { 19132 };
+            config.signaling_port_tcp = 19132;
+            config.server_port_udp = 19133;
         }
 
         info!(
-            "Ports active -> NetherNet TCP Signaling: {}, RakNet UDP Gameplay: {}",
-            config.signaling_port_tcp, config.server_port_udp
+            "Configuration active -> Primary TCP Signaling: {}, Gameplay UDP (WebRTC/RakNet): {}, Whitelist: {}",
+            config.signaling_port_tcp, config.server_port_udp, if config.white_list { "ON" } else { "OFF" }
         );
 
         config
@@ -117,6 +120,9 @@ impl ServerConfig {
         if let Some(auth) = map.get("xbox-auth") {
             self.xbox_auth = *auth == "on" || *auth == "true" || *auth == "1";
         }
+        if let Some(wl) = map.get("white-list").or_else(|| map.get("allow-list")).or_else(|| map.get("whitelist")) {
+            self.white_list = *wl == "on" || *wl == "true" || *wl == "1";
+        }
     }
 
     fn parse_pocketmine_yml(&mut self, content: &str) {
@@ -133,7 +139,7 @@ impl ServerConfig {
                 continue;
             }
 
-            if trimmed.starts_with("name:") && line.contains("transport:") == false {
+            if trimmed.starts_with("name:") && !line.contains("transport:") {
                 let val = trimmed.trim_start_matches("name:").trim();
                 self.transports = val.split(',').map(|s| s.trim().to_lowercase()).collect();
             }
@@ -149,7 +155,7 @@ impl ServerConfig {
                             self.signaling_port_tcp = p;
                         }
                     }
-                } else if !line.starts_with(" ") && !line.starts_with("\t") {
+                } else if !line.starts_with(' ') && !line.starts_with('\t') {
                     in_builtin_signaling = false;
                 }
             }
@@ -162,17 +168,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_config_port_separation() {
-        let mut config = ServerConfig::default();
-        config.server_port_udp = 19132;
-        config.signaling_port_tcp = 19132;
-
-        if config.builtin_signaling_enabled && config.signaling_port_tcp == config.server_port_udp {
-            config.signaling_port_tcp = 19133;
-        }
-
-        assert_ne!(config.signaling_port_tcp, config.server_port_udp);
-        assert_eq!(config.signaling_port_tcp, 19133);
-        assert_eq!(config.server_port_udp, 19132);
+    fn test_server_config_defaults() {
+        let config = ServerConfig::default();
+        assert_eq!(config.signaling_port_tcp, 19132);
+        assert_eq!(config.server_port_udp, 19133);
+        assert!(!config.white_list);
     }
 }
