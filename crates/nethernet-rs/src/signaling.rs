@@ -8,19 +8,67 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
 use rtc::peer_connection::transport::RTCDtlsRole;
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCSessionDescription, SettingEngineBuilder,
+    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState,
+    RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
 
 use crate::identity::NetherNetIdentity;
 use crate::info::ServerInfo;
 
-#[derive(Clone)]
-struct NetherNetWebRtcHandler;
+struct NetherNetWebRtcHandler {
+    gather_notify: Arc<tokio::sync::Notify>,
+    peer_addr: SocketAddr,
+}
 
 #[async_trait::async_trait]
-impl PeerConnectionEventHandler for NetherNetWebRtcHandler {}
+impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        debug!("[:WebRTC] ICE gathering state changed to {:?} for {}", state, self.peer_addr);
+        if state == RTCIceGatheringState::Complete {
+            self.gather_notify.notify_waiters();
+        }
+    }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        info!("[:WebRTC] ICE connection state changed to {:?} for {}", state, self.peer_addr);
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        info!("[:WebRTC] PeerConnection state changed to {:?} for {}", state, self.peer_addr);
+    }
+
+    async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
+        let peer = self.peer_addr;
+        let label = dc.label().await.unwrap_or_default();
+        let id = dc.id();
+        info!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
+
+        tokio::spawn(async move {
+            loop {
+                match dc.poll().await {
+                    Some(DataChannelEvent::OnMessage(msg)) => {
+                        if !msg.data.is_empty() {
+                            let countdown = msg.data[0];
+                            let payload = &msg.data[1..];
+                            debug!(
+                                "[:WebRTC] DataChannel '{}' message from {} (countdown={}, len={})",
+                                label, peer, countdown, payload.len()
+                            );
+                        }
+                    }
+                    Some(DataChannelEvent::OnClose) | None => {
+                        info!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
 
 pub struct SignalingServer {
     addrs: Vec<SocketAddr>,
@@ -268,7 +316,7 @@ impl SignalingServer {
             };
 
             let primary_udp = udp_ports.first().copied().unwrap_or(19133);
-            let sdp_answer = match Self::generate_sdp_answer(sdp_body, &client_host, primary_udp, &identity).await {
+            let sdp_answer = match Self::generate_sdp_answer(sdp_body, &client_host, primary_udp, peer_addr, &identity).await {
                 Ok(answer) => answer,
                 Err(e) => {
                     error!("[:{}] WebRTC negotiation fallback due to: {}", signaling_port, e);
@@ -302,20 +350,29 @@ impl SignalingServer {
         offer_sdp: &str,
         client_host: &str,
         udp_port: u16,
+        peer_addr: SocketAddr,
         identity: &NetherNetIdentity,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let gather_notify = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(NetherNetWebRtcHandler {
+            gather_notify: Arc::clone(&gather_notify),
+            peer_addr,
+        });
+
         let setting_engine = SettingEngineBuilder::new()
             .with_answering_dtls_role(RTCDtlsRole::Server)
             .build();
 
         let config = RTCConfigurationBuilder::new().build();
-        let pc = PeerConnectionBuilder::new()
-            .with_configuration(config)
-            .with_setting_engine(setting_engine)
-            .with_handler(Arc::new(NetherNetWebRtcHandler))
-            .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
-            .build()
-            .await?;
+        let pc = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_configuration(config)
+                .with_setting_engine(setting_engine)
+                .with_handler(handler)
+                .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
+                .build()
+                .await?,
+        );
 
         // Clean client offer: strip out any a=identity line before parsing
         let cleaned_offer = offer_sdp
@@ -328,11 +385,23 @@ impl SignalingServer {
         pc.set_remote_description(offer).await?;
 
         let answer = pc.create_answer(None).await?;
-        pc.set_local_description(answer.clone()).await?;
+        pc.set_local_description(answer).await?;
 
-        // Extract fingerprint from generated answer
+        // Wait for ICE gathering to complete (non-trickle ICE exchange)
+        tokio::select! {
+            _ = gather_notify.notified() => {
+                debug!("[:WebRTC] ICE gathering completed for {}", peer_addr);
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                debug!("[:WebRTC] ICE gathering timed out after 500ms for {}", peer_addr);
+            }
+        }
+
+        let local_desc = pc.local_description().await.ok_or("No local description")?;
+
+        // Extract fingerprint from local description
         let mut fingerprint = String::new();
-        for line in answer.sdp.lines() {
+        for line in local_desc.sdp.lines() {
             if line.starts_with("a=fingerprint:sha-256 ") {
                 fingerprint = line["a=fingerprint:sha-256 ".len()..].trim().to_string();
                 break;
@@ -344,14 +413,38 @@ impl SignalingServer {
 
         let identity_assertion = identity.create_assertion(&fingerprint);
 
-        // Format final SDP answer: inject a=identity before m= line, ensure candidate points to LAN IP
+        // Format final SDP answer: inject a=identity before m= line, ensure candidate points to reachable IP
         let mut final_sdp = String::new();
         let mut identity_inserted = false;
+        let mut candidate_seen = false;
 
-        for line in answer.sdp.lines() {
+        for line in local_desc.sdp.lines() {
             if line.starts_with("m=") && !identity_inserted {
                 final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
                 identity_inserted = true;
+            }
+            if line.starts_with("a=candidate:") {
+                candidate_seen = true;
+                // Add the candidate rewritten with the reachable client_host IP
+                let rewritten = line
+                    .replace("172.17.0.3", client_host)
+                    .replace("0.0.0.0", client_host)
+                    .replace("127.0.0.1", client_host);
+                final_sdp.push_str(&rewritten);
+                final_sdp.push_str("\r\n");
+
+                if client_host != "192.168.100.51" {
+                    let lan = line
+                        .replace("172.17.0.3", "192.168.100.51")
+                        .replace("0.0.0.0", "192.168.100.51");
+                    final_sdp.push_str(&lan);
+                    final_sdp.push_str("\r\n");
+                }
+
+                // Also retain the original candidate line
+                final_sdp.push_str(line);
+                final_sdp.push_str("\r\n");
+                continue;
             }
             final_sdp.push_str(line);
             final_sdp.push_str("\r\n");
@@ -360,23 +453,25 @@ impl SignalingServer {
             final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
         }
 
-        // Add host candidate for advertised UDP port
-        let mut cand_str = format!(
-            "a=candidate:1 1 udp 2122260199 {} {} typ host generation 0 network-id 1 network-cost 10\r\n",
-            client_host, udp_port
-        );
-        if client_host != "192.168.100.51" {
-            cand_str.push_str(&format!(
-                "a=candidate:2 1 udp 2122260198 192.168.100.51 {} typ host generation 0 network-id 2 network-cost 10\r\n",
-                udp_port
-            ));
+        if !candidate_seen {
+            let mut cand_str = format!(
+                "a=candidate:1 1 udp 2122260199 {} {} typ host generation 0 network-id 1 network-cost 10\r\n",
+                client_host, udp_port
+            );
+            if client_host != "192.168.100.51" {
+                cand_str.push_str(&format!(
+                    "a=candidate:2 1 udp 2122260198 192.168.100.51 {} typ host generation 0 network-id 2 network-cost 10\r\n",
+                    udp_port
+                ));
+            }
+            final_sdp.push_str(&cand_str);
         }
-        final_sdp.push_str(&cand_str);
 
         // Keep connection active for the game session
+        let pc_keeper = Arc::clone(&pc);
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            let _ = pc.close().await;
+            let _ = pc_keeper.close().await;
         });
 
         Ok(final_sdp)
