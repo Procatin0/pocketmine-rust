@@ -1,0 +1,10 @@
+[package]
+name = "bedrock-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }
+tracing = { workspace = true }
