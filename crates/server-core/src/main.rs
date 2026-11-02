@@ -20,26 +20,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_info = ServerInfo {
         name: config.motd.clone(),
         max_players: config.max_players,
-        online_auth: false,
+        online_auth: true,
         self_signed_auth: true,
         whitelist: false,
         allow_list: false,
         ..Default::default()
     };
 
-    // 1. Iniciar transporte primario: NetherNet HTTP/HTTPS Signaling en el puerto principal 19132
-    // y fallback en 19133
-    let signaling_addrs: Vec<SocketAddr> = vec![
-        "0.0.0.0:19132".parse()?,
-        "0.0.0.0:19133".parse()?,
-    ];
-    let udp_ports = vec![19132, 19133];
+    // 1. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)
+    // El puerto 19133 es de WebRTC (UDP) y NUNCA debe escuchar en TCP (idéntico a Axolotl/PocketMine)
+    let signaling_addr: SocketAddr = "0.0.0.0:19132".parse()?;
+    let webrtc_udp_port: u16 = 19133;
 
     let identity = Arc::new(NetherNetIdentity::new());
-    let signaling_server = SignalingServer::with_multiple_ports(
-        signaling_addrs,
+    let signaling_server = SignalingServer::new(
+        signaling_addr,
         server_info,
-        udp_ports.clone(),
+        webrtc_udp_port,
         identity,
     );
     tokio::spawn(async move {
@@ -52,48 +49,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_manager = Arc::new(SessionManager::new());
     info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
-    // 3. Iniciar listeners de UDP gameplay (RakNet / WebRTC) en ambos puertos
+    // 3. Iniciar listener de RakNet en UDP 19132 (fallback para clientes sin NetherNet)
     let server_id: u64 = 0x12345678_aabbccdd;
-    for &port in &udp_ports {
-        let raknet_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-        let listener = match RakNetListener::bind(raknet_addr, server_id).await {
-            Ok(l) => Arc::new(l),
-            Err(e) => {
-                tracing::warn!("Could not bind RakNet on UDP port {}: {}", port, e);
-                continue;
-            }
-        };
+    let raknet_port = 19132;
+    let raknet_addr: SocketAddr = format!("0.0.0.0:{}", raknet_port).parse()?;
+    match RakNetListener::bind(raknet_addr, server_id).await {
+        Ok(listener) => {
+            let listener = Arc::new(listener);
+            listener.set_motd(format!(
+                "MCPE;{};2225;1.26.60;0;{};{};Survival;1;{};{};",
+                config.motd, config.max_players, server_id, raknet_port, raknet_port
+            ));
 
-        listener.set_motd(format!(
-            "MCPE;{};2225;1.26.60;0;{};{};Survival;1;{};{};",
-            config.motd, config.max_players, server_id, port, port
-        ));
-
-        let raknet_runner = Arc::clone(&listener);
-        let session_mgr = Arc::clone(&session_manager);
-        tokio::spawn(async move {
-            loop {
-                match raknet_runner.poll_event().await {
-                    Ok(event) => match event {
-                        RakNetEvent::Offline { packet, src, .. } => {
-                            tracing::info!("RakNet Offline Handshake on :{} from {}: {:?}", port, src, packet);
-                            let _ = session_mgr.create_session(src);
+            let raknet_runner = Arc::clone(&listener);
+            let session_mgr = Arc::clone(&session_manager);
+            tokio::spawn(async move {
+                loop {
+                    match raknet_runner.poll_event().await {
+                        Ok(event) => match event {
+                            RakNetEvent::Offline { packet, src, .. } => {
+                                tracing::info!("RakNet Offline Handshake on :{} from {}: {:?}", raknet_port, src, packet);
+                                let _ = session_mgr.create_session(src);
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("RakNet listener error on :{}: {}", raknet_port, e);
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!("RakNet listener error on : {}: {}", port, e);
                     }
                 }
-            }
-        });
-        info!("RakNet (UDP Transport) active on :{}", port);
+            });
+            info!("RakNet (UDP Fallback Transport) active on :{}", raknet_port);
+        }
+        Err(e) => {
+            tracing::warn!("Could not bind RakNet on UDP port {}: {}", raknet_port, e);
+        }
     }
 
     info!("============================================================");
-    info!(" Server READY on ALL Bedrock ports:");
-    info!(" -> TCP Signaling: listening on 19132 & 19133 (returns JSON)");
-    info!(" -> UDP Gameplay:  listening on 19132 & 19133 (WebRTC/RakNet)");
-    info!(" -> Whitelist:     DISABLED (OFF)");
+    info!(" PocketMine-Rust READY (Axolotl / NetherNet Architecture):");
+    info!(" -> TCP 19132: HTTP/HTTPS Signaling (GET / and /v1/join -> JSON)");
+    info!(" -> UDP 19133: WebRTC Gameplay (ICE / DTLS / DataChannel)");
+    info!(" -> UDP 19132: RakNet Fallback Transport");
+    info!(" -> TCP 19133: CLOSED (WebRTC is UDP-only, matches Axolotl)");
+    info!(" -> Whitelist: DISABLED");
     info!("============================================================");
 
     // Mantener corriendo hasta Ctrl+C

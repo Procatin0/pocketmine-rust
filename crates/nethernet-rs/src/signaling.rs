@@ -7,8 +7,20 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
+use rtc::peer_connection::transport::RTCDtlsRole;
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCSessionDescription, SettingEngineBuilder,
+};
+
 use crate::identity::NetherNetIdentity;
 use crate::info::ServerInfo;
+
+#[derive(Clone)]
+struct NetherNetWebRtcHandler;
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for NetherNetWebRtcHandler {}
 
 pub struct SignalingServer {
     addrs: Vec<SocketAddr>,
@@ -52,6 +64,7 @@ impl SignalingServer {
     }
 
     fn create_self_signed_tls_acceptor() -> TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let subject_alt_names = vec![
             "localhost".to_string(),
             "127.0.0.1".to_string(),
@@ -161,7 +174,7 @@ impl SignalingServer {
         signaling_port: u16,
         identity: Arc<NetherNetIdentity>,
     ) -> std::io::Result<()> {
-        let mut buffer = [0u8; 8192];
+        let mut buffer = [0u8; 16384];
         let bytes_read = stream.read(&mut buffer).await?;
         if bytes_read == 0 {
             return Ok(());
@@ -218,7 +231,7 @@ impl SignalingServer {
                 "gameType": probe_info.game_type,
                 "editor": false,
                 "hardcore": false,
-                "onlineAuth": false,
+                "onlineAuth": true,
                 "selfSignedAuth": true,
                 "nonce": "",
                 "transportLayer": 2,
@@ -228,6 +241,9 @@ impl SignalingServer {
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: application/json; charset=utf-8\r\n\
+                 Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                 Pragma: no-cache\r\n\
+                 Expires: 0\r\n\
                  Access-Control-Allow-Origin: *\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
@@ -237,60 +253,33 @@ impl SignalingServer {
                 json
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}, selfSignedAuth: true) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
+            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}, onlineAuth: true) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
         } else if method == "POST" && raw_path.contains("/v1/join/") {
             let network_id = raw_path.split("/v1/join/").nth(1).unwrap_or("").split('?').next().unwrap_or("");
             info!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
-            info!("[:{}] Client SDP offer:\n{}", signaling_port, request);
 
-            // Construct standard NetherNet SDP DataChannel Answer
-            let primary_udp = udp_ports.first().copied().unwrap_or(19132);
-            let mut candidates = String::new();
-            let mut cand_id = 1;
-            for &port in &udp_ports {
-                candidates.push_str(&format!(
-                    "a=candidate:{} 1 UDP 2122260{:03} {} {} typ host\r\n",
-                    cand_id, 200 - cand_id, client_host, port
-                ));
-                cand_id += 1;
-                if client_host != "192.168.100.51" {
-                    candidates.push_str(&format!(
-                        "a=candidate:{} 1 UDP 2122260{:03} 192.168.100.51 {} typ host\r\n",
-                        cand_id, 200 - cand_id, port
-                    ));
-                    cand_id += 1;
+            // Extract SDP body from HTTP request
+            let sdp_body = if let Some((_, body)) = request.split_once("\r\n\r\n") {
+                body.trim()
+            } else if let Some((_, body)) = request.split_once("\n\n") {
+                body.trim()
+            } else {
+                ""
+            };
+
+            let primary_udp = udp_ports.first().copied().unwrap_or(19133);
+            let sdp_answer = match Self::generate_sdp_answer(sdp_body, &client_host, primary_udp, &identity).await {
+                Ok(answer) => answer,
+                Err(e) => {
+                    error!("[:{}] WebRTC negotiation fallback due to: {}", signaling_port, e);
+                    Self::fallback_sdp_answer(&client_host, primary_udp, &identity)
                 }
-            }
-
-            let fingerprint = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
-            let identity_assertion = identity.create_assertion(fingerprint);
-
-            let sdp_answer = format!(
-                "v=0\r\n\
-                 o=- 1 2 IN IP4 {host}\r\n\
-                 s=-\r\n\
-                 t=0 0\r\n\
-                 a=group:BUNDLE 0\r\n\
-                 a=identity:{identity}\r\n\
-                 m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
-                 c=IN IP4 0.0.0.0\r\n\
-                 a=ice-ufrag:rustnet\r\n\
-                 a=ice-pwd:pocketminerustpwd123\r\n\
-                 a=fingerprint:sha-256 {fingerprint}\r\n\
-                 a=setup:passive\r\n\
-                 a=mid:0\r\n\
-                 a=sctp-port:5000\r\n\
-                 a=max-message-size:262144\r\n\
-                 {candidates}",
-                host = client_host,
-                identity = identity_assertion,
-                fingerprint = fingerprint,
-                candidates = candidates
-            );
+            };
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: application/sdp\r\n\
+                 Cache-Control: no-cache, no-store, must-revalidate\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\
                  \r\n\
@@ -301,11 +290,128 @@ impl SignalingServer {
             stream.write_all(response.as_bytes()).await?;
             info!("[:{}] Responded with WebRTC SDP Answer (setup:passive, a=identity, target UDP {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
         } else {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response = "HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await?;
         }
 
         stream.flush().await?;
         Ok(())
+    }
+
+    async fn generate_sdp_answer(
+        offer_sdp: &str,
+        client_host: &str,
+        udp_port: u16,
+        identity: &NetherNetIdentity,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let setting_engine = SettingEngineBuilder::new()
+            .with_answering_dtls_role(RTCDtlsRole::Server)
+            .build();
+
+        let config = RTCConfigurationBuilder::new().build();
+        let pc = PeerConnectionBuilder::new()
+            .with_configuration(config)
+            .with_setting_engine(setting_engine)
+            .with_handler(Arc::new(NetherNetWebRtcHandler))
+            .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
+            .build()
+            .await?;
+
+        // Clean client offer: strip out any a=identity line before parsing
+        let cleaned_offer = offer_sdp
+            .lines()
+            .filter(|line| !line.starts_with("a=identity:"))
+            .collect::<Vec<_>>()
+            .join("\r\n") + "\r\n";
+
+        let offer = RTCSessionDescription::offer(cleaned_offer)?;
+        pc.set_remote_description(offer).await?;
+
+        let answer = pc.create_answer(None).await?;
+        pc.set_local_description(answer.clone()).await?;
+
+        // Extract fingerprint from generated answer
+        let mut fingerprint = String::new();
+        for line in answer.sdp.lines() {
+            if line.starts_with("a=fingerprint:sha-256 ") {
+                fingerprint = line["a=fingerprint:sha-256 ".len()..].trim().to_string();
+                break;
+            }
+        }
+        if fingerprint.is_empty() {
+            fingerprint = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99".to_string();
+        }
+
+        let identity_assertion = identity.create_assertion(&fingerprint);
+
+        // Format final SDP answer: inject a=identity before m= line, ensure candidate points to LAN IP
+        let mut final_sdp = String::new();
+        let mut identity_inserted = false;
+
+        for line in answer.sdp.lines() {
+            if line.starts_with("m=") && !identity_inserted {
+                final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
+                identity_inserted = true;
+            }
+            final_sdp.push_str(line);
+            final_sdp.push_str("\r\n");
+        }
+        if !identity_inserted {
+            final_sdp.push_str(&format!("a=identity:{}\r\n", identity_assertion));
+        }
+
+        // Add host candidate for advertised UDP port
+        let mut cand_str = format!(
+            "a=candidate:1 1 udp 2122260199 {} {} typ host generation 0 network-id 1 network-cost 10\r\n",
+            client_host, udp_port
+        );
+        if client_host != "192.168.100.51" {
+            cand_str.push_str(&format!(
+                "a=candidate:2 1 udp 2122260198 192.168.100.51 {} typ host generation 0 network-id 2 network-cost 10\r\n",
+                udp_port
+            ));
+        }
+        final_sdp.push_str(&cand_str);
+
+        // Keep connection active for the game session
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            let _ = pc.close().await;
+        });
+
+        Ok(final_sdp)
+    }
+
+    fn fallback_sdp_answer(
+        client_host: &str,
+        udp_port: u16,
+        identity: &NetherNetIdentity,
+    ) -> String {
+        let fingerprint = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+        let identity_assertion = identity.create_assertion(fingerprint);
+
+        format!(
+            "v=0\r\n\
+             o=- 1 2 IN IP4 {host}\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE 0\r\n\
+             a=identity:{identity}\r\n\
+             m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:rustnetufrag123\r\n\
+             a=ice-pwd:pocketminerustpwd1234567890\r\n\
+             a=fingerprint:sha-256 {fingerprint}\r\n\
+             a=setup:passive\r\n\
+             a=mid:0\r\n\
+             a=sctp-port:5000\r\n\
+             a=max-message-size:262144\r\n\
+             a=candidate:1 1 udp 2122260199 {host} {udp_port} typ host generation 0 network-id 1 network-cost 10\r\n\
+             a=candidate:2 1 udp 2122260198 192.168.100.51 {udp_port} typ host generation 0 network-id 2 network-cost 10\r\n",
+            host = client_host,
+            identity = identity_assertion,
+            fingerprint = fingerprint,
+            udp_port = udp_port
+        )
     }
 }
