@@ -33,7 +33,7 @@ impl Default for ServerInfo {
             game_type: 1, // Survival
             editor: false,
             hardcore: false,
-            online_auth: true,
+            online_auth: false, // Default to false for LAN/custom servers to prevent Terracotta auth failure
             self_signed_auth: true,
             nonce: "".to_string(),
             transport_layer: 2, // NetherNet

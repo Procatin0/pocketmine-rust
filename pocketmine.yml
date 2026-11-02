@@ -1,0 +1,36 @@
+# PocketMine-MP / PocketMine-Rust Server Configuration
+# Reference: https://github.com/axolotl-pm/PocketMine-MP/blob/stable/resources/pocketmine.yml
+
+settings:
+  force-language: false
+  shutdown-message: "Server closed"
+  query-plugins: true
+  enable-profiling: false
+  async-workers: auto
+
+network:
+  batch-threshold: 256
+  compression-level: 6
+  async-compression: false
+  max-mtu-size: 1492
+  enable-encryption: true
+  upnp-forwarding: false
+
+transport:
+  # Network transport(s) used for player connections (comma-separated: nethernet,raknet)
+  name: nethernet,raknet
+  nethernet:
+    key-file: nethernet.key
+    identity-domain: ""
+    ice-udp-mux: false
+    # UDP port range for NetherNet WebRTC connections
+    port-range: [19134, 19140]
+    mtu: 1200
+    builtin-signaling:
+      enabled: true
+      # TCP port for HTTP signaling (default 19133 to prevent collision with RakNet UDP 19132)
+      port: 19133
+      tls:
+        certificate: ""
+        key: ""
+        passphrase: ""
