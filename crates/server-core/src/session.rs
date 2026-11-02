@@ -181,8 +181,8 @@ impl PlayerSession {
         );
 
         let response = NetworkSettingsPacket {
-            compression_threshold: 512,
-            compression_algorithm: 0, // 0 = Deflate / Flate2
+            compression_threshold: 65535,
+            compression_algorithm: 0xFFFF, // none
             client_throttle_threshold: 0,
             client_throttle_scalar: 0.0,
         };
@@ -395,5 +395,82 @@ impl SessionManager {
 
     pub fn session_count(&self) -> usize {
         self.sessions.read().len()
+    }
+
+    /// Dispatches a raw Bedrock network message received over NetherNet WebRtc DataChannels
+    pub fn dispatch_webrtc_packet(&self, peer: SocketAddr, raw: &[u8]) -> Vec<bytes::Bytes> {
+        let mut map = self.sessions.write();
+        let session = map.values_mut().find(|s| s.client_addr == peer);
+        let session = match session {
+            Some(s) => s,
+            None => {
+                let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+                let new_session = PlayerSession::new(id, peer);
+                map.insert(id, new_session);
+                map.get_mut(&id).unwrap()
+            }
+        };
+
+        let mut reader = Reader::new(raw);
+        let mut out_bytes = Vec::new();
+
+        while reader.remaining() > 0 {
+            let first_varint = match reader.read_var_u32() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
+            let packet_id;
+            let payload;
+            if first_varint as usize <= reader.remaining() && first_varint > 0 {
+                // Batch format: first_varint is packet length
+                let pos_after_len = reader.position();
+                let header = match reader.read_var_u32() {
+                    Ok(h) => h,
+                    Err(_) => break,
+                };
+                packet_id = header & 0x3FF;
+                let header_len = reader.position() - pos_after_len;
+                let payload_len = (first_varint as usize).saturating_sub(header_len);
+                payload = match reader.read_bytes(payload_len.min(reader.remaining())) {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+            } else {
+                // Direct format: first_varint is packet header
+                packet_id = first_varint & 0x3FF;
+                payload = reader.read_remaining();
+            }
+
+            info!(
+                "[:WebRTC] Dispatching Bedrock packet 0x{:02X} (len {}) from {}",
+                packet_id, payload.len(), peer
+            );
+
+            match session.handle_packet(packet_id, payload) {
+                Ok(responses) => {
+                    for resp in responses {
+                        let mut pkt_writer = Writer::new();
+                        let header = resp.packet_id() & 0x3FF;
+                        pkt_writer.write_var_u32(header);
+                        if let Err(e) = resp.encode(&mut pkt_writer) {
+                            tracing::error!("Failed to encode outgoing packet 0x{:02X}: {}", resp.packet_id(), e);
+                            continue;
+                        }
+                        let pkt_bytes = pkt_writer.into_bytes();
+
+                        let mut batch_writer = Writer::new();
+                        batch_writer.write_var_u32(pkt_bytes.len() as u32);
+                        batch_writer.write_bytes(&pkt_bytes);
+                        out_bytes.push(batch_writer.into_bytes());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[:WebRTC] Session error handling 0x{:02X} from {}: {}", packet_id, peer, e);
+                }
+            }
+        }
+
+        out_bytes
     }
 }

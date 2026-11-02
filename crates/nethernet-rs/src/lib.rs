@@ -8,4 +8,4 @@ pub mod signaling;
 pub use identity::NetherNetIdentity;
 pub use info::ServerInfo;
 pub use negotiation::{AnswerBuilder, IceCandidate, IceCandidateFormatter};
-pub use signaling::SignalingServer;
+pub use signaling::{NetherNetPacketHandler, SignalingServer};

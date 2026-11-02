@@ -27,27 +27,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // 1. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)
+    // 1. Inicializar gestor de sesiones de jugadores
+    let session_manager = Arc::new(SessionManager::new());
+    info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
+
+    // 2. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)
     // El puerto 19133 es de WebRTC (UDP) y NUNCA debe escuchar en TCP (idéntico a Axolotl/PocketMine)
     let signaling_addr: SocketAddr = "0.0.0.0:19132".parse()?;
     let webrtc_udp_port: u16 = 19133;
 
+    struct BedrockPacketHandler {
+        session_manager: Arc<SessionManager>,
+    }
+
+    impl nethernet_rs::NetherNetPacketHandler for BedrockPacketHandler {
+        fn handle_message(&self, peer: SocketAddr, channel: &str, data: bytes::Bytes) -> Vec<bytes::Bytes> {
+            if channel != "ReliableDataChannel" && channel != "UnreliableDataChannel" {
+                return Vec::new();
+            }
+            self.session_manager.dispatch_webrtc_packet(peer, &data)
+        }
+    }
+
     let identity = Arc::new(NetherNetIdentity::new());
-    let signaling_server = SignalingServer::new(
+    let mut signaling_server = SignalingServer::new(
         signaling_addr,
         server_info,
         webrtc_udp_port,
         identity,
     );
+    signaling_server.set_packet_handler(Arc::new(BedrockPacketHandler {
+        session_manager: Arc::clone(&session_manager),
+    }));
+
     tokio::spawn(async move {
         if let Err(e) = signaling_server.run().await {
             tracing::error!("NetherNet Signaling Server failed: {}", e);
         }
     });
-
-    // 2. Inicializar gestor de sesiones de jugadores
-    let session_manager = Arc::new(SessionManager::new());
-    info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
     // 3. Inicializar motor y puente de plugins (php-plugin-bridge)
     let plugin_manager = Arc::new(php_plugin_bridge::PluginManager::new());

@@ -27,6 +27,10 @@ impl<'a> Reader<'a> {
         self.data.len().saturating_sub(self.pos)
     }
 
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     pub fn read_byte(&mut self) -> Result<u8, CodecError> {
         if self.pos >= self.data.len() {
             return Err(CodecError::UnexpectedEof { needed: 1, available: 0 });

@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use rtc::ice::network_type::NetworkType;
 use rtc::peer_connection::transport::{RTCDtlsRole, RTCIceCandidateInit};
@@ -22,9 +22,14 @@ use crate::identity::NetherNetIdentity;
 use crate::info::ServerInfo;
 use crate::negotiation::{AnswerBuilder, IceCandidateFormatter};
 
+pub trait NetherNetPacketHandler: Send + Sync {
+    fn handle_message(&self, peer: SocketAddr, channel: &str, data: bytes::Bytes) -> Vec<bytes::Bytes>;
+}
+
 struct NetherNetWebRtcHandler {
     gather_notify: Arc<tokio::sync::Notify>,
     peer_addr: SocketAddr,
+    packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
 }
 
 #[async_trait::async_trait]
@@ -50,17 +55,31 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
         let id = dc.id();
         info!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
 
+        let handler = self.packet_handler.clone();
         tokio::spawn(async move {
             loop {
                 match dc.poll().await {
                     Some(DataChannelEvent::OnMessage(msg)) => {
                         if !msg.data.is_empty() {
                             let countdown = msg.data[0];
-                            let payload = &msg.data[1..];
+                            let payload = bytes::Bytes::copy_from_slice(&msg.data[1..]);
                             debug!(
                                 "[:WebRTC] DataChannel '{}' message from {} (countdown={}, len={})",
                                 label, peer, countdown, payload.len()
                             );
+                            if let Some(ref ph) = handler {
+                                let responses = ph.handle_message(peer, &label, payload);
+                                for resp in responses {
+                                    let mut framed = Vec::with_capacity(resp.len() + 1);
+                                    framed.push(0x00); // 0x00 NetherNet countdown header (unfragmented)
+                                    framed.extend_from_slice(&resp);
+                                    let mut buf = bytes::BytesMut::with_capacity(framed.len());
+                                    buf.extend_from_slice(&framed);
+                                    if let Err(e) = dc.send(buf).await {
+                                        error!("[:WebRTC] Failed to send response on '{}': {}", label, e);
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(DataChannelEvent::OnClose) | None => {
@@ -81,6 +100,7 @@ pub struct SignalingServer {
     identity: Arc<NetherNetIdentity>,
     tls_acceptor: Arc<TlsAcceptor>,
     active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
+    packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
 }
 
 impl SignalingServer {
@@ -98,6 +118,7 @@ impl SignalingServer {
             identity,
             tls_acceptor,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
+            packet_handler: None,
         }
     }
 
@@ -115,7 +136,17 @@ impl SignalingServer {
             identity,
             tls_acceptor,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
+            packet_handler: None,
         }
+    }
+
+    pub fn set_packet_handler(&mut self, handler: Arc<dyn NetherNetPacketHandler>) {
+        self.packet_handler = Some(handler);
+    }
+
+    pub fn with_packet_handler(mut self, handler: Arc<dyn NetherNetPacketHandler>) -> Self {
+        self.packet_handler = Some(handler);
+        self
     }
 
     fn create_self_signed_tls_acceptor() -> TlsAcceptor {
@@ -146,8 +177,9 @@ impl SignalingServer {
             let identity = Arc::clone(&self.identity);
             let tls_acceptor = Arc::clone(&self.tls_acceptor);
             let active_peers = Arc::clone(&self.active_peers);
+            let packet_handler = self.packet_handler.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor, active_peers).await {
+                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor, active_peers, packet_handler).await {
                     error!("Signaling listener failed on {}: {}", addr, e);
                 }
             });
@@ -163,6 +195,7 @@ impl SignalingServer {
         identity: Arc<NetherNetIdentity>,
         tls_acceptor: Arc<TlsAcceptor>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
+        packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         loop {
@@ -173,6 +206,7 @@ impl SignalingServer {
             let identity = Arc::clone(&identity);
             let tls_acceptor = Arc::clone(&tls_acceptor);
             let active_peers = Arc::clone(&active_peers);
+            let packet_handler = packet_handler.clone();
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_connection(
                     stream,
@@ -183,6 +217,7 @@ impl SignalingServer {
                     identity,
                     tls_acceptor,
                     active_peers,
+                    packet_handler,
                 )
                 .await
                 {
@@ -201,6 +236,7 @@ impl SignalingServer {
         identity: Arc<NetherNetIdentity>,
         tls_acceptor: Arc<TlsAcceptor>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
+        packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
     ) -> std::io::Result<()> {
         let mut peek_buf = [0u8; 1];
         let n = stream.peek(&mut peek_buf).await?;
@@ -213,7 +249,7 @@ impl SignalingServer {
             debug!("[:{}] TLS Handshake (HTTPS) initiated by {}", signaling_port, peer_addr);
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers).await
+                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler).await
                 }
                 Err(e) => {
                     debug!("[:{}] TLS handshake failed from {}: {}", signaling_port, peer_addr, e);
@@ -222,7 +258,7 @@ impl SignalingServer {
             }
         } else {
             // Plaintext HTTP connection
-            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers).await
+            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler).await
         }
     }
 
@@ -234,6 +270,7 @@ impl SignalingServer {
         signaling_port: u16,
         identity: Arc<NetherNetIdentity>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
+        packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
     ) -> std::io::Result<()> {
         // Read HTTP request headers in a loop until \r\n\r\n or \n\n
         let mut buffer = Vec::new();
@@ -373,6 +410,24 @@ impl SignalingServer {
             info!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
 
             let offer_sdp = String::from_utf8_lossy(&body_bytes).to_string();
+            if offer_sdp.trim().is_empty() {
+                warn!("[:{}] Empty offer SDP received from {}", signaling_port, peer_addr);
+                let err_body = "5";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {}",
+                    err_body.len(),
+                    err_body
+                );
+                stream.write_all(response.as_bytes()).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+
             let primary_udp = udp_ports.first().copied().unwrap_or(19133);
 
             match Self::generate_sdp_answer(
@@ -383,6 +438,7 @@ impl SignalingServer {
                 peer_addr,
                 &identity,
                 &active_peers,
+                &packet_handler,
             ).await {
                 Ok(sdp_answer) => {
                     let response = format!(
@@ -434,50 +490,13 @@ impl SignalingServer {
         peer_addr: SocketAddr,
         identity: &NetherNetIdentity,
         active_peers: &Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
+        packet_handler: &Option<Arc<dyn NetherNetPacketHandler>>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Clean up any previous PeerConnection on this UDP port to ensure the port can be cleanly bound
-        {
-            let mut peers = active_peers.lock().await;
-            if let Some(old_pc) = peers.remove(network_id) {
-                let _ = old_pc.close().await;
-            }
-            // If any other connection is inactive or broken, clear it
-            peers.retain(|_, pc| {
-                // If closed, drop
-                let _ = pc;
-                true
-            });
+        if offer_sdp.trim().is_empty() {
+            return Err("Offer SDP is empty".into());
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
-        let gather_notify = Arc::new(tokio::sync::Notify::new());
-        let handler = Arc::new(NetherNetWebRtcHandler {
-            gather_notify: Arc::clone(&gather_notify),
-            peer_addr,
-        });
-
-        // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:
-        // - DTLS Role: Server (setup:passive)
-        // - Network types: UDP only (TCP disabled)
-        // - mDNS disabled
-        let setting_engine = SettingEngineBuilder::new()
-            .with_answering_dtls_role(RTCDtlsRole::Server)
-            .with_multicast_dns_mode(rtc::ice::mdns::MulticastDnsMode::Disabled)
-            .with_network_types(vec![NetworkType::Udp4])
-            .build();
-
-        let config = RTCConfigurationBuilder::new().build();
-        let pc: Arc<dyn PeerConnection> = Arc::new(
-            PeerConnectionBuilder::new()
-                .with_configuration(config)
-                .with_setting_engine(setting_engine)
-                .with_handler(handler)
-                .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
-                .build()
-                .await?,
-        );
-
-        // 3. Clean client offer: strip out any existing a=identity line before setting remote description
+        // Clean client offer before creating PC
         let cleaned_offer = offer_sdp
             .lines()
             .filter(|line| !line.starts_with("a=identity:"))
@@ -485,55 +504,113 @@ impl SignalingServer {
             .join("\r\n") + "\r\n";
 
         let offer = RTCSessionDescription::offer(cleaned_offer)?;
-        pc.set_remote_description(offer).await?;
 
-        // 4. Check if client offer needs signalingPeer candidate (from Axolotl TransportNegotiator.php)
-        let peer_ip = peer_addr.ip().to_string();
-        if let Some(cand_str) = IceCandidateFormatter::signaling_peer(offer_sdp, &peer_ip) {
-            let init = RTCIceCandidateInit {
-                candidate: cand_str,
-                sdp_mid: Some("0".to_string()),
-                sdp_mline_index: Some(0),
-                username_fragment: None,
-                url: None,
-            };
-            if let Err(e) = pc.add_ice_candidate(init).await {
-                debug!("[:WebRTC] signalingPeer candidate add ignored: {}", e);
-            }
-        }
-
-        let answer = pc.create_answer(None).await?;
-        pc.set_local_description(answer).await?;
-
-        // 5. Wait for ICE candidate gathering to finish (up to 1000ms)
-        tokio::select! {
-            _ = gather_notify.notified() => {
-                debug!("[:WebRTC] ICE gathering completed for {}", peer_addr);
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {
-                debug!("[:WebRTC] ICE gathering wait elapsed for {}", peer_addr);
-            }
-        }
-
-        let local_desc = pc.local_description().await.ok_or("No local description produced")?;
-
-        // 6. Build the final SDP answer using AnswerBuilder (translating Axolotl AnswerBuilder.php & IceCandidateFormatter.php)
-        let mut advertised_addrs = vec![client_host.to_string()];
-        if client_host != "192.168.100.51" {
-            advertised_addrs.push("192.168.100.51".to_string());
-        }
-        let builder = AnswerBuilder::new(advertised_addrs);
-        let final_sdp = builder
-            .build(&local_desc.sdp, identity)
-            .map_err(|e| std::io::Error::other(e))?;
-
-        // 7. Retain the active PeerConnection in active_peers
+        // 1. Clean up all previous PeerConnections on this UDP port to ensure the port is cleanly freed
         {
             let mut peers = active_peers.lock().await;
-            peers.insert(network_id.to_string(), Arc::clone(&pc));
+            for (id, old_pc) in peers.drain() {
+                debug!("[:WebRTC] Closing prior PeerConnection for {} on port {}", id, udp_port);
+                let _ = old_pc.close().await;
+            }
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        Ok(final_sdp)
+        let gather_notify = Arc::new(tokio::sync::Notify::new());
+        let handler: Arc<dyn PeerConnectionEventHandler> = Arc::new(NetherNetWebRtcHandler {
+            gather_notify: Arc::clone(&gather_notify),
+            peer_addr,
+            packet_handler: packet_handler.clone(),
+        });
+
+        // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:
+        let mut pc_res = None;
+        for attempt in 1..=5 {
+            let setting_engine = SettingEngineBuilder::new()
+                .with_answering_dtls_role(RTCDtlsRole::Server)
+                .with_multicast_dns_mode(rtc::ice::mdns::MulticastDnsMode::Disabled)
+                .with_network_types(vec![NetworkType::Udp4])
+                .build();
+            let config = RTCConfigurationBuilder::new().build();
+
+            match PeerConnectionBuilder::new()
+                .with_configuration(config)
+                .with_setting_engine(setting_engine)
+                .with_handler(Arc::clone(&handler))
+                .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
+                .build()
+                .await
+            {
+                Ok(built) => {
+                    pc_res = Some(built);
+                    break;
+                }
+                Err(e) => {
+                    if attempt < 5 {
+                        debug!("[:WebRTC] Bind attempt {} on UDP :{} failed ({}), retrying in 60ms...", attempt, udp_port, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
+                    } else {
+                        return Err(Box::new(e));
+                    }
+                }
+            }
+        }
+        let pc: Arc<dyn PeerConnection> = Arc::new(pc_res.unwrap());
+        active_peers.lock().await.insert(network_id.to_string(), Arc::clone(&pc));
+
+        let negotiation = async {
+            pc.set_remote_description(offer).await?;
+
+            // Check if client offer needs signalingPeer candidate (from Axolotl TransportNegotiator.php)
+            let peer_ip = peer_addr.ip().to_string();
+            if let Some(cand_str) = IceCandidateFormatter::signaling_peer(offer_sdp, &peer_ip) {
+                let init = RTCIceCandidateInit {
+                    candidate: cand_str,
+                    sdp_mid: Some("0".to_string()),
+                    sdp_mline_index: Some(0),
+                    username_fragment: None,
+                    url: None,
+                };
+                if let Err(e) = pc.add_ice_candidate(init).await {
+                    debug!("[:WebRTC] signalingPeer candidate add ignored: {}", e);
+                }
+            }
+
+            let answer = pc.create_answer(None).await?;
+            pc.set_local_description(answer).await?;
+
+            // Wait for ICE candidate gathering to finish (up to 1000ms)
+            tokio::select! {
+                _ = gather_notify.notified() => {
+                    debug!("[:WebRTC] ICE gathering completed for {}", peer_addr);
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {
+                    debug!("[:WebRTC] ICE gathering wait elapsed for {}", peer_addr);
+                }
+            }
+
+            let local_desc = pc.local_description().await.ok_or_else(|| std::io::Error::other("No local description produced"))?;
+
+            // Build the final SDP answer using AnswerBuilder (translating Axolotl AnswerBuilder.php & IceCandidateFormatter.php)
+            let mut advertised_addrs = vec![client_host.to_string()];
+            if client_host != "192.168.100.51" {
+                advertised_addrs.push("192.168.100.51".to_string());
+            }
+            let builder = AnswerBuilder::new(advertised_addrs);
+            let final_sdp = builder
+                .build(&local_desc.sdp, identity)
+                .map_err(|e| std::io::Error::other(e))?;
+
+            Ok::<String, Box<dyn std::error::Error + Send + Sync>>(final_sdp)
+        }.await;
+
+        match negotiation {
+            Ok(final_sdp) => Ok(final_sdp),
+            Err(e) => {
+                let _ = pc.close().await;
+                active_peers.lock().await.remove(network_id);
+                Err(e)
+            }
+        }
     }
 
     pub fn fallback_sdp_answer(
