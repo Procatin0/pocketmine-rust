@@ -52,6 +52,8 @@ impl SignalingServer {
         let method = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
 
+        info!("Incoming signaling request: {} {} from {}", method, path, peer_addr);
+
         if method == "GET" && (path == "/v1/join" || path == "/v1/join/") {
             // Client probe: return ServerInfo JSON
             let json = info.to_json().map_err(|e| {
