@@ -48,4 +48,7 @@ impl StaticPackets {
 
     pub const NETWORK_CHUNK_PUBLISHER_UPDATE: &'static [u8] =
         include_bytes!("../../../data/bds-capture/network_chunk_publisher_update/1.bin");
+
+    pub const UPDATE_ADVENTURE_SETTINGS: &'static [u8] =
+        include_bytes!("../../../data/bds-capture/update_adventure_settings/1.bin");
 }

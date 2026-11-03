@@ -112,5 +112,13 @@ pub fn deserialize_subchunk(reader: &mut Reader) -> Result<SubChunk, SubChunkNet
         layers.push(PalettedBlockArray::from_raw(bits_per_block, words, palette));
     }
 
-    Ok(SubChunk { layers })
+    let default_block = layers
+        .first()
+        .and_then(|l| l.palette().first().copied())
+        .unwrap_or(crate::block_id::AIR);
+
+    Ok(SubChunk {
+        default_block,
+        layers,
+    })
 }

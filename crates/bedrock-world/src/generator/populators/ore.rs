@@ -150,12 +150,12 @@ impl OrePopulator {
                 + 1.0)
                 / 2.0;
 
-            let start_x = (center_x - radius).floor() as i32;
-            let end_x = (center_x + radius).ceil() as i32;
-            let start_y = (center_y - radius).floor() as i32;
-            let end_y = (center_y + radius).ceil() as i32;
-            let start_z = (center_z - radius).floor() as i32;
-            let end_z = (center_z + radius).ceil() as i32;
+            let start_x = (center_x - radius) as i32;
+            let end_x = (center_x + radius) as i32;
+            let start_y = (center_y - radius) as i32;
+            let end_y = (center_y + radius) as i32;
+            let start_z = (center_z - radius) as i32;
+            let end_z = (center_z + radius) as i32;
 
             for xx in start_x..=end_x {
                 let size_x = (xx as f64 + 0.5 - center_x) / radius;

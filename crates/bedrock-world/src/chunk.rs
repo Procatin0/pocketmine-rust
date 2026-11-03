@@ -42,7 +42,12 @@ impl Chunk {
     pub fn get_block(&self, x: usize, y: i32, z: usize) -> u32 {
         if let Some(sc_idx) = Self::subchunk_index(y) {
             let by = (y & 15) as usize;
-            self.subchunks[sc_idx].get_block(x, by, z, 0)
+            let id = self.subchunks[sc_idx].get_block(x, by, z, 0);
+            if id == 0 {
+                block_id::AIR
+            } else {
+                id
+            }
         } else {
             block_id::AIR
         }
@@ -64,7 +69,7 @@ impl Chunk {
             let base_y = (sc_idx as i32 + MIN_SUBCHUNK_INDEX) * 16;
             for by in (0..16).rev() {
                 let id = self.subchunks[sc_idx].get_block(x, by, z, 0);
-                if id != block_id::AIR {
+                if id != 0 && id != block_id::AIR {
                     return Some(base_y + by as i32);
                 }
             }

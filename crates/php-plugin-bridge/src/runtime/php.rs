@@ -319,9 +319,14 @@ impl PhpWorker {
 
     /// Attempts to spawn the PHP worker process.
     pub async fn start(&self) -> Result<bool, PluginError> {
+        let code = POCKETMINE_BOOTSTRAP_PHP
+            .strip_prefix("<?php")
+            .unwrap_or(POCKETMINE_BOOTSTRAP_PHP)
+            .trim_start();
+
         let mut child = match Command::new("php")
             .arg("-r")
-            .arg(POCKETMINE_BOOTSTRAP_PHP)
+            .arg(code)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

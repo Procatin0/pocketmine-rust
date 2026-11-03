@@ -63,7 +63,15 @@ static RIVER_COVER: &[u32] = &[
     block_id::DIRT,
 ];
 
-static EMPTY_COVER: &[u32] = &[];
+static GRAVEL_COVER: &[u32] = &[
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+];
+
+static _EMPTY_COVER: &[u32] = &[];
 
 pub fn get_biome_info(id: u8) -> BiomeInfo {
     match id {
@@ -72,7 +80,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Ocean",
             min_elevation: 46.0,
             max_elevation: 58.0,
-            ground_cover: EMPTY_COVER,
+            ground_cover: GRAVEL_COVER,
             temperature: 0.5,
             rainfall: 0.5,
         },
@@ -171,7 +179,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Ocean",
             min_elevation: 46.0,
             max_elevation: 58.0,
-            ground_cover: EMPTY_COVER,
+            ground_cover: GRAVEL_COVER,
             temperature: 0.5,
             rainfall: 0.5,
         },

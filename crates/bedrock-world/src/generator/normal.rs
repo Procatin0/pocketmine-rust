@@ -67,15 +67,37 @@ impl NormalGenerator {
             spawn_pos: (0, Self::SEA_LEVEL + 2, 0),
         };
 
-        // Calculate actual spawn height at (0, 0)
-        let chunk = gen.generate_chunk_internal(0, 0);
-        let h = chunk.get_highest_block_at(0, 0).unwrap_or(Self::SEA_LEVEL);
-        gen.spawn_pos = (0, (h + 1).max(Self::SEA_LEVEL + 1), 0);
+        // Search for nearest solid land above sea level (safe spawn point matching PocketMine getSafeSpawn)
+        let mut spawn = (0, Self::SEA_LEVEL + 2, 0);
+        'search: for radius in 0i32..16 {
+            for cx in -radius..=radius {
+                for cz in -radius..=radius {
+                    if cx.abs() != radius && cz.abs() != radius {
+                        continue;
+                    }
+                    let chunk = gen.generate_chunk_internal(cx, cz);
+                    for x in 0..16 {
+                        for z in 0..16 {
+                            if let Some(h) = chunk.get_highest_block_at(x, z) {
+                                let b = chunk.get_block(x, h, z);
+                                if h > Self::SEA_LEVEL && block_id::is_solid(b) {
+                                    let world_x = cx * 16 + x as i32;
+                                    let world_z = cz * 16 + z as i32;
+                                    spawn = (world_x, h + 1, world_z);
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        gen.spawn_pos = spawn;
 
         gen
     }
 
-    fn generate_chunk_internal(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
+    pub fn generate_chunk_internal(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
         let mut random = Random::new(0xdeadbeef ^ ((chunk_x as i64) << 8) ^ (chunk_z as i64) ^ self.seed);
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;

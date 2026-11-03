@@ -374,6 +374,9 @@ impl PlayerSession {
                 // 10. GameRulesChangedPacket (0x48 / 72)
                 out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
 
+                // 10b. UpdateAdventureSettingsPacket (0x37 / 55)
+                out.push(OutgoingPacket::RawWire(StaticPackets::UPDATE_ADVENTURE_SETTINGS.to_vec()));
+
                 // 11. SetSpawnPositionPacket (0x2B / 43)
                 let spawn_pos = BlockPos::new(sx, sy, sz);
                 out.push(OutgoingPacket::SetSpawnPosition(
@@ -385,9 +388,11 @@ impl PlayerSession {
                     NetworkChunkPublisherUpdatePacket::new(spawn_pos, 64),
                 ));
 
-                // 13. Create initial 5x5 chunks around spawn (x: -2..=2, z: -2..=2)
-                for cx in -2..=2 {
-                    for cz in -2..=2 {
+                // 13. Create initial 5x5 chunks around spawn
+                let spawn_cx = sx >> 4;
+                let spawn_cz = sz >> 4;
+                for cx in (spawn_cx - 2)..=(spawn_cx + 2) {
+                    for cz in (spawn_cz - 2)..=(spawn_cz + 2) {
                         out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
                     }
                 }
@@ -435,11 +440,16 @@ impl PlayerSession {
             ),
         ];
 
-        // Generate surrounding chunks for the client requested radius
-        for x in -clamped_radius..=clamped_radius {
-            for z in -clamped_radius..=clamped_radius {
-                if x.abs() > 2 || z.abs() > 2 {
-                    out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(x, z)));
+        // Generate surrounding chunks for the client requested radius around spawn chunk
+        let (sx, _sy, sz) = self.generator.spawn_position();
+        let spawn_cx = sx >> 4;
+        let spawn_cz = sz >> 4;
+        for dx in -clamped_radius..=clamped_radius {
+            for dz in -clamped_radius..=clamped_radius {
+                if dx.abs() > 2 || dz.abs() > 2 {
+                    let cx = spawn_cx + dx;
+                    let cz = spawn_cz + dz;
+                    out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
                 }
             }
         }

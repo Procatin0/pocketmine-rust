@@ -3,6 +3,7 @@ use crate::paletted_block_array::PalettedBlockArray;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubChunk {
+    pub default_block: u32,
     pub layers: Vec<PalettedBlockArray>,
 }
 
@@ -11,12 +12,16 @@ impl SubChunk {
 
     pub fn new(fill_entry: u32) -> Self {
         Self {
+            default_block: fill_entry,
             layers: vec![PalettedBlockArray::new(fill_entry)],
         }
     }
 
     pub fn empty() -> Self {
-        Self { layers: Vec::new() }
+        Self {
+            default_block: crate::block_id::AIR,
+            layers: Vec::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -31,12 +36,12 @@ impl SubChunk {
         self.layers
             .get(layer)
             .map(|l| l.get(x, y, z))
-            .unwrap_or(0)
+            .unwrap_or(self.default_block)
     }
 
     pub fn set_block(&mut self, x: usize, y: usize, z: usize, layer: usize, block_id: u32) {
         if layer >= self.layers.len() {
-            self.layers.resize_with(layer + 1, || PalettedBlockArray::new(0));
+            self.layers.resize_with(layer + 1, || PalettedBlockArray::new(self.default_block));
         }
         self.layers[layer].set(x, y, z, block_id);
     }
