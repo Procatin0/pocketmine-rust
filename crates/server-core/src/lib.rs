@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod session;
+pub mod static_packets;
 
 pub use config::ServerConfig;
 pub use session::{

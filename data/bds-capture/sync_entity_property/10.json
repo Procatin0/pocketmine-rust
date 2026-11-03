@@ -1,0 +1,45 @@
+{
+  "nbt": {
+    "type": "compound",
+    "name": "",
+    "value": {
+      "properties": {
+        "type": "list",
+        "value": {
+          "type": "compound",
+          "value": [
+            {
+              "enum": {
+                "type": "list",
+                "value": {
+                  "type": "string",
+                  "value": [
+                    "default",
+                    "big",
+                    "cute",
+                    "grumpy",
+                    "mad",
+                    "puglin",
+                    "sad"
+                  ]
+                }
+              },
+              "name": {
+                "type": "string",
+                "value": "minecraft:sound_variant"
+              },
+              "type": {
+                "type": "int",
+                "value": 3
+              }
+            }
+          ]
+        }
+      },
+      "type": {
+        "type": "string",
+        "value": "minecraft:wolf"
+      }
+    }
+  }
+}

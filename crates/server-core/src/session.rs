@@ -13,7 +13,9 @@ use bedrock_protocol::{
 use bedrock_world::SubChunk;
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
+
+use crate::static_packets::StaticPackets;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -54,6 +56,7 @@ pub enum OutgoingPacket {
     ChunkRadiusUpdated(ChunkRadiusUpdatedPacket),
     LevelChunk(LevelChunkPacket),
     Disconnect(DisconnectPacket),
+    RawWire(Vec<u8>),
 }
 
 impl OutgoingPacket {
@@ -67,6 +70,10 @@ impl OutgoingPacket {
             Self::ChunkRadiusUpdated(p) => p.packet_id(),
             Self::LevelChunk(p) => p.packet_id(),
             Self::Disconnect(p) => p.packet_id(),
+            Self::RawWire(bytes) => {
+                let mut reader = Reader::new(bytes);
+                reader.read_var_u32().unwrap_or(0) & 0x3FF
+            }
         }
     }
 
@@ -80,6 +87,10 @@ impl OutgoingPacket {
             Self::ChunkRadiusUpdated(p) => p.encode(writer),
             Self::LevelChunk(p) => p.encode(writer),
             Self::Disconnect(p) => p.encode(writer),
+            Self::RawWire(bytes) => {
+                writer.write_bytes(bytes);
+                Ok(())
+            }
         }
     }
 
@@ -283,8 +294,17 @@ impl PlayerSession {
             }
             3 | 4 if self.state == SessionState::ResourcePackStack || self.state == SessionState::ResourcePacks => {
                 self.state = SessionState::InGame;
-                info!("Session {} entered world (InGame)", self.session_id);
+                info!("Session {} entered world (InGame) - sending pre-spawn declaration and world packets", self.session_id);
 
+                let mut out = Vec::new();
+
+                // 1. JigsawStructureDataPacket (0x139 / 313) - Required before StartGame in 1.21+ / 1.26
+                out.push(OutgoingPacket::RawWire(StaticPackets::JIGSAW_STRUCTURE_DATA.to_vec()));
+
+                // 2. VoxelShapesPacket (0x151 / 337) - Required before StartGame in 1.21+ / 1.26
+                out.push(OutgoingPacket::RawWire(StaticPackets::VOXEL_SHAPES.to_vec()));
+
+                // 3. StartGamePacket (0x0B / 11) - Core world configuration
                 let mut start_game = StartGamePacket::default();
                 start_game.actor_unique_id = self.entity_unique_id;
                 start_game.actor_runtime_id = self.entity_runtime_id;
@@ -297,19 +317,55 @@ impl PlayerSession {
                 start_game.level_settings.difficulty = 1;
                 start_game.level_settings.dimension = 0;
                 start_game.world_name = "PocketMine-Rust World".to_string();
+                out.push(OutgoingPacket::StartGame(start_game));
 
-                // Create initial spawn chunk (0, 0)
+                // 4. ItemRegistryPacket (0xA2 / 162) - Dynamic session item dictionary
+                out.push(OutgoingPacket::RawWire(StaticPackets::ITEM_REGISTRY.to_vec()));
+
+                // 5. AvailableActorIdentifiersPacket (0x77 / 119) - Entity definitions
+                out.push(OutgoingPacket::RawWire(StaticPackets::AVAILABLE_ENTITY_IDENTIFIERS.to_vec()));
+
+                // 6. BiomeDefinitionListPacket (0x7A / 122) - World biomes
+                out.push(OutgoingPacket::RawWire(StaticPackets::BIOME_DEFINITION_LIST.to_vec()));
+
+                // 7. CameraPresetsPacket (0xC6 / 198)
+                out.push(OutgoingPacket::RawWire(StaticPackets::CAMERA_PRESETS.to_vec()));
+
+                // 8. CreativeContentPacket (0x91 / 145)
+                out.push(OutgoingPacket::RawWire(StaticPackets::CREATIVE_CONTENT.to_vec()));
+
+                // 9. TrimDataPacket (0x12E / 302)
+                out.push(OutgoingPacket::RawWire(StaticPackets::TRIM_DATA.to_vec()));
+
+                // 10. CraftingDataPacket (0x34 / 52)
+                out.push(OutgoingPacket::RawWire(StaticPackets::CRAFTING_DATA.to_vec()));
+
+                // 11. SetCommandsEnabledPacket (0x3B / 59)
+                out.push(OutgoingPacket::RawWire(StaticPackets::SET_COMMANDS_ENABLED.to_vec()));
+
+                // 12. SetDifficultyPacket (0x3C / 60)
+                out.push(OutgoingPacket::RawWire(StaticPackets::SET_DIFFICULTY.to_vec()));
+
+                // 13. GameRulesChangedPacket (0x48 / 72)
+                out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
+
+                // 14. SetSpawnPositionPacket (0x2B / 43)
+                out.push(OutgoingPacket::RawWire(StaticPackets::SET_SPAWN_POSITION.to_vec()));
+
+                // 15. NetworkChunkPublisherUpdatePacket (0x79 / 121)
+                out.push(OutgoingPacket::RawWire(StaticPackets::NETWORK_CHUNK_PUBLISHER_UPDATE.to_vec()));
+
+                // 16. Create initial spawn chunk (0, 0)
                 let spawn_chunk = self.create_chunk_packet(0, 0);
+                out.push(OutgoingPacket::LevelChunk(spawn_chunk));
 
+                // 17. Confirm spawn to client (PLAYER_SPAWN = 3)
                 let play_status = PlayStatusPacket {
                     status: PlayStatusPacket::PLAYER_SPAWN,
                 };
+                out.push(OutgoingPacket::PlayStatus(play_status));
 
-                Ok(vec![
-                    OutgoingPacket::StartGame(start_game),
-                    OutgoingPacket::LevelChunk(spawn_chunk),
-                    OutgoingPacket::PlayStatus(play_status),
-                ])
+                Ok(out)
             }
             other => {
                 debug!("Session {} sent unknown resource pack status: {}", self.session_id, other);
@@ -466,7 +522,8 @@ impl SessionManager {
             }
         };
 
-        let mut outgoing_batch = Vec::new();
+        let mut batches: Vec<Vec<u8>> = Vec::new();
+        let mut current_batch = Vec::new();
 
         for (packet_id, payload) in packets {
             info!(
@@ -477,28 +534,37 @@ impl SessionManager {
             match session.handle_packet(packet_id, &payload) {
                 Ok(responses) => {
                     for resp in responses {
-                        let mut pkt_writer = Writer::new();
-                        let header = resp.packet_id() & 0x3FF;
-                        pkt_writer.write_var_u32(header);
-                        if let Err(e) = resp.encode(&mut pkt_writer) {
-                            tracing::error!("Failed to encode outgoing packet 0x{:02X}: {}", resp.packet_id(), e);
-                            continue;
-                        }
-                        let pkt_bytes = pkt_writer.into_bytes();
+                        let pkt_bytes = match &resp {
+                            OutgoingPacket::RawWire(bytes) => bytes::Bytes::copy_from_slice(bytes),
+                            _ => {
+                                let mut pkt_writer = Writer::new();
+                                let header = resp.packet_id() & 0x3FF;
+                                pkt_writer.write_var_u32(header);
+                                if let Err(e) = resp.encode(&mut pkt_writer) {
+                                    tracing::error!("Failed to encode outgoing packet 0x{:02X}: {}", resp.packet_id(), e);
+                                    continue;
+                                }
+                                pkt_writer.into_bytes()
+                            }
+                        };
 
                         let mut entry_writer = Writer::new();
                         entry_writer.write_var_u32(pkt_bytes.len() as u32);
                         entry_writer.write_bytes(&pkt_bytes);
-                        outgoing_batch.extend_from_slice(&entry_writer.into_bytes());
+                        let framed_entry = entry_writer.into_bytes();
 
-                        // If response was NetworkSettingsPacket, enable compression for following packets
+                        // If response was NetworkSettingsPacket, send uncompressed immediately
                         if resp.packet_id() == 0x8F {
-                            // NetworkSettingsPacket itself is sent uncompressed:
-                            let uncompressed_resp = outgoing_batch.clone();
-                            outgoing_batch.clear();
                             session.compression_enabled = true;
-                            return vec![bytes::Bytes::from(uncompressed_resp)];
+                            return vec![bytes::Bytes::from(framed_entry)];
                         }
+
+                        // Flush current batch if adding this packet exceeds ~32KB to keep SCTP message size optimal
+                        if !current_batch.is_empty() && current_batch.len() + framed_entry.len() > 32768 {
+                            batches.push(std::mem::take(&mut current_batch));
+                        }
+
+                        current_batch.extend_from_slice(&framed_entry);
                     }
                 }
                 Err(e) => {
@@ -507,21 +573,24 @@ impl SessionManager {
             }
         }
 
-        if outgoing_batch.is_empty() {
-            return Vec::new();
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
         }
 
-        // Compress the outgoing batch if compression is active
-        if session.compression_enabled {
-            match PacketBatch::compress(&outgoing_batch, 512) {
-                Ok(compressed) => vec![bytes::Bytes::from(compressed)],
-                Err(e) => {
-                    tracing::error!("Failed to compress outgoing batch for {}: {}", peer, e);
-                    vec![bytes::Bytes::from(outgoing_batch)]
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if session.compression_enabled {
+                match PacketBatch::compress(&batch, 512) {
+                    Ok(compressed) => out.push(bytes::Bytes::from(compressed)),
+                    Err(e) => {
+                        tracing::error!("Failed to compress outgoing batch for {}: {}", peer, e);
+                        out.push(bytes::Bytes::from(batch));
+                    }
                 }
+            } else {
+                out.push(bytes::Bytes::from(batch));
             }
-        } else {
-            vec![bytes::Bytes::from(outgoing_batch)]
         }
+        out
     }
 }

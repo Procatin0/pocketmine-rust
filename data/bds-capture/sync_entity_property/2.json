@@ -1,0 +1,30 @@
+{
+  "nbt": {
+    "type": "compound",
+    "name": "",
+    "value": {
+      "properties": {
+        "type": "list",
+        "value": {
+          "type": "compound",
+          "value": [
+            {
+              "name": {
+                "type": "string",
+                "value": "minecraft:can_move"
+              },
+              "type": {
+                "type": "int",
+                "value": 2
+              }
+            }
+          ]
+        }
+      },
+      "type": {
+        "type": "string",
+        "value": "minecraft:happy_ghast"
+      }
+    }
+  }
+}

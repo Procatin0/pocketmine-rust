@@ -1,0 +1,75 @@
+{
+  "nbt": {
+    "type": "compound",
+    "name": "",
+    "value": {
+      "properties": {
+        "type": "list",
+        "value": {
+          "type": "compound",
+          "value": [
+            {
+              "enum": {
+                "type": "list",
+                "value": {
+                  "type": "string",
+                  "value": [
+                    "none",
+                    "take",
+                    "take_fail",
+                    "put",
+                    "put_fail"
+                  ]
+                }
+              },
+              "name": {
+                "type": "string",
+                "value": "minecraft:chest_interaction"
+              },
+              "type": {
+                "type": "int",
+                "value": 3
+              }
+            },
+            {
+              "name": {
+                "type": "string",
+                "value": "minecraft:has_flower"
+              },
+              "type": {
+                "type": "int",
+                "value": 2
+              }
+            },
+            {
+              "enum": {
+                "type": "list",
+                "value": {
+                  "type": "string",
+                  "value": [
+                    "unoxidized",
+                    "exposed",
+                    "weathered",
+                    "oxidized"
+                  ]
+                }
+              },
+              "name": {
+                "type": "string",
+                "value": "minecraft:oxidation_level"
+              },
+              "type": {
+                "type": "int",
+                "value": 3
+              }
+            }
+          ]
+        }
+      },
+      "type": {
+        "type": "string",
+        "value": "minecraft:copper_golem"
+      }
+    }
+  }
+}

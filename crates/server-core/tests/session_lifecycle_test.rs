@@ -90,37 +90,34 @@ fn test_session_full_login_lifecycle() {
 
     assert_eq!(session.state, SessionState::InGame);
     assert!(session.is_in_game());
-    assert_eq!(responses.len(), 3);
+    assert!(responses.len() >= 3);
 
-    // Verify StartGamePacket
-    match &responses[0] {
-        OutgoingPacket::StartGame(p) => {
-            assert_eq!(p.actor_unique_id, 42);
-            assert_eq!(p.actor_runtime_id, 42);
-            assert_eq!(p.player_gamemode, 0);
-            assert_eq!(p.world_name, "PocketMine-Rust World");
-        }
-        other => panic!("Expected StartGame, got {:?}", other),
-    }
+    // Verify StartGamePacket is present
+    let start_game = responses.iter().find_map(|r| match r {
+        OutgoingPacket::StartGame(p) => Some(p),
+        _ => None,
+    }).expect("Expected StartGamePacket in responses");
+    assert_eq!(start_game.actor_unique_id, 42);
+    assert_eq!(start_game.actor_runtime_id, 42);
+    assert_eq!(start_game.player_gamemode, 0);
+    assert_eq!(start_game.world_name, "PocketMine-Rust World");
 
-    // Verify spawn LevelChunkPacket
-    match &responses[1] {
-        OutgoingPacket::LevelChunk(chunk) => {
-            assert_eq!(chunk.chunk_x, 0);
-            assert_eq!(chunk.chunk_z, 0);
-            assert_eq!(chunk.sub_chunk_count, 1);
-            assert!(!chunk.payload.is_empty());
-        }
-        other => panic!("Expected LevelChunk, got {:?}", other),
-    }
+    // Verify spawn LevelChunkPacket is present
+    let chunk = responses.iter().find_map(|r| match r {
+        OutgoingPacket::LevelChunk(c) => Some(c),
+        _ => None,
+    }).expect("Expected LevelChunk in responses");
+    assert_eq!(chunk.chunk_x, 0);
+    assert_eq!(chunk.chunk_z, 0);
+    assert_eq!(chunk.sub_chunk_count, 1);
+    assert!(!chunk.payload.is_empty());
 
-    // Verify PlayStatusPacket (PLAYER_SPAWN)
-    match &responses[2] {
-        OutgoingPacket::PlayStatus(p) => {
-            assert_eq!(p.status, PlayStatusPacket::PLAYER_SPAWN);
-        }
-        other => panic!("Expected PlayStatus(PLAYER_SPAWN), got {:?}", other),
-    }
+    // Verify PlayStatusPacket (PLAYER_SPAWN) is present
+    let play_status = responses.iter().find_map(|r| match r {
+        OutgoingPacket::PlayStatus(p) => Some(p),
+        _ => None,
+    }).expect("Expected PlayStatusPacket in responses");
+    assert_eq!(play_status.status, PlayStatusPacket::PLAYER_SPAWN);
 
     // Step 5: Client sends RequestChunkRadius (0x45)
     let radius_req = RequestChunkRadiusPacket::new(12, 16);

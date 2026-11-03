@@ -1,0 +1,10 @@
+{
+  "payload_type": "sync_state",
+  "sync_states": [
+    {
+      "clock_id": "BIG(7194480507151251734)",
+      "time": 1501,
+      "paused": false
+    }
+  ]
+}

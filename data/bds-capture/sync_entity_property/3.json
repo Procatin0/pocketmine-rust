@@ -1,0 +1,51 @@
+{
+  "nbt": {
+    "type": "compound",
+    "name": "",
+    "value": {
+      "properties": {
+        "type": "list",
+        "value": {
+          "type": "compound",
+          "value": [
+            {
+              "enum": {
+                "type": "list",
+                "value": {
+                  "type": "string",
+                  "value": [
+                    "none",
+                    "bouncy",
+                    "regular",
+                    "slow_bouncy",
+                    "slow_flat",
+                    "fast_flat",
+                    "light",
+                    "fast_sliding",
+                    "slow_sliding",
+                    "sticky",
+                    "high_resistance",
+                    "explosive",
+                    "hot"
+                  ]
+                }
+              },
+              "name": {
+                "type": "string",
+                "value": "minecraft:sulfur_cube_archetype"
+              },
+              "type": {
+                "type": "int",
+                "value": 3
+              }
+            }
+          ]
+        }
+      },
+      "type": {
+        "type": "string",
+        "value": "minecraft:sulfur_cube"
+      }
+    }
+  }
+}
