@@ -30,8 +30,11 @@ fn test_login_packet_roundtrip() {
 fn test_resource_packs_info_packet_empty_roundtrip() {
     let packet = ResourcePacksInfoPacket {
         must_accept: false,
+        has_addons: false,
         has_scripts: false,
-        force_server_packs: false,
+        disable_vibrant_visuals: false,
+        world_template_uuid: [0u8; 16],
+        world_template_version: String::new(),
         behavior_packs: Vec::new(),
         resource_packs: Vec::new(),
     };
@@ -52,18 +55,12 @@ fn test_resource_packs_info_packet_empty_roundtrip() {
 fn test_resource_packs_info_packet_with_entries_roundtrip() {
     let packet = ResourcePacksInfoPacket {
         must_accept: true,
+        has_addons: false,
         has_scripts: true,
-        force_server_packs: false,
-        behavior_packs: vec![ResourcePackInfoEntry {
-            pack_id: "00000000-0000-0000-0000-000000000001".to_string(),
-            version: "1.0.0".to_string(),
-            pack_size: 1024,
-            content_key: "key123".to_string(),
-            sub_pack_name: "subpack_a".to_string(),
-            content_identity: "identity_bp".to_string(),
-            has_scripts: true,
-            rtx_enabled: false,
-        }],
+        disable_vibrant_visuals: false,
+        world_template_uuid: [1u8; 16],
+        world_template_version: "1.0.0".to_string(),
+        behavior_packs: Vec::new(),
         resource_packs: vec![ResourcePackInfoEntry {
             pack_id: "00000000-0000-0000-0000-000000000002".to_string(),
             version: "2.1.0".to_string(),
@@ -91,18 +88,15 @@ fn test_resource_packs_info_packet_with_entries_roundtrip() {
 fn test_resource_pack_stack_packet_roundtrip() {
     let packet = ResourcePackStackPacket {
         must_accept: true,
-        behavior_packs: vec![ResourcePackStackEntry {
-            pack_id: "bp-uuid-1".to_string(),
-            version: "1.0.0".to_string(),
-            sub_pack_name: "".to_string(),
-        }],
+        behavior_packs: Vec::new(),
         resource_packs: vec![ResourcePackStackEntry {
             pack_id: "rp-uuid-2".to_string(),
             version: "1.2.0".to_string(),
             sub_pack_name: "high_res".to_string(),
         }],
-        game_version: "1.21.0".to_string(),
+        game_version: "1.26.60".to_string(),
         experiments_previously_enabled: false,
+        has_editor_packs: false,
     };
     assert_eq!(packet.packet_id(), 0x07);
 

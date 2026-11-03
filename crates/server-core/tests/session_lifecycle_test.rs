@@ -72,7 +72,7 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(responses.len(), 1);
     match &responses[0] {
         OutgoingPacket::ResourcePackStack(p) => {
-            assert_eq!(p.game_version, "1.21.0");
+            assert_eq!(p.game_version, "1.26.60");
         }
         other => panic!("Expected ResourcePackStack, got {:?}", other),
     }

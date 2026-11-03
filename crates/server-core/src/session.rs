@@ -219,8 +219,11 @@ impl PlayerSession {
         };
         let packs_info = ResourcePacksInfoPacket {
             must_accept: false,
+            has_addons: false,
             has_scripts: false,
-            force_server_packs: false,
+            disable_vibrant_visuals: false,
+            world_template_uuid: [0u8; 16],
+            world_template_version: String::new(),
             behavior_packs: Vec::new(),
             resource_packs: Vec::new(),
         };
@@ -237,7 +240,7 @@ impl PlayerSession {
         packet: ResourcePackClientResponsePacket,
     ) -> Result<Vec<OutgoingPacket>, SessionError> {
         match packet.response_status {
-            ResourcePackClientResponsePacket::STATUS_REFUSED => {
+            0 => {
                 info!("Session {} refused resource packs; disconnecting.", self.session_id);
                 self.state = SessionState::Disconnected;
                 Ok(vec![OutgoingPacket::Disconnect(DisconnectPacket {
@@ -246,36 +249,24 @@ impl PlayerSession {
                     message: Some("Resource packs were refused.".to_string()),
                 })])
             }
-            ResourcePackClientResponsePacket::STATUS_SEND_PACKS => {
+            1 => {
                 // Client requests packs downloading
                 Ok(Vec::new())
             }
-            ResourcePackClientResponsePacket::STATUS_HAVE_ALL_PACKS => {
-                if self.state != SessionState::ResourcePacks {
-                    return Err(SessionError::UnexpectedPacket {
-                        state: self.state,
-                        packet_id: 0x08,
-                    });
-                }
-
+            2 | 3 if self.state == SessionState::ResourcePacks => {
                 self.state = SessionState::ResourcePackStack;
                 let stack = ResourcePackStackPacket {
                     must_accept: false,
                     behavior_packs: Vec::new(),
                     resource_packs: Vec::new(),
-                    game_version: "1.21.0".to_string(),
+                    game_version: "1.26.60".to_string(),
                     experiments_previously_enabled: false,
+                    has_editor_packs: false,
                 };
+                info!("Session {} accepted packs, sending ResourcePackStack", self.session_id);
                 Ok(vec![OutgoingPacket::ResourcePackStack(stack)])
             }
-            ResourcePackClientResponsePacket::STATUS_COMPLETED => {
-                if self.state != SessionState::ResourcePackStack && self.state != SessionState::ResourcePacks {
-                    return Err(SessionError::UnexpectedPacket {
-                        state: self.state,
-                        packet_id: 0x08,
-                    });
-                }
-
+            3 | 4 if self.state == SessionState::ResourcePackStack || self.state == SessionState::ResourcePacks => {
                 self.state = SessionState::InGame;
                 info!("Session {} entered world (InGame)", self.session_id);
 

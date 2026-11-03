@@ -43,8 +43,11 @@ impl ResourcePackInfoEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourcePacksInfoPacket {
     pub must_accept: bool,
+    pub has_addons: bool,
     pub has_scripts: bool,
-    pub force_server_packs: bool,
+    pub disable_vibrant_visuals: bool,
+    pub world_template_uuid: [u8; 16],
+    pub world_template_version: String,
     pub behavior_packs: Vec<ResourcePackInfoEntry>,
     pub resource_packs: Vec<ResourcePackInfoEntry>,
 }
@@ -56,15 +59,15 @@ impl Packet for ResourcePacksInfoPacket {
 
     fn encode(&self, writer: &mut Writer) -> Result<(), CodecError> {
         writer.write_bool(self.must_accept);
+        writer.write_bool(self.has_addons);
         writer.write_bool(self.has_scripts);
-        writer.write_bool(self.force_server_packs);
+        writer.write_bool(self.disable_vibrant_visuals);
 
-        writer.write_u16_le(self.behavior_packs.len() as u16);
-        for entry in &self.behavior_packs {
-            entry.encode(writer);
-        }
+        writer.write_bytes(&self.world_template_uuid);
+        writer.write_string(&self.world_template_version);
 
-        writer.write_u16_le(self.resource_packs.len() as u16);
+        // texture_packs count (varint)
+        writer.write_var_u32(self.resource_packs.len() as u32);
         for entry in &self.resource_packs {
             entry.encode(writer);
         }
@@ -74,16 +77,16 @@ impl Packet for ResourcePacksInfoPacket {
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
         let must_accept = reader.read_bool()?;
+        let has_addons = reader.read_bool()?;
         let has_scripts = reader.read_bool()?;
-        let force_server_packs = reader.read_bool()?;
+        let disable_vibrant_visuals = reader.read_bool()?;
 
-        let behavior_count = reader.read_u16_le()? as usize;
-        let mut behavior_packs = Vec::with_capacity(behavior_count);
-        for _ in 0..behavior_count {
-            behavior_packs.push(ResourcePackInfoEntry::decode(reader)?);
-        }
+        let mut world_template_uuid = [0u8; 16];
+        let uuid_bytes = reader.read_bytes(16)?;
+        world_template_uuid.copy_from_slice(uuid_bytes);
+        let world_template_version = reader.read_string()?;
 
-        let resource_count = reader.read_u16_le()? as usize;
+        let resource_count = reader.read_var_u32()? as usize;
         let mut resource_packs = Vec::with_capacity(resource_count);
         for _ in 0..resource_count {
             resource_packs.push(ResourcePackInfoEntry::decode(reader)?);
@@ -91,9 +94,12 @@ impl Packet for ResourcePacksInfoPacket {
 
         Ok(Self {
             must_accept,
+            has_addons,
             has_scripts,
-            force_server_packs,
-            behavior_packs,
+            disable_vibrant_visuals,
+            world_template_uuid,
+            world_template_version,
+            behavior_packs: Vec::new(),
             resource_packs,
         })
     }
@@ -130,6 +136,7 @@ pub struct ResourcePackStackPacket {
     pub resource_packs: Vec<ResourcePackStackEntry>,
     pub game_version: String,
     pub experiments_previously_enabled: bool,
+    pub has_editor_packs: bool,
 }
 
 impl Packet for ResourcePackStackPacket {
@@ -140,30 +147,23 @@ impl Packet for ResourcePackStackPacket {
     fn encode(&self, writer: &mut Writer) -> Result<(), CodecError> {
         writer.write_bool(self.must_accept);
 
-        writer.write_var_u32(self.behavior_packs.len() as u32);
-        for entry in &self.behavior_packs {
-            entry.encode(writer);
-        }
-
         writer.write_var_u32(self.resource_packs.len() as u32);
         for entry in &self.resource_packs {
-            entry.encode(writer);
+            writer.write_string(&entry.pack_id);
+            writer.write_string(&entry.version);
+            writer.write_string(&entry.sub_pack_name);
         }
 
         writer.write_string(&self.game_version);
+        writer.write_i32_le(0); // experiments count (li32 0)
         writer.write_bool(self.experiments_previously_enabled);
+        writer.write_bool(self.has_editor_packs);
 
         Ok(())
     }
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
         let must_accept = reader.read_bool()?;
-
-        let behavior_count = reader.read_var_u32()? as usize;
-        let mut behavior_packs = Vec::with_capacity(behavior_count);
-        for _ in 0..behavior_count {
-            behavior_packs.push(ResourcePackStackEntry::decode(reader)?);
-        }
 
         let resource_count = reader.read_var_u32()? as usize;
         let mut resource_packs = Vec::with_capacity(resource_count);
@@ -172,14 +172,17 @@ impl Packet for ResourcePackStackPacket {
         }
 
         let game_version = reader.read_string()?;
-        let experiments_previously_enabled = reader.read_bool()?;
+        let _experiments_count = reader.read_i32_le().unwrap_or(0);
+        let experiments_previously_enabled = reader.read_bool().unwrap_or(false);
+        let has_editor_packs = reader.read_bool().unwrap_or(false);
 
         Ok(Self {
             must_accept,
-            behavior_packs,
+            behavior_packs: Vec::new(),
             resource_packs,
             game_version,
             experiments_previously_enabled,
+            has_editor_packs,
         })
     }
 }
@@ -192,10 +195,10 @@ pub struct ResourcePackClientResponsePacket {
 }
 
 impl ResourcePackClientResponsePacket {
-    pub const STATUS_REFUSED: u8 = 1;
-    pub const STATUS_SEND_PACKS: u8 = 2;
-    pub const STATUS_HAVE_ALL_PACKS: u8 = 3;
-    pub const STATUS_COMPLETED: u8 = 4;
+    pub const STATUS_REFUSED: u8 = 0;
+    pub const STATUS_SEND_PACKS: u8 = 1;
+    pub const STATUS_HAVE_ALL_PACKS: u8 = 2;
+    pub const STATUS_COMPLETED: u8 = 3;
 
     pub fn new(response_status: u8, pack_ids: Vec<String>) -> Self {
         Self {
@@ -220,11 +223,19 @@ impl Packet for ResourcePackClientResponsePacket {
     }
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
-        let response_status = reader.read_byte()?;
-        let count = reader.read_u16_le()? as usize;
+        let response_status = match reader.read_var_u32() {
+            Ok(s) => s as u8,
+            Err(_) => reader.read_byte()?,
+        };
+        let count = match reader.read_u16_le() {
+            Ok(c) => c as usize,
+            Err(_) => 0,
+        };
         let mut pack_ids = Vec::with_capacity(count);
         for _ in 0..count {
-            pack_ids.push(reader.read_string()?);
+            if let Ok(id) = reader.read_string() {
+                pack_ids.push(id);
+            }
         }
         Ok(Self {
             response_status,

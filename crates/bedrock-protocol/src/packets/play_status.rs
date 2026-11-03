@@ -24,13 +24,13 @@ impl Packet for PlayStatusPacket {
     }
 
     fn encode(&self, writer: &mut Writer) -> Result<(), CodecError> {
-        writer.write_i32_le(self.status);
+        writer.write_i32_be(self.status);
         Ok(())
     }
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
         Ok(Self {
-            status: reader.read_i32_le()?,
+            status: reader.read_i32_be()?,
         })
     }
 }

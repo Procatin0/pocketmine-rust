@@ -69,6 +69,11 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn read_i32_be(&mut self) -> Result<i32, CodecError> {
+        let b = self.read_bytes(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     pub fn read_i64_le(&mut self) -> Result<i64, CodecError> {
         let b = self.read_bytes(8)?;
         Ok(i64::from_le_bytes([
@@ -208,6 +213,10 @@ impl Writer {
 
     pub fn write_u32_be(&mut self, val: u32) {
         self.buf.put_u32(val);
+    }
+
+    pub fn write_i32_be(&mut self, val: i32) {
+        self.buf.put_i32(val);
     }
 
     pub fn write_i64_le(&mut self, val: i64) {

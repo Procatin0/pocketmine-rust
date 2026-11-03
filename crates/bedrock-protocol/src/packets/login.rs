@@ -30,7 +30,12 @@ impl Packet for LoginPacket {
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
         let protocol_version = reader.read_u32_be()?;
-        let connection_request = reader.read_string()?;
+        let len = match reader.read_var_u32() {
+            Ok(l) => l as usize,
+            Err(_) => reader.remaining(),
+        };
+        let bytes = reader.read_bytes(len.min(reader.remaining()))?;
+        let connection_request = String::from_utf8_lossy(bytes).into_owned();
         Ok(Self {
             protocol_version,
             connection_request,
