@@ -365,17 +365,26 @@ impl PlayerSession {
                 // 7. TrimDataPacket (0x12E / 302)
                 out.push(OutgoingPacket::RawWire(StaticPackets::TRIM_DATA.to_vec()));
 
-                // 8. SetCommandsEnabledPacket (0x3B / 59)
+                // 8. UpdateAttributesPacket (0x1D / 29) - Health, hunger, movement speed
+                out.push(OutgoingPacket::RawWire(self.create_update_attributes_packet()));
+
+                // 9. SetActorDataPacket (0x27 / 39) - Collision, gravity, scale, air=300
+                out.push(OutgoingPacket::RawWire(self.create_set_actor_data_packet()));
+
+                // 10. UpdateAbilitiesPacket (0xBB / 187) - Survival abilities, flying=false
+                out.push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
+
+                // 10b. UpdateAdventureSettingsPacket (0xBC / 188)
+                out.push(OutgoingPacket::RawWire(StaticPackets::UPDATE_ADVENTURE_SETTINGS.to_vec()));
+
+                // 10c. SetCommandsEnabledPacket (0x3B / 59)
                 out.push(OutgoingPacket::RawWire(StaticPackets::SET_COMMANDS_ENABLED.to_vec()));
 
-                // 9. SetDifficultyPacket (0x3C / 60)
+                // 10d. SetDifficultyPacket (0x3C / 60)
                 out.push(OutgoingPacket::RawWire(StaticPackets::SET_DIFFICULTY.to_vec()));
 
-                // 10. GameRulesChangedPacket (0x48 / 72)
+                // 10e. GameRulesChangedPacket (0x48 / 72)
                 out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
-
-                // 10b. UpdateAdventureSettingsPacket (0x37 / 55)
-                out.push(OutgoingPacket::RawWire(StaticPackets::UPDATE_ADVENTURE_SETTINGS.to_vec()));
 
                 // 11. SetSpawnPositionPacket (0x2B / 43)
                 let spawn_pos = BlockPos::new(sx, sy, sz);
@@ -471,6 +480,33 @@ impl PlayerSession {
             payload,
             false, // client_biome_update: false
         )
+    }
+
+    /// Creates a SetActorDataPacket (0x27) setting collision, gravity, scale, and air supply.
+    pub fn create_set_actor_data_packet(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.write_var_u32(0x27); // SetActorData packet ID
+        writer.write_var_u64(self.entity_runtime_id);
+        writer.write_bytes(&StaticPackets::SET_ENTITY_DATA[2..]);
+        writer.into_bytes().to_vec()
+    }
+
+    /// Creates an UpdateAttributesPacket (0x1D) setting player attributes (health, hunger, movement speed, etc.).
+    pub fn create_update_attributes_packet(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.write_var_u32(0x1d); // UpdateAttributes packet ID
+        writer.write_var_u64(self.entity_runtime_id);
+        writer.write_bytes(&StaticPackets::UPDATE_ATTRIBUTES[2..]);
+        writer.into_bytes().to_vec()
+    }
+
+    /// Creates an UpdateAbilitiesPacket (0xBB) setting player abilities (survival, flying disabled, normal walk speed).
+    pub fn create_update_abilities_packet(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.write_var_u32(0xbb); // UpdateAbilities packet ID
+        writer.write_i64_le(self.entity_unique_id);
+        writer.write_bytes(&StaticPackets::UPDATE_ABILITIES[10..]);
+        writer.into_bytes().to_vec()
     }
 }
 

@@ -51,4 +51,13 @@ impl StaticPackets {
 
     pub const UPDATE_ADVENTURE_SETTINGS: &'static [u8] =
         include_bytes!("../../../data/bds-capture/update_adventure_settings/1.bin");
+
+    pub const SET_ENTITY_DATA: &'static [u8] =
+        include_bytes!("../../../data/bds-capture/set_entity_data/1.bin");
+
+    pub const UPDATE_ATTRIBUTES: &'static [u8] =
+        include_bytes!("../../../data/bds-capture/update_attributes/1.bin");
+
+    pub const UPDATE_ABILITIES: &'static [u8] =
+        include_bytes!("../../../data/bds-capture/update_abilities/1.bin");
 }
