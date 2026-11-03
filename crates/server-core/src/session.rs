@@ -328,38 +328,29 @@ impl PlayerSession {
                 // 6. BiomeDefinitionListPacket (0x7A / 122) - World biomes
                 out.push(OutgoingPacket::RawWire(StaticPackets::BIOME_DEFINITION_LIST.to_vec()));
 
-                // 7. CameraPresetsPacket (0xC6 / 198)
-                out.push(OutgoingPacket::RawWire(StaticPackets::CAMERA_PRESETS.to_vec()));
-
-                // 8. CreativeContentPacket (0x91 / 145)
-                out.push(OutgoingPacket::RawWire(StaticPackets::CREATIVE_CONTENT.to_vec()));
-
-                // 9. TrimDataPacket (0x12E / 302)
+                // 7. TrimDataPacket (0x12E / 302)
                 out.push(OutgoingPacket::RawWire(StaticPackets::TRIM_DATA.to_vec()));
 
-                // 10. CraftingDataPacket (0x34 / 52)
-                out.push(OutgoingPacket::RawWire(StaticPackets::CRAFTING_DATA.to_vec()));
-
-                // 11. SetCommandsEnabledPacket (0x3B / 59)
+                // 8. SetCommandsEnabledPacket (0x3B / 59)
                 out.push(OutgoingPacket::RawWire(StaticPackets::SET_COMMANDS_ENABLED.to_vec()));
 
-                // 12. SetDifficultyPacket (0x3C / 60)
+                // 9. SetDifficultyPacket (0x3C / 60)
                 out.push(OutgoingPacket::RawWire(StaticPackets::SET_DIFFICULTY.to_vec()));
 
-                // 13. GameRulesChangedPacket (0x48 / 72)
+                // 10. GameRulesChangedPacket (0x48 / 72)
                 out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
 
-                // 14. SetSpawnPositionPacket (0x2B / 43)
+                // 11. SetSpawnPositionPacket (0x2B / 43)
                 out.push(OutgoingPacket::RawWire(StaticPackets::SET_SPAWN_POSITION.to_vec()));
 
-                // 15. NetworkChunkPublisherUpdatePacket (0x79 / 121)
+                // 12. NetworkChunkPublisherUpdatePacket (0x79 / 121)
                 out.push(OutgoingPacket::RawWire(StaticPackets::NETWORK_CHUNK_PUBLISHER_UPDATE.to_vec()));
 
-                // 16. Create initial spawn chunk (0, 0)
+                // 13. Create initial spawn chunk (0, 0)
                 let spawn_chunk = self.create_chunk_packet(0, 0);
                 out.push(OutgoingPacket::LevelChunk(spawn_chunk));
 
-                // 17. Confirm spawn to client (PLAYER_SPAWN = 3)
+                // 14. Confirm spawn to client (PLAYER_SPAWN = 3)
                 let play_status = PlayStatusPacket {
                     status: PlayStatusPacket::PLAYER_SPAWN,
                 };
@@ -559,8 +550,8 @@ impl SessionManager {
                             return vec![bytes::Bytes::from(framed_entry)];
                         }
 
-                        // Flush current batch if adding this packet exceeds ~32KB to keep SCTP message size optimal
-                        if !current_batch.is_empty() && current_batch.len() + framed_entry.len() > 32768 {
+                        // Split batches at ~16KB threshold to keep SCTP message size optimal
+                        if !current_batch.is_empty() && current_batch.len() + framed_entry.len() > 16384 {
                             batches.push(std::mem::take(&mut current_batch));
                         }
 

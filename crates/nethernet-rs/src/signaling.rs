@@ -543,6 +543,8 @@ impl SignalingServer {
                 .with_answering_dtls_role(RTCDtlsRole::Server)
                 .with_multicast_dns_mode(rtc::ice::mdns::MulticastDnsMode::Disabled)
                 .with_network_types(vec![NetworkType::Udp4])
+                .with_sctp_max_message_size(rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize::Bounded(262144))
+                .with_sctp_max_receive_buffer_size(1024 * 1024 * 4)
                 .build();
             let config = RTCConfigurationBuilder::new().build();
 
