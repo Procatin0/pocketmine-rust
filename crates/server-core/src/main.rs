@@ -27,8 +27,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // 1. Inicializar gestor de sesiones de jugadores
-    let session_manager = Arc::new(SessionManager::new());
+    // 1. Inicializar gestor de sesiones de jugadores con el generador de mundo configurado
+    let world_generator = config.create_world_generator();
+    info!(
+        "World generator initialized (level-type: {}, generator-type: {}, spawn: {:?})",
+        config.level_type,
+        world_generator.generator_type(),
+        world_generator.spawn_position()
+    );
+    let session_manager = Arc::new(SessionManager::with_generator(world_generator));
     info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
     // 2. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)

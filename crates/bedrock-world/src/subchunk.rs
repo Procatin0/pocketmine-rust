@@ -15,6 +15,18 @@ impl SubChunk {
         }
     }
 
+    pub fn empty() -> Self {
+        Self { layers: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+            || (self.layers.len() == 1
+                && self.layers[0].bits_per_block() == 0
+                && (self.layers[0].palette().first() == Some(&crate::block_id::AIR)
+                    || self.layers[0].palette().first() == Some(&0)))
+    }
+
     pub fn get_block(&self, x: usize, y: usize, z: usize, layer: usize) -> u32 {
         self.layers
             .get(layer)

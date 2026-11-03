@@ -12,6 +12,8 @@ pub struct ServerConfig {
     pub max_players: i32,
     pub xbox_auth: bool,
     pub white_list: bool,
+    pub level_type: String,
+    pub level_seed: u64,
     pub transports: Vec<String>,
     pub builtin_signaling_enabled: bool,
 }
@@ -26,6 +28,8 @@ impl Default for ServerConfig {
             max_players: 1000,
             xbox_auth: false,
             white_list: false,            // Whitelist disabled
+            level_type: "DEFAULT".to_string(),
+            level_seed: 12345678,
             transports: vec!["nethernet".to_string(), "raknet".to_string()],
             builtin_signaling_enabled: true,
         }
@@ -123,6 +127,17 @@ impl ServerConfig {
         if let Some(wl) = map.get("white-list").or_else(|| map.get("allow-list")).or_else(|| map.get("whitelist")) {
             self.white_list = *wl == "on" || *wl == "true" || *wl == "1";
         }
+        if let Some(lt) = map.get("level-type") {
+            self.level_type = lt.to_string();
+        }
+        if let Some(seed) = map.get("level-seed").and_then(|s| s.parse().ok()) {
+            self.level_seed = seed;
+        }
+    }
+
+    /// Creates a world generator instance based on `level-type` and `level-seed`.
+    pub fn create_world_generator(&self) -> std::sync::Arc<dyn bedrock_world::WorldGenerator> {
+        bedrock_world::create_generator(&self.level_type, self.level_seed)
     }
 
     fn parse_pocketmine_yml(&mut self, content: &str) {

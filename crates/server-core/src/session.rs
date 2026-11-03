@@ -468,6 +468,7 @@ impl PlayerSession {
 pub struct SessionManager {
     sessions: RwLock<HashMap<u64, PlayerSession>>,
     next_session_id: AtomicU64,
+    generator: Arc<dyn WorldGenerator>,
 }
 
 impl Default for SessionManager {
@@ -478,19 +479,24 @@ impl Default for SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
+        Self::with_generator(Arc::new(bedrock_world::NormalGenerator::new(12345678)))
+    }
+
+    pub fn with_generator(generator: Arc<dyn WorldGenerator>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            generator,
         }
     }
 
     pub fn create_session(&self, addr: SocketAddr) -> Arc<RwLock<PlayerSession>> {
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let session = PlayerSession::new(id, addr);
+        let session = PlayerSession::with_generator(id, addr, Arc::clone(&self.generator));
         let mut map = self.sessions.write();
         map.insert(id, session);
         // Note: For direct Arc access, or callers can lookup by id
-        Arc::new(RwLock::new(PlayerSession::new(id, addr)))
+        Arc::new(RwLock::new(PlayerSession::with_generator(id, addr, Arc::clone(&self.generator))))
     }
 
     pub fn add_session(&self, session: PlayerSession) {
@@ -515,7 +521,7 @@ impl SessionManager {
             Some(s) => s,
             None => {
                 let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-                let new_session = PlayerSession::new(id, peer);
+                let new_session = PlayerSession::with_generator(id, peer, Arc::clone(&self.generator));
                 map.insert(id, new_session);
                 map.get_mut(&id).unwrap()
             }
