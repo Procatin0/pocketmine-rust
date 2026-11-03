@@ -58,7 +58,9 @@ pub fn serialize_subchunk_version(subchunk: &SubChunk, writer: &mut Writer, vers
         }
 
         let palette = layer.palette();
-        writer.write_var_i32(palette.len() as i32);
+        if bpb != 0 {
+            writer.write_var_i32(palette.len() as i32);
+        }
         for &runtime_id in palette {
             writer.write_var_i32(runtime_id as i32);
         }
@@ -91,10 +93,15 @@ pub fn deserialize_subchunk(reader: &mut Reader) -> Result<SubChunk, SubChunkNet
             words.push(reader.read_u32_le()?);
         }
 
-        let palette_size = reader.read_var_i32()?;
-        if palette_size <= 0 || palette_size > (PalettedBlockArray::SIZE as i32) {
-            return Err(SubChunkNetworkError::InvalidPaletteSize(palette_size));
-        }
+        let palette_size = if bits_per_block == 0 {
+            1
+        } else {
+            let size = reader.read_var_i32()?;
+            if size <= 0 || size > (PalettedBlockArray::SIZE as i32) {
+                return Err(SubChunkNetworkError::InvalidPaletteSize(size));
+            }
+            size
+        };
 
         let mut palette = Vec::with_capacity(palette_size as usize);
         for _ in 0..palette_size {

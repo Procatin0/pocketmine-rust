@@ -1,5 +1,5 @@
 use bedrock_protocol::{
-    BlockPos, ChunkRadiusUpdatedPacket, LevelChunkPacket, LevelSettings, LoginPacket, Packet,
+    BlockPos, ChunkRadiusUpdatedPacket, LevelChunkPacket, LoginPacket, Packet,
     Reader, RequestChunkRadiusPacket, ResourcePackClientResponsePacket, ResourcePackInfoEntry,
     ResourcePackStackEntry, ResourcePackStackPacket, ResourcePacksInfoPacket, StartGamePacket,
     Vector3f, Writer,
@@ -143,24 +143,22 @@ fn test_resource_pack_client_response_packet_roundtrip() {
 
 #[test]
 fn test_start_game_packet_roundtrip() {
-    let packet = StartGamePacket {
-        actor_unique_id: -123456789012345,
-        actor_runtime_id: 987654321098765,
-        player_gamemode: 1, // Creative
-        player_position: Vector3f::new(100.5, 64.0, -250.75),
-        pitch: 15.5,
-        yaw: 180.0,
-        level_settings: LevelSettings {
-            seed: 9876543210123456,
-            spawn_position: BlockPos::new(100, 64, -250),
-            generator_type: 1,
-            world_gamemode: 0,
-            hardcore: false,
-            difficulty: 2,
-            dimension: 0,
-            level_name: "PocketMine-Rust World".to_string(),
-        },
-    };
+    let mut packet = StartGamePacket::default();
+    packet.actor_unique_id = -123456789012345;
+    packet.actor_runtime_id = 987654321098765;
+    packet.player_gamemode = 1; // Creative
+    packet.player_position = Vector3f::new(100.5, 64.0, -250.75);
+    packet.pitch = 15.5;
+    packet.yaw = 180.0;
+    packet.level_settings.seed = 9876543210123456;
+    packet.level_settings.spawn_position = BlockPos::new(100, 64, -250);
+    packet.level_settings.generator_type = 1;
+    packet.level_settings.world_gamemode = 0;
+    packet.level_settings.hardcore = false;
+    packet.level_settings.difficulty = 2;
+    packet.level_settings.dimension = 0;
+    packet.world_name = "PocketMine-Rust World".to_string();
+
     assert_eq!(packet.packet_id(), 0x0B);
 
     let mut writer = Writer::new();
@@ -211,7 +209,7 @@ fn test_chunk_radius_packets_roundtrip() {
 #[test]
 fn test_level_chunk_packet_roundtrip() {
     let dummy_subchunk_payload = vec![0x08, 0x01, 0x01, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
-    let packet = LevelChunkPacket::new(4, -8, 2, dummy_subchunk_payload);
+    let packet = LevelChunkPacket::new(4, -8, 0, 2, None, false, Vec::new(), dummy_subchunk_payload, false);
     assert_eq!(packet.packet_id(), 0x3A);
 
     let mut writer = Writer::new();

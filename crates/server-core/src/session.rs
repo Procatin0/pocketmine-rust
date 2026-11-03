@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
-    BlockPos, ChunkRadiusUpdatedPacket, DisconnectPacket, LevelChunkPacket, LevelSettings,
-    LoginPacket, NetworkSettingsPacket, Packet, PacketBatch, PlayStatusPacket, RequestChunkRadiusPacket,
-    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
-    ResourcePacksInfoPacket, StartGamePacket, Vector3f,
+    BlockPos, ChunkRadiusUpdatedPacket, DisconnectPacket, LevelChunkPacket,
+    LoginPacket, NetworkSettingsPacket, Packet, PacketBatch, PacketViolationWarningPacket, PlayStatusPacket,
+    RequestChunkRadiusPacket, RequestNetworkSettingsPacket, ResourcePackClientResponsePacket,
+    ResourcePackStackPacket, ResourcePacksInfoPacket, StartGamePacket, Vector3f,
 };
 use bedrock_world::SubChunk;
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -160,6 +160,21 @@ impl PlayerSession {
                 let packet = RequestChunkRadiusPacket::decode(&mut reader)?;
                 self.handle_chunk_radius_request(packet)
             }
+            0x9C => {
+                let mut reader = Reader::new(payload);
+                match PacketViolationWarningPacket::decode(&mut reader) {
+                    Ok(p) => {
+                        error!(
+                            "[:WebRTC] >>> CLIENT PACKET VIOLATION (0x9C) from session {}: type={}, severity={}, packet_id=0x{:02X}, reason='{}'",
+                            self.session_id, p.violation_type, p.severity, p.packet_id, p.message
+                        );
+                    }
+                    Err(e) => {
+                        error!("[:WebRTC] Failed to decode 0x9C packet violation from session {}: {}", self.session_id, e);
+                    }
+                }
+                Ok(Vec::new())
+            }
             _ => {
                 debug!(
                     "Unhandled packet ID 0x{:02X} (len {}) from session {}",
@@ -270,24 +285,18 @@ impl PlayerSession {
                 self.state = SessionState::InGame;
                 info!("Session {} entered world (InGame)", self.session_id);
 
-                let start_game = StartGamePacket {
-                    actor_unique_id: self.entity_unique_id,
-                    actor_runtime_id: self.entity_runtime_id,
-                    player_gamemode: self.gamemode,
-                    player_position: self.position,
-                    pitch: 0.0,
-                    yaw: 0.0,
-                    level_settings: LevelSettings {
-                        seed: 12345678,
-                        spawn_position: BlockPos::new(0, 64, 0),
-                        generator_type: 1,
-                        world_gamemode: self.gamemode,
-                        hardcore: false,
-                        difficulty: 1,
-                        dimension: 0,
-                        level_name: "PocketMine-Rust World".to_string(),
-                    },
-                };
+                let mut start_game = StartGamePacket::default();
+                start_game.actor_unique_id = self.entity_unique_id;
+                start_game.actor_runtime_id = self.entity_runtime_id;
+                start_game.player_gamemode = self.gamemode;
+                start_game.player_position = self.position;
+                start_game.level_settings.seed = 12345678;
+                start_game.level_settings.spawn_position = BlockPos::new(0, 64, 0);
+                start_game.level_settings.generator_type = 1;
+                start_game.level_settings.world_gamemode = self.gamemode;
+                start_game.level_settings.difficulty = 1;
+                start_game.level_settings.dimension = 0;
+                start_game.world_name = "PocketMine-Rust World".to_string();
 
                 // Create initial spawn chunk (0, 0)
                 let spawn_chunk = self.create_chunk_packet(0, 0);
@@ -342,9 +351,39 @@ impl PlayerSession {
 
     /// Generates a standard subchunk packet using bedrock-world serialization.
     pub fn create_chunk_packet(&self, chunk_x: i32, chunk_z: i32) -> LevelChunkPacket {
-        let subchunk = SubChunk::new(1); // fill entry 1 (e.g. grass block)
-        let payload = subchunk.serialize_network();
-        LevelChunkPacket::new(chunk_x, chunk_z, 1, payload)
+        let mut writer = Writer::new();
+
+        // 1 subchunk (at y = 0)
+        let subchunk = SubChunk::new(1); // grass block or air
+        subchunk.serialize_network_to(&mut writer);
+
+        // 24 biome palettes (dimension bounds -4..=19 in 1.18+)
+        for _ in 0..24 {
+            // bpb = 0 -> header = (0 << 1) | 1 = 1
+            writer.write_byte(1);
+            // 0 words
+            // no count since bpb == 0
+            // 1 palette entry: plains = 1
+            writer.write_var_i32(1);
+        }
+
+        // Border blocks count: 0
+        writer.write_byte(0);
+
+        // Block entities: 0 (no tiles)
+
+        let payload = writer.into_bytes().to_vec();
+        LevelChunkPacket::new(
+            chunk_x,
+            chunk_z,
+            0,     // dimension: 0 (Overworld)
+            1,     // sub_chunk_count: 1
+            None,  // sub_chunk_request_limit: None
+            false, // cache_enabled: false
+            Vec::new(), // used_blob_hashes: empty
+            payload,
+            false, // client_biome_update: false
+        )
     }
 }
 

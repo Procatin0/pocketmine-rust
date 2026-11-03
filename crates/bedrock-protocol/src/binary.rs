@@ -40,6 +40,10 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
+    pub fn read_i8(&mut self) -> Result<i8, CodecError> {
+        Ok(self.read_byte()? as i8)
+    }
+
     pub fn read_bool(&mut self) -> Result<bool, CodecError> {
         Ok(self.read_byte()? != 0)
     }
@@ -189,6 +193,10 @@ impl Writer {
 
     pub fn write_byte(&mut self, byte: u8) {
         self.buf.put_u8(byte);
+    }
+
+    pub fn write_i8(&mut self, val: i8) {
+        self.buf.put_i8(val);
     }
 
     pub fn write_bool(&mut self, val: bool) {

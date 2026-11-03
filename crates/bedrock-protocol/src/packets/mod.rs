@@ -6,6 +6,7 @@ pub mod resource_packs;
 pub mod start_game;
 pub mod chunk_radius;
 pub mod level_chunk;
+pub mod packet_violation_warning;
 
 pub use network_settings::{NetworkSettingsPacket, RequestNetworkSettingsPacket};
 pub use play_status::PlayStatusPacket;
@@ -18,3 +19,4 @@ pub use resource_packs::{
 pub use start_game::{LevelSettings, StartGamePacket};
 pub use chunk_radius::{ChunkRadiusUpdatedPacket, RequestChunkRadiusPacket};
 pub use level_chunk::LevelChunkPacket;
+pub use packet_violation_warning::PacketViolationWarningPacket;

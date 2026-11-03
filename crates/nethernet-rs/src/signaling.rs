@@ -30,6 +30,7 @@ struct NetherNetWebRtcHandler {
     gather_notify: Arc<tokio::sync::Notify>,
     peer_addr: SocketAddr,
     packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
+    peer_conn: Arc<Mutex<Option<Arc<dyn PeerConnection>>>>,
 }
 
 #[async_trait::async_trait]
@@ -47,6 +48,12 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         info!("[:WebRTC] PeerConnection state changed to {:?} for {}", state, self.peer_addr);
+        if state == RTCPeerConnectionState::Disconnected || state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
+            if let Some(pc) = self.peer_conn.lock().await.take() {
+                debug!("[:WebRTC] Closing PeerConnection on disconnect/fail for {}", self.peer_addr);
+                let _ = pc.close().await;
+            }
+        }
     }
 
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
@@ -56,6 +63,7 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
         info!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
 
         let handler = self.packet_handler.clone();
+        let peer_conn = Arc::clone(&self.peer_conn);
         tokio::spawn(async move {
             loop {
                 match dc.poll().await {
@@ -84,6 +92,10 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                     }
                     Some(DataChannelEvent::OnClose) | None => {
                         info!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
+                        if let Some(pc) = peer_conn.lock().await.take() {
+                            debug!("[:WebRTC] Closing PeerConnection on DataChannel close for {}", peer);
+                            let _ = pc.close().await;
+                        }
                         break;
                     }
                     _ => {}
@@ -516,10 +528,12 @@ impl SignalingServer {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let gather_notify = Arc::new(tokio::sync::Notify::new());
+        let peer_conn_holder: Arc<Mutex<Option<Arc<dyn PeerConnection>>>> = Arc::new(Mutex::new(None));
         let handler: Arc<dyn PeerConnectionEventHandler> = Arc::new(NetherNetWebRtcHandler {
             gather_notify: Arc::clone(&gather_notify),
             peer_addr,
             packet_handler: packet_handler.clone(),
+            peer_conn: Arc::clone(&peer_conn_holder),
         });
 
         // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:
@@ -555,6 +569,7 @@ impl SignalingServer {
             }
         }
         let pc: Arc<dyn PeerConnection> = Arc::new(pc_res.unwrap());
+        *peer_conn_holder.lock().await = Some(Arc::clone(&pc));
         active_peers.lock().await.insert(network_id.to_string(), Arc::clone(&pc));
 
         let negotiation = async {

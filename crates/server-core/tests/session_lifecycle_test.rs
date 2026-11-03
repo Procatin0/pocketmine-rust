@@ -98,7 +98,7 @@ fn test_session_full_login_lifecycle() {
             assert_eq!(p.actor_unique_id, 42);
             assert_eq!(p.actor_runtime_id, 42);
             assert_eq!(p.player_gamemode, 0);
-            assert_eq!(p.level_settings.level_name, "PocketMine-Rust World");
+            assert_eq!(p.world_name, "PocketMine-Rust World");
         }
         other => panic!("Expected StartGame, got {:?}", other),
     }

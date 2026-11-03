@@ -13,9 +13,9 @@ fn test_empty_subchunk_roundtrip() {
     // [0] = version (8)
     // [1] = layer count (1)
     // [2] = palette header: (0 << 1) | 1 = 1
-    // [3] = palette size VarInt zigzag: 1 -> 0x02
-    // [4] = block runtime id VarInt zigzag: 0 -> 0x00
-    assert_eq!(bytes, vec![8, 1, 1, 2, 0]);
+    // (no palette size count for bpb == 0 in Bedrock protocol)
+    // [3] = block runtime id VarInt zigzag: 0 -> 0x00
+    assert_eq!(bytes, vec![8, 1, 1, 0]);
 
     let deserialized = SubChunk::deserialize_network(&bytes).expect("Failed to deserialize empty subchunk");
     assert_eq!(deserialized.layers.len(), 1);
