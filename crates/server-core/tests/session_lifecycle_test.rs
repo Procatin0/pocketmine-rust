@@ -104,12 +104,12 @@ fn test_session_full_login_lifecycle() {
 
     // Verify spawn LevelChunkPacket is present
     let chunk = responses.iter().find_map(|r| match r {
-        OutgoingPacket::LevelChunk(c) => Some(c),
+        OutgoingPacket::LevelChunk(c) if c.chunk_x == 0 && c.chunk_z == 0 => Some(c),
         _ => None,
-    }).expect("Expected LevelChunk in responses");
+    }).expect("Expected LevelChunk (0,0) in responses");
     assert_eq!(chunk.chunk_x, 0);
     assert_eq!(chunk.chunk_z, 0);
-    assert_eq!(chunk.sub_chunk_count, 1);
+    assert_eq!(chunk.sub_chunk_count, 5);
     assert!(!chunk.payload.is_empty());
 
     // Verify PlayStatusPacket (PLAYER_SPAWN) is present

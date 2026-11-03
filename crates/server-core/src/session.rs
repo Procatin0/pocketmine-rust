@@ -125,7 +125,7 @@ impl PlayerSession {
             username: format!("Player_{}", session_id),
             entity_unique_id: session_id as i64,
             entity_runtime_id: session_id,
-            position: Vector3f::new(0.0, 68.0, 0.0),
+            position: Vector3f::new(0.5, 17.62, 0.5),
             gamemode: 0, // Survival
             chunk_radius: 8,
             compression_enabled: false,
@@ -311,7 +311,7 @@ impl PlayerSession {
                 start_game.player_gamemode = self.gamemode;
                 start_game.player_position = self.position;
                 start_game.level_settings.seed = 12345678;
-                start_game.level_settings.spawn_position = BlockPos::new(0, 64, 0);
+                start_game.level_settings.spawn_position = BlockPos::new(0, 16, 0);
                 start_game.level_settings.generator_type = 1;
                 start_game.level_settings.world_gamemode = self.gamemode;
                 start_game.level_settings.difficulty = 1;
@@ -346,9 +346,12 @@ impl PlayerSession {
                 // 12. NetworkChunkPublisherUpdatePacket (0x79 / 121)
                 out.push(OutgoingPacket::RawWire(StaticPackets::NETWORK_CHUNK_PUBLISHER_UPDATE.to_vec()));
 
-                // 13. Create initial spawn chunk (0, 0)
-                let spawn_chunk = self.create_chunk_packet(0, 0);
-                out.push(OutgoingPacket::LevelChunk(spawn_chunk));
+                // 13. Create initial 3x3 chunks around spawn (x: -1..=1, z: -1..=1)
+                for cx in -1..=1 {
+                    for cz in -1..=1 {
+                        out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
+                    }
+                }
 
                 // 14. Confirm spawn to client (PLAYER_SPAWN = 3)
                 let play_status = PlayStatusPacket {
@@ -384,10 +387,10 @@ impl PlayerSession {
             ChunkRadiusUpdatedPacket::new(clamped_radius),
         )];
 
-        // Generate surrounding chunks around spawn for the client
-        for x in -1..=1 {
-            for z in -1..=1 {
-                if x != 0 || z != 0 {
+        // Generate outer surrounding chunks for the client (5x5 grid: -2..=2)
+        for x in -2i32..=2i32 {
+            for z in -2i32..=2i32 {
+                if x.abs() > 1 || z.abs() > 1 {
                     out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(x, z)));
                 }
             }
@@ -396,20 +399,25 @@ impl PlayerSession {
         Ok(out)
     }
 
-    /// Generates a standard subchunk packet using bedrock-world serialization.
+    /// Generates a standard subchunk packet with 5 subchunks (Y = -64..15)
+    /// having solid grass blocks (runtime_id 11608) at Y = 0..15.
     pub fn create_chunk_packet(&self, chunk_x: i32, chunk_z: i32) -> LevelChunkPacket {
         let mut writer = Writer::new();
 
-        // 1 subchunk (at y = 0)
-        let subchunk = SubChunk::new(1); // grass block or air
-        subchunk.serialize_network_to(&mut writer);
+        // 4 empty subchunks for Y = -64..-1 (subchunk indices -4, -3, -2, -1)
+        for _ in 0..4 {
+            writer.write_byte(8); // version 8
+            writer.write_byte(0); // 0 layers (empty subchunk)
+        }
+
+        // 1 populated subchunk at index 0 (Y = 0..15) filled with solid grass_block (runtime_id: 11608)
+        let grass_subchunk = SubChunk::new(11608);
+        grass_subchunk.serialize_network_to(&mut writer);
 
         // 24 biome palettes (dimension bounds -4..=19 in 1.18+)
         for _ in 0..24 {
             // bpb = 0 -> header = (0 << 1) | 1 = 1
             writer.write_byte(1);
-            // 0 words
-            // no count since bpb == 0
             // 1 palette entry: plains = 1
             writer.write_var_i32(1);
         }
@@ -424,7 +432,7 @@ impl PlayerSession {
             chunk_x,
             chunk_z,
             0,     // dimension: 0 (Overworld)
-            1,     // sub_chunk_count: 1
+            5,     // sub_chunk_count: 5 (4 empty + 1 populated)
             None,  // sub_chunk_request_limit: None
             false, // cache_enabled: false
             Vec::new(), // used_blob_hashes: empty
