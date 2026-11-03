@@ -1,17 +1,17 @@
 use std::io::{Read, Write};
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
+use flate2::read::{DeflateDecoder, ZlibDecoder};
+use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use crate::binary::{CodecError, Reader, Writer};
 
-pub const COMPRESSION_ZLIB: u8 = 0;
+pub const COMPRESSION_DEFLATE: u8 = 0;
 pub const COMPRESSION_SNAPPY: u8 = 1;
 pub const COMPRESSION_NONE: u8 = 0xFF;
 
 pub struct PacketBatch;
 
 impl PacketBatch {
-    /// Decompresses a Bedrock network payload (prefixed by compression algorithm byte).
+    /// Decompresses a Bedrock network payload (prefixed by compression algorithm byte, or raw batch).
     pub fn decompress(payload: &[u8]) -> Result<Vec<u8>, CodecError> {
         if payload.is_empty() {
             return Ok(Vec::new());
@@ -21,19 +21,27 @@ impl PacketBatch {
         let data = &payload[1..];
 
         match compression_type {
-            COMPRESSION_ZLIB => {
-                let mut decoder = ZlibDecoder::new(data);
+            COMPRESSION_DEFLATE => {
+                // Bedrock standard: Raw Deflate (RFC 1951)
+                let mut def_decoder = DeflateDecoder::new(data);
                 let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed).map_err(|e| {
-                    CodecError::Custom(format!("Zlib decompression failed: {}", e))
+                if def_decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
+                    return Ok(decompressed);
+                }
+
+                // Fallback: Zlib (RFC 1950)
+                let mut zlib_decoder = ZlibDecoder::new(data);
+                let mut zlib_decompressed = Vec::new();
+                zlib_decoder.read_to_end(&mut zlib_decompressed).map_err(|e| {
+                    CodecError::Custom(format!("Deflate and Zlib decompression failed: {}", e))
                 })?;
-                Ok(decompressed)
+                Ok(zlib_decompressed)
             }
             COMPRESSION_NONE => Ok(data.to_vec()),
-            other => Err(CodecError::Custom(format!(
-                "Unsupported compression algorithm: 0x{:02X}",
-                other
-            ))),
+            _ => {
+                // Payload has no compression algorithm header (direct uncompressed batch)
+                Ok(payload.to_vec())
+            }
         }
     }
 
@@ -46,16 +54,16 @@ impl PacketBatch {
             return Ok(out);
         }
 
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data).map_err(|e| {
-            CodecError::Custom(format!("Zlib compression failed: {}", e))
+            CodecError::Custom(format!("Deflate compression failed: {}", e))
         })?;
         let compressed = encoder.finish().map_err(|e| {
-            CodecError::Custom(format!("Zlib finish failed: {}", e))
+            CodecError::Custom(format!("Deflate finish failed: {}", e))
         })?;
 
         let mut out = Vec::with_capacity(compressed.len() + 1);
-        out.push(COMPRESSION_ZLIB);
+        out.push(COMPRESSION_DEFLATE);
         out.extend_from_slice(&compressed);
         Ok(out)
     }
@@ -106,7 +114,7 @@ mod tests {
     fn test_batch_compression_roundtrip() {
         let original = b"Hello Bedrock Protocol Packet Batch Data";
         let compressed = PacketBatch::compress(original, 0).unwrap();
-        assert_eq!(compressed[0], COMPRESSION_ZLIB);
+        assert_eq!(compressed[0], COMPRESSION_DEFLATE);
 
         let decompressed = PacketBatch::decompress(&compressed).unwrap();
         assert_eq!(decompressed, original);

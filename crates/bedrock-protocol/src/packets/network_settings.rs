@@ -29,6 +29,7 @@ impl Packet for RequestNetworkSettingsPacket {
 pub struct NetworkSettingsPacket {
     pub compression_threshold: u16,
     pub compression_algorithm: u16,
+    pub client_throttle: bool,
     pub client_throttle_threshold: u8,
     pub client_throttle_scalar: f32,
 }
@@ -41,6 +42,7 @@ impl Packet for NetworkSettingsPacket {
     fn encode(&self, writer: &mut Writer) -> Result<(), CodecError> {
         writer.write_u16_le(self.compression_threshold);
         writer.write_u16_le(self.compression_algorithm);
+        writer.write_bool(self.client_throttle);
         writer.write_byte(self.client_throttle_threshold);
         writer.write_f32_le(self.client_throttle_scalar);
         Ok(())
@@ -50,6 +52,7 @@ impl Packet for NetworkSettingsPacket {
         Ok(Self {
             compression_threshold: reader.read_u16_le()?,
             compression_algorithm: reader.read_u16_le()?,
+            client_throttle: reader.read_bool()?,
             client_throttle_threshold: reader.read_byte()?,
             client_throttle_scalar: reader.read_f32_le()?,
         })

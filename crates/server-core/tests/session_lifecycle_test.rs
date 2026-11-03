@@ -27,8 +27,9 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(responses.len(), 1);
     match &responses[0] {
         OutgoingPacket::NetworkSettings(pkt) => {
-            assert_eq!(pkt.compression_threshold, 0);
+            assert_eq!(pkt.compression_threshold, 512);
             assert_eq!(pkt.compression_algorithm, 0);
+            assert_eq!(pkt.client_throttle, false);
         }
         other => panic!("Expected NetworkSettings, got {:?}", other),
     }

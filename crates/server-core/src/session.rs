@@ -183,8 +183,9 @@ impl PlayerSession {
         );
 
         let response = NetworkSettingsPacket {
-            compression_threshold: 0,
-            compression_algorithm: 0, // 0 = Deflate / Zlib (Standard PocketMine/Bedrock)
+            compression_threshold: 512,
+            compression_algorithm: 0, // 0 = Deflate (Standard Bedrock)
+            client_throttle: false,
             client_throttle_threshold: 0,
             client_throttle_scalar: 0.0,
         };
@@ -413,27 +414,13 @@ impl SessionManager {
             }
         };
 
-        // Determine if packet is compressed:
-        // Either session.compression_enabled is true, OR payload starts with zlib header (0x00 0x78)
-        let decompressed = if raw.len() >= 3 && raw[0] == 0x00 && raw[1] == 0x78 {
-            session.compression_enabled = true;
-            match PacketBatch::decompress(raw) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!("[:WebRTC] Failed to decompress batch from {}: {}", peer, e);
-                    return Vec::new();
-                }
+        // Decompress batch or treat as raw uncompressed batch
+        let decompressed = match PacketBatch::decompress(raw) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("[:WebRTC] Batch decompress failed from {}: {}, using raw", peer, e);
+                raw.to_vec()
             }
-        } else if session.compression_enabled && !raw.is_empty() {
-            match PacketBatch::decompress(raw) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!("[:WebRTC] Failed to decompress batch from {}: {}", peer, e);
-                    return Vec::new();
-                }
-            }
-        } else {
-            raw.to_vec()
         };
 
         // Decode individual packets from the uncompressed buffer
@@ -496,7 +483,7 @@ impl SessionManager {
 
         // Compress the outgoing batch if compression is active
         if session.compression_enabled {
-            match PacketBatch::compress(&outgoing_batch, 0) {
+            match PacketBatch::compress(&outgoing_batch, 512) {
                 Ok(compressed) => vec![bytes::Bytes::from(compressed)],
                 Err(e) => {
                     tracing::error!("Failed to compress outgoing batch for {}: {}", peer, e);
