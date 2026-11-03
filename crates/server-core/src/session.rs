@@ -6,11 +6,12 @@ use std::sync::Arc;
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
     BlockPos, ChunkRadiusUpdatedPacket, DisconnectPacket, LevelChunkPacket,
-    LoginPacket, NetworkSettingsPacket, Packet, PacketBatch, PacketViolationWarningPacket, PlayStatusPacket,
-    RequestChunkRadiusPacket, RequestNetworkSettingsPacket, ResourcePackClientResponsePacket,
-    ResourcePackStackPacket, ResourcePacksInfoPacket, StartGamePacket, Vector3f,
+    LoginPacket, NetworkChunkPublisherUpdatePacket, NetworkSettingsPacket, Packet, PacketBatch,
+    PacketViolationWarningPacket, PlayStatusPacket, RequestChunkRadiusPacket,
+    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
+    ResourcePacksInfoPacket, SetSpawnPositionPacket, StartGamePacket, Vector3f,
 };
-use bedrock_world::SubChunk;
+use bedrock_world::{FlatGenerator, WorldGenerator};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::{debug, error, info};
@@ -53,6 +54,8 @@ pub enum OutgoingPacket {
     ResourcePacksInfo(ResourcePacksInfoPacket),
     ResourcePackStack(ResourcePackStackPacket),
     StartGame(StartGamePacket),
+    SetSpawnPosition(SetSpawnPositionPacket),
+    NetworkChunkPublisherUpdate(NetworkChunkPublisherUpdatePacket),
     ChunkRadiusUpdated(ChunkRadiusUpdatedPacket),
     LevelChunk(LevelChunkPacket),
     Disconnect(DisconnectPacket),
@@ -67,6 +70,8 @@ impl OutgoingPacket {
             Self::ResourcePacksInfo(p) => p.packet_id(),
             Self::ResourcePackStack(p) => p.packet_id(),
             Self::StartGame(p) => p.packet_id(),
+            Self::SetSpawnPosition(p) => p.packet_id(),
+            Self::NetworkChunkPublisherUpdate(p) => p.packet_id(),
             Self::ChunkRadiusUpdated(p) => p.packet_id(),
             Self::LevelChunk(p) => p.packet_id(),
             Self::Disconnect(p) => p.packet_id(),
@@ -84,6 +89,8 @@ impl OutgoingPacket {
             Self::ResourcePacksInfo(p) => p.encode(writer),
             Self::ResourcePackStack(p) => p.encode(writer),
             Self::StartGame(p) => p.encode(writer),
+            Self::SetSpawnPosition(p) => p.encode(writer),
+            Self::NetworkChunkPublisherUpdate(p) => p.encode(writer),
             Self::ChunkRadiusUpdated(p) => p.encode(writer),
             Self::LevelChunk(p) => p.encode(writer),
             Self::Disconnect(p) => p.encode(writer),
@@ -113,10 +120,13 @@ pub struct PlayerSession {
     pub gamemode: i32,
     pub chunk_radius: i32,
     pub compression_enabled: bool,
+    pub generator: Arc<dyn WorldGenerator>,
 }
 
 impl PlayerSession {
     pub fn new(session_id: u64, client_addr: SocketAddr) -> Self {
+        let generator = Arc::new(FlatGenerator::new());
+        let (px, py, pz) = generator.player_position();
         Self {
             session_id,
             client_addr,
@@ -125,10 +135,33 @@ impl PlayerSession {
             username: format!("Player_{}", session_id),
             entity_unique_id: session_id as i64,
             entity_runtime_id: session_id,
-            position: Vector3f::new(0.5, 17.62, 0.5),
+            position: Vector3f::new(px, py, pz),
             gamemode: 0, // Survival
             chunk_radius: 8,
             compression_enabled: false,
+            generator,
+        }
+    }
+
+    pub fn with_generator(
+        session_id: u64,
+        client_addr: SocketAddr,
+        generator: Arc<dyn WorldGenerator>,
+    ) -> Self {
+        let (px, py, pz) = generator.player_position();
+        Self {
+            session_id,
+            client_addr,
+            state: SessionState::Connected,
+            protocol_version: 0,
+            username: format!("Player_{}", session_id),
+            entity_unique_id: session_id as i64,
+            entity_runtime_id: session_id,
+            position: Vector3f::new(px, py, pz),
+            gamemode: 0,
+            chunk_radius: 8,
+            compression_enabled: false,
+            generator,
         }
     }
 
@@ -311,8 +344,9 @@ impl PlayerSession {
                 start_game.player_gamemode = self.gamemode;
                 start_game.player_position = self.position;
                 start_game.level_settings.seed = 12345678;
-                start_game.level_settings.spawn_position = BlockPos::new(0, 16, 0);
-                start_game.level_settings.generator_type = 1;
+                let (sx, sy, sz) = self.generator.spawn_position();
+                start_game.level_settings.spawn_position = BlockPos::new(sx, sy, sz);
+                start_game.level_settings.generator_type = self.generator.generator_type();
                 start_game.level_settings.world_gamemode = self.gamemode;
                 start_game.level_settings.difficulty = 1;
                 start_game.level_settings.dimension = 0;
@@ -341,14 +375,19 @@ impl PlayerSession {
                 out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
 
                 // 11. SetSpawnPositionPacket (0x2B / 43)
-                out.push(OutgoingPacket::RawWire(StaticPackets::SET_SPAWN_POSITION.to_vec()));
+                let spawn_pos = BlockPos::new(sx, sy, sz);
+                out.push(OutgoingPacket::SetSpawnPosition(
+                    SetSpawnPositionPacket::new_player_spawn(spawn_pos, 0),
+                ));
 
                 // 12. NetworkChunkPublisherUpdatePacket (0x79 / 121)
-                out.push(OutgoingPacket::RawWire(StaticPackets::NETWORK_CHUNK_PUBLISHER_UPDATE.to_vec()));
+                out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
+                    NetworkChunkPublisherUpdatePacket::new(spawn_pos, 64),
+                ));
 
-                // 13. Create initial 3x3 chunks around spawn (x: -1..=1, z: -1..=1)
-                for cx in -1..=1 {
-                    for cz in -1..=1 {
+                // 13. Create initial 5x5 chunks around spawn (x: -2..=2, z: -2..=2)
+                for cx in -2..=2 {
+                    for cz in -2..=2 {
                         out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
                     }
                 }
@@ -383,14 +422,23 @@ impl PlayerSession {
         let clamped_radius = packet.radius.clamp(2, 16);
         self.chunk_radius = clamped_radius;
 
-        let mut out = vec![OutgoingPacket::ChunkRadiusUpdated(
-            ChunkRadiusUpdatedPacket::new(clamped_radius),
-        )];
+        let center_pos = BlockPos::new(
+            self.position.x as i32,
+            self.position.y as i32,
+            self.position.z as i32,
+        );
 
-        // Generate outer surrounding chunks for the client (5x5 grid: -2..=2)
-        for x in -2i32..=2i32 {
-            for z in -2i32..=2i32 {
-                if x.abs() > 1 || z.abs() > 1 {
+        let mut out = vec![
+            OutgoingPacket::ChunkRadiusUpdated(ChunkRadiusUpdatedPacket::new(clamped_radius)),
+            OutgoingPacket::NetworkChunkPublisherUpdate(
+                NetworkChunkPublisherUpdatePacket::new(center_pos, (clamped_radius as u32) * 16),
+            ),
+        ];
+
+        // Generate surrounding chunks for the client requested radius
+        for x in -clamped_radius..=clamped_radius {
+            for z in -clamped_radius..=clamped_radius {
+                if x.abs() > 2 || z.abs() > 2 {
                     out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(x, z)));
                 }
             }
@@ -399,40 +447,14 @@ impl PlayerSession {
         Ok(out)
     }
 
-    /// Generates a standard subchunk packet with 5 subchunks (Y = -64..15)
-    /// having solid grass blocks (runtime_id 11608) at Y = 0..15.
+    /// Generates a LevelChunkPacket for (chunk_x, chunk_z) using the active WorldGenerator.
     pub fn create_chunk_packet(&self, chunk_x: i32, chunk_z: i32) -> LevelChunkPacket {
-        let mut writer = Writer::new();
-
-        // 4 empty subchunks for Y = -64..-1 (subchunk indices -4, -3, -2, -1)
-        for _ in 0..4 {
-            writer.write_byte(8); // version 8
-            writer.write_byte(0); // 0 layers (empty subchunk)
-        }
-
-        // 1 populated subchunk at index 0 (Y = 0..15) filled with solid grass_block (runtime_id: 11608)
-        let grass_subchunk = SubChunk::new(11608);
-        grass_subchunk.serialize_network_to(&mut writer);
-
-        // 24 biome palettes (dimension bounds -4..=19 in 1.18+)
-        for _ in 0..24 {
-            // bpb = 0 -> header = (0 << 1) | 1 = 1
-            writer.write_byte(1);
-            // 1 palette entry: plains = 1
-            writer.write_var_i32(1);
-        }
-
-        // Border blocks count: 0
-        writer.write_byte(0);
-
-        // Block entities: 0 (no tiles)
-
-        let payload = writer.into_bytes().to_vec();
+        let (sub_chunk_count, payload) = self.generator.generate_chunk(chunk_x, chunk_z);
         LevelChunkPacket::new(
             chunk_x,
             chunk_z,
             0,     // dimension: 0 (Overworld)
-            5,     // sub_chunk_count: 5 (4 empty + 1 populated)
+            sub_chunk_count,
             None,  // sub_chunk_request_limit: None
             false, // cache_enabled: false
             Vec::new(), // used_blob_hashes: empty

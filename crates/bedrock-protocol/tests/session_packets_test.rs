@@ -226,3 +226,43 @@ fn test_level_chunk_packet_roundtrip() {
     assert_eq!(decoded.sub_chunk_count, 2);
     assert_eq!(decoded.payload.len(), 9);
 }
+
+#[test]
+fn test_network_chunk_publisher_update_roundtrip() {
+    use bedrock_protocol::NetworkChunkPublisherUpdatePacket;
+
+    let packet = NetworkChunkPublisherUpdatePacket::new(BlockPos::new(0, 1, 0), 64);
+    assert_eq!(packet.packet_id(), 0x79);
+
+    let mut writer = Writer::new();
+    packet.encode(&mut writer).expect("encode should succeed");
+
+    let bytes = writer.into_bytes();
+    let mut reader = Reader::new(&bytes);
+    let decoded = NetworkChunkPublisherUpdatePacket::decode(&mut reader).expect("decode should succeed");
+
+    assert_eq!(reader.remaining(), 0);
+    assert_eq!(packet, decoded);
+    assert_eq!(decoded.position, BlockPos::new(0, 1, 0));
+    assert_eq!(decoded.radius, 64);
+}
+
+#[test]
+fn test_set_spawn_position_roundtrip() {
+    use bedrock_protocol::SetSpawnPositionPacket;
+
+    let packet = SetSpawnPositionPacket::new_player_spawn(BlockPos::new(0, 1, 0), 0);
+    assert_eq!(packet.packet_id(), 0x2B);
+
+    let mut writer = Writer::new();
+    packet.encode(&mut writer).expect("encode should succeed");
+
+    let bytes = writer.into_bytes();
+    let mut reader = Reader::new(&bytes);
+    let decoded = SetSpawnPositionPacket::decode(&mut reader).expect("decode should succeed");
+
+    assert_eq!(reader.remaining(), 0);
+    assert_eq!(packet, decoded);
+    assert_eq!(decoded.player_position, BlockPos::new(0, 1, 0));
+    assert_eq!(decoded.dimension_id, 0);
+}
