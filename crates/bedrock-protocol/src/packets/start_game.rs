@@ -377,7 +377,7 @@ impl Default for StartGamePacket {
             enable_new_inventory_system: true,
             server_software_version: "PocketMine-Rust 1.0.0 (Axolotl-PM)".to_string(),
             player_actor_properties: vec![0x0a, 0x00, 0x00],
-            block_palette_checksum: u64::from_le_bytes([168, 39, 245, 43, 68, 197, 223, 241]),
+            block_palette_checksum: 0, // 0 skips client strict checksum validation (prevents error Boar)
             world_template_id: [0u8; 16],
             enable_client_side_chunk_generation: false,
             block_network_ids_are_hashes: true,
