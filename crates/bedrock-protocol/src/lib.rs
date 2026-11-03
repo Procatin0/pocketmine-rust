@@ -3,7 +3,9 @@
 pub mod binary;
 pub mod types;
 pub mod packets;
+pub mod batch;
 
+pub use batch::PacketBatch;
 pub use binary::{Reader, Writer};
 pub use packets::*;
 pub use types::*;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
     BlockPos, ChunkRadiusUpdatedPacket, DisconnectPacket, LevelChunkPacket, LevelSettings,
-    LoginPacket, NetworkSettingsPacket, Packet, PlayStatusPacket, RequestChunkRadiusPacket,
+    LoginPacket, NetworkSettingsPacket, Packet, PacketBatch, PlayStatusPacket, RequestChunkRadiusPacket,
     RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
     ResourcePacksInfoPacket, StartGamePacket, Vector3f,
 };
@@ -101,6 +101,7 @@ pub struct PlayerSession {
     pub position: Vector3f,
     pub gamemode: i32,
     pub chunk_radius: i32,
+    pub compression_enabled: bool,
 }
 
 impl PlayerSession {
@@ -116,6 +117,7 @@ impl PlayerSession {
             position: Vector3f::new(0.0, 68.0, 0.0),
             gamemode: 0, // Survival
             chunk_radius: 8,
+            compression_enabled: false,
         }
     }
 
@@ -181,8 +183,8 @@ impl PlayerSession {
         );
 
         let response = NetworkSettingsPacket {
-            compression_threshold: 65535,
-            compression_algorithm: 0xFFFF, // none
+            compression_threshold: 0,
+            compression_algorithm: 0, // 0 = Deflate / Zlib (Standard PocketMine/Bedrock)
             client_throttle_threshold: 0,
             client_throttle_scalar: 0.0,
         };
@@ -411,43 +413,51 @@ impl SessionManager {
             }
         };
 
-        let mut reader = Reader::new(raw);
-        let mut out_bytes = Vec::new();
-
-        while reader.remaining() > 0 {
-            let first_varint = match reader.read_var_u32() {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-
-            let packet_id;
-            let payload;
-            if first_varint as usize <= reader.remaining() && first_varint > 0 {
-                // Batch format: first_varint is packet length
-                let pos_after_len = reader.position();
-                let header = match reader.read_var_u32() {
-                    Ok(h) => h,
-                    Err(_) => break,
-                };
-                packet_id = header & 0x3FF;
-                let header_len = reader.position() - pos_after_len;
-                let payload_len = (first_varint as usize).saturating_sub(header_len);
-                payload = match reader.read_bytes(payload_len.min(reader.remaining())) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-            } else {
-                // Direct format: first_varint is packet header
-                packet_id = first_varint & 0x3FF;
-                payload = reader.read_remaining();
+        // Determine if packet is compressed:
+        // Either session.compression_enabled is true, OR payload starts with zlib header (0x00 0x78)
+        let decompressed = if raw.len() >= 3 && raw[0] == 0x00 && raw[1] == 0x78 {
+            session.compression_enabled = true;
+            match PacketBatch::decompress(raw) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("[:WebRTC] Failed to decompress batch from {}: {}", peer, e);
+                    return Vec::new();
+                }
             }
+        } else if session.compression_enabled && !raw.is_empty() {
+            match PacketBatch::decompress(raw) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("[:WebRTC] Failed to decompress batch from {}: {}", peer, e);
+                    return Vec::new();
+                }
+            }
+        } else {
+            raw.to_vec()
+        };
 
+        // Decode individual packets from the uncompressed buffer
+        let packets = match PacketBatch::decode_packets(&decompressed) {
+            Ok(pkts) if !pkts.is_empty() => pkts,
+            _ => {
+                // Fallback: direct unbatched packet format (like uncompressed RequestNetworkSettingsPacket)
+                let mut reader = Reader::new(&decompressed);
+                let header = reader.read_var_u32().unwrap_or(0);
+                let packet_id = header & 0x3FF;
+                let payload = reader.read_remaining().to_vec();
+                vec![(packet_id, payload)]
+            }
+        };
+
+        let mut outgoing_batch = Vec::new();
+
+        for (packet_id, payload) in packets {
             info!(
                 "[:WebRTC] Dispatching Bedrock packet 0x{:02X} (len {}) from {}",
                 packet_id, payload.len(), peer
             );
 
-            match session.handle_packet(packet_id, payload) {
+            match session.handle_packet(packet_id, &payload) {
                 Ok(responses) => {
                     for resp in responses {
                         let mut pkt_writer = Writer::new();
@@ -459,10 +469,19 @@ impl SessionManager {
                         }
                         let pkt_bytes = pkt_writer.into_bytes();
 
-                        let mut batch_writer = Writer::new();
-                        batch_writer.write_var_u32(pkt_bytes.len() as u32);
-                        batch_writer.write_bytes(&pkt_bytes);
-                        out_bytes.push(batch_writer.into_bytes());
+                        let mut entry_writer = Writer::new();
+                        entry_writer.write_var_u32(pkt_bytes.len() as u32);
+                        entry_writer.write_bytes(&pkt_bytes);
+                        outgoing_batch.extend_from_slice(&entry_writer.into_bytes());
+
+                        // If response was NetworkSettingsPacket, enable compression for following packets
+                        if resp.packet_id() == 0x8F {
+                            // NetworkSettingsPacket itself is sent uncompressed:
+                            let uncompressed_resp = outgoing_batch.clone();
+                            outgoing_batch.clear();
+                            session.compression_enabled = true;
+                            return vec![bytes::Bytes::from(uncompressed_resp)];
+                        }
                     }
                 }
                 Err(e) => {
@@ -471,6 +490,21 @@ impl SessionManager {
             }
         }
 
-        out_bytes
+        if outgoing_batch.is_empty() {
+            return Vec::new();
+        }
+
+        // Compress the outgoing batch if compression is active
+        if session.compression_enabled {
+            match PacketBatch::compress(&outgoing_batch, 0) {
+                Ok(compressed) => vec![bytes::Bytes::from(compressed)],
+                Err(e) => {
+                    tracing::error!("Failed to compress outgoing batch for {}: {}", peer, e);
+                    vec![bytes::Bytes::from(outgoing_batch)]
+                }
+            }
+        } else {
+            vec![bytes::Bytes::from(outgoing_batch)]
+        }
     }
 }
