@@ -380,7 +380,7 @@ impl Default for StartGamePacket {
             block_palette_checksum: 0, // 0 skips client strict checksum validation (prevents error Boar)
             world_template_id: [0u8; 16],
             enable_client_side_chunk_generation: false,
-            block_network_ids_are_hashes: true,
+            block_network_ids_are_hashes: false,
             disable_client_sounds: true,
             server_identifier: String::new(),
             scenario_identifier: String::new(),

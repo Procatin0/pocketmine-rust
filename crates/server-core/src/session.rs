@@ -342,6 +342,8 @@ impl PlayerSession {
                 start_game.actor_unique_id = self.entity_unique_id;
                 start_game.actor_runtime_id = self.entity_runtime_id;
                 start_game.player_gamemode = self.gamemode;
+                let (px, py, pz) = self.generator.player_position();
+                self.position = Vector3f::new(px, py, pz);
                 start_game.player_position = self.position;
                 start_game.level_settings.seed = 12345678;
                 let (sx, sy, sz) = self.generator.spawn_position();
@@ -487,7 +489,53 @@ impl PlayerSession {
         let mut writer = Writer::new();
         writer.write_var_u32(0x27); // SetActorData packet ID
         writer.write_var_u64(self.entity_runtime_id);
-        writer.write_bytes(&StaticPackets::SET_ENTITY_DATA[2..]);
+        // Metadata count: 6 entries
+        writer.write_var_u32(6);
+
+        // 1. FLAGS (0) -> type: long (7), legacy_type: 7
+        writer.write_var_u32(0);
+        writer.write_var_u32(7);
+        writer.write_byte(7);
+        // has_collision (bit 48) | affected_by_gravity (bit 49) | can_climb (bit 19)
+        let flags: i64 = (1i64 << 48) | (1i64 << 49) | (1i64 << 19);
+        writer.write_var_i64(flags);
+
+        // 2. AIR (7) -> type: short (1), legacy_type: 1 -> 300
+        writer.write_var_u32(7);
+        writer.write_var_u32(1);
+        writer.write_byte(1);
+        writer.write_i16_le(300);
+
+        // 3. MAX_AIR (42) -> type: short (1), legacy_type: 1 -> 300
+        writer.write_var_u32(42);
+        writer.write_var_u32(1);
+        writer.write_byte(1);
+        writer.write_i16_le(300);
+
+        // 4. SCALE (38) -> type: float (3), legacy_type: 3 -> 1.0
+        writer.write_var_u32(38);
+        writer.write_var_u32(3);
+        writer.write_byte(3);
+        writer.write_f32_le(1.0);
+
+        // 5. BOUNDING_BOX_WIDTH (53) -> type: float (3), legacy_type: 3 -> 0.6
+        writer.write_var_u32(53);
+        writer.write_var_u32(3);
+        writer.write_byte(3);
+        writer.write_f32_le(0.6);
+
+        // 6. BOUNDING_BOX_HEIGHT (54) -> type: float (3), legacy_type: 3 -> 1.8
+        writer.write_var_u32(54);
+        writer.write_var_u32(3);
+        writer.write_byte(3);
+        writer.write_f32_le(1.8);
+
+        // EntityProperties (ints: 0, floats: 0)
+        writer.write_var_u32(0);
+        writer.write_var_u32(0);
+        // Tick: 0
+        writer.write_var_u64(0);
+
         writer.into_bytes().to_vec()
     }
 
@@ -496,7 +544,42 @@ impl PlayerSession {
         let mut writer = Writer::new();
         writer.write_var_u32(0x1d); // UpdateAttributes packet ID
         writer.write_var_u64(self.entity_runtime_id);
-        writer.write_bytes(&StaticPackets::UPDATE_ATTRIBUTES[2..]);
+        // 3 attributes: health, movement, player.hunger
+        writer.write_var_u32(3);
+
+        // 1. minecraft:health (min: 0.0, max: 20.0, val: 20.0, def_min: 0.0, def_max: 20.0, def: 20.0)
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(20.0);
+        writer.write_string("minecraft:health");
+        writer.write_var_u32(0); // modifier count: 0
+
+        // 2. minecraft:movement (min: 0.0, max: f32::MAX, val: 0.1, def_min: 0.0, def_max: f32::MAX, def: 0.1)
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(f32::MAX);
+        writer.write_f32_le(0.1);
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(f32::MAX);
+        writer.write_f32_le(0.1);
+        writer.write_string("minecraft:movement");
+        writer.write_var_u32(0); // modifier count: 0
+
+        // 3. minecraft:player.hunger (min: 0.0, max: 20.0, val: 20.0, def_min: 0.0, def_max: 20.0, def: 20.0)
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(0.0);
+        writer.write_f32_le(20.0);
+        writer.write_f32_le(20.0);
+        writer.write_string("minecraft:player.hunger");
+        writer.write_var_u32(0); // modifier count: 0
+
+        // tick: 0
+        writer.write_var_u64(0);
+
         writer.into_bytes().to_vec()
     }
 
@@ -505,7 +588,22 @@ impl PlayerSession {
         let mut writer = Writer::new();
         writer.write_var_u32(0xbb); // UpdateAbilities packet ID
         writer.write_i64_le(self.entity_unique_id);
-        writer.write_bytes(&StaticPackets::UPDATE_ABILITIES[10..]);
+        writer.write_byte(1); // permission_level: member (1)
+        writer.write_byte(0); // command_permission: normal (0)
+        writer.write_byte(1); // layer count: 1
+
+        // Layer 0: Base layer (1)
+        writer.write_u16_le(1);
+        // Allowed abilities bitmask: build, mine, doors, containers, attack_players, attack_mobs, flying, may_fly, fly_speed, walk_speed
+        // (1<<0) | (1<<1) | (1<<2) | (1<<3) | (1<<4) | (1<<5) | (1<<9) | (1<<10) | (1<<13) | (1<<14) = 0x663f
+        writer.write_u32_le(0x0000663f);
+        // Enabled abilities bitmask: build, mine, doors, containers, attack_players, attack_mobs (flying=false, may_fly=false)
+        // (1<<0) | (1<<1) | (1<<2) | (1<<3) | (1<<4) | (1<<5) = 0x003f
+        writer.write_u32_le(0x0000003f);
+        writer.write_f32_le(0.05); // fly_speed
+        writer.write_f32_le(0.0);  // vertical_fly_speed
+        writer.write_f32_le(0.1);  // walk_speed
+
         writer.into_bytes().to_vec()
     }
 }
