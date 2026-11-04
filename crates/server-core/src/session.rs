@@ -780,7 +780,7 @@ impl PlayerSession {
             let mut val_mask: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
                 | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11);
             if self.is_flying {
-                val_mask |= (1 << 9);
+                val_mask |= 1 << 9;
             }
             writer.write_u32_le(val_mask);
             writer.write_f32_le(0.05); // fly_speed

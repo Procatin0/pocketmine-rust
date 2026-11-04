@@ -2,9 +2,10 @@
 //!
 //! Matches `pocketmine\world\generator\populator\Ore` and `pocketmine\world\generator\object\Ore`.
 
+use std::collections::HashSet;
 use std::f64::consts::PI;
 use crate::block_id;
-use crate::chunk::Chunk;
+use crate::generator::manager::ChunkManager;
 use crate::generator::random::Random;
 
 #[derive(Debug, Clone)]
@@ -104,26 +105,44 @@ impl OrePopulator {
         }
     }
 
-    pub fn populate(&self, chunk: &mut Chunk, _chunk_x: i32, _chunk_z: i32, random: &mut Random) {
+    pub fn new_emerald() -> Self {
+        Self {
+            ore_types: vec![
+                OreType {
+                    material: block_id::EMERALD_ORE,
+                    replaces: block_id::STONE,
+                    cluster_count: 11,
+                    cluster_size: 1,
+                    min_height: 0,
+                    max_height: 32,
+                },
+            ],
+        }
+    }
+
+    pub fn populate<M: ChunkManager>(&self, world: &mut M, chunk_x: i32, chunk_z: i32, random: &mut Random) {
+        let base_x = chunk_x << 4;
+        let base_z = chunk_z << 4;
+
         for ore_type in &self.ore_types {
             for _ in 0..ore_type.cluster_count {
-                let x = random.next_range(0, 15) as usize;
+                let x = random.next_range(base_x, base_x + 15);
                 let y = random.next_range(ore_type.min_height, ore_type.max_height);
-                let z = random.next_range(0, 15) as usize;
+                let z = random.next_range(base_z, base_z + 15);
 
-                if chunk.get_block(x, y, z) == ore_type.replaces {
-                    self.place_cluster(chunk, x, y, z, ore_type, random);
+                if world.get_block_at(x, y, z) == ore_type.replaces {
+                    self.place_cluster(world, x, y, z, ore_type, random);
                 }
             }
         }
     }
 
-    fn place_cluster(
+    fn place_cluster<M: ChunkManager>(
         &self,
-        chunk: &mut Chunk,
-        x: usize,
+        world: &mut M,
+        x: i32,
         y: i32,
-        z: usize,
+        z: i32,
         ore_type: &OreType,
         random: &mut Random,
     ) {
@@ -138,6 +157,8 @@ impl OrePopulator {
         let z2 = z as f64 + 8.0 - offset_z;
         let y1 = y as f64 + (random.next_bounded_int(3) + 2) as f64;
         let y2 = y as f64 + (random.next_bounded_int(3) + 2) as f64;
+
+        let mut visited = HashSet::new();
 
         for count in 0..=cluster_size {
             let t = count as f64 / cluster_size as f64;
@@ -175,9 +196,10 @@ impl OrePopulator {
                         let size_z = (zz as f64 + 0.5 - center_z) / radius;
                         let size_z_sq = size_z * size_z;
                         if (size_x_sq + size_y_sq + size_z_sq) < 1.0 {
-                            if xx >= 0 && xx < 16 && zz >= 0 && zz < 16 {
-                                if chunk.get_block(xx as usize, yy, zz as usize) == ore_type.replaces {
-                                    chunk.set_block(xx as usize, yy, zz as usize, ore_type.material);
+                            let hash = ((xx as i64) << 40) ^ ((zz as i64) << 20) ^ ((yy as i64) & 0xfffff);
+                            if visited.insert(hash) {
+                                if world.get_block_at(xx, yy, zz) == ore_type.replaces {
+                                    world.set_block_at(xx, yy, zz, ore_type.material);
                                 }
                             }
                         }

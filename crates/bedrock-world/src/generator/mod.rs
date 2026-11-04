@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 pub mod biome;
 pub mod flat;
+pub mod manager;
 pub mod noise;
 pub mod normal;
 pub mod populators;
 pub mod random;
 
 pub use flat::FlatGenerator;
+pub use manager::{ChunkManager, ChunkManager3x3};
 pub use normal::NormalGenerator;
 
 /// Common trait for Bedrock world generators.

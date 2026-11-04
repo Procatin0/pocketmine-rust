@@ -159,7 +159,9 @@ fn test_world_generation_verification_suite() {
     println!("Exact Block Alignment:   {:>6.2}%", overall_block_rate);
     println!("=======================================================\n");
 
-    assert!(overall_block_rate > 90.0, "Block alignment rate must be > 90%");
+    assert!(overall_biome_rate >= 99.99, "Biome consistency must be 100%");
+    assert!(overall_height_rate >= 99.99, "Elevation height match rate must be 100%");
+    assert!(overall_block_rate >= 99.99, "Exact block alignment rate must be 100%");
 }
 
 #[test]
@@ -207,6 +209,9 @@ fn test_terrain_column_consistency() {
 
                     if php_stone_h == rust_stone_h && php_dirt_h == rust_dirt_h && php_water_h == rust_water_h {
                         matched_columns += 1;
+                    } else {
+                        println!("  Mismatch at ({}, {}): PHP stone={} dirt={} water={} | Rust stone={} dirt={} water={}",
+                            x, z, php_stone_h, php_dirt_h, php_water_h, rust_stone_h, rust_dirt_h, rust_water_h);
                     }
                 }
             }
@@ -293,6 +298,8 @@ fn map_rust_block(id: u32) -> u8 {
         block_id::BIRCH_LOG => 19,
         block_id::BIRCH_LEAVES => 20,
         block_id::SNOW_LAYER => 21,
+        block_id::SHORT_GRASS | block_id::TALL_GRASS => 22,
+        block_id::EMERALD_ORE => 23,
         _ => 255,
     }
 }

@@ -103,25 +103,23 @@ impl Packet for TextPacket {
         let text_type = reader.read_byte()?;
 
         let mut source_name = String::new();
-        let mut message = String::new();
         let mut parameters = Vec::new();
 
-        match category {
+        let message = match category {
             1 => {
                 source_name = reader.read_string()?;
-                message = reader.read_string()?;
+                reader.read_string()?
             }
             2 => {
-                message = reader.read_string()?;
+                let msg = reader.read_string()?;
                 let count = reader.read_var_u32()? as usize;
                 for _ in 0..count {
                     parameters.push(reader.read_string()?);
                 }
+                msg
             }
-            _ => {
-                message = reader.read_string()?;
-            }
-        }
+            _ => reader.read_string()?,
+        };
 
         let xbox_user_id = reader.read_string()?;
         let platform_chat_id = reader.read_string()?;
