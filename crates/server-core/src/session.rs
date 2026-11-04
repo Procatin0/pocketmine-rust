@@ -449,8 +449,9 @@ impl PlayerSession {
                 ));
 
                 // 12. NetworkChunkPublisherUpdatePacket (0x79 / 121)
+                let initial_radius_blocks = (((self.chunk_radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
                 out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
-                    NetworkChunkPublisherUpdatePacket::new(spawn_pos, 64),
+                    NetworkChunkPublisherUpdatePacket::new(spawn_pos, initial_radius_blocks.max(128)),
                 ));
 
                 // 13. Create initial 5x5 chunks around spawn
@@ -499,19 +500,23 @@ impl PlayerSession {
             self.position.z as i32,
         );
 
+        let publisher_radius_blocks = (((clamped_radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
+
         let mut out = vec![
             OutgoingPacket::ChunkRadiusUpdated(ChunkRadiusUpdatedPacket::new(clamped_radius)),
             OutgoingPacket::NetworkChunkPublisherUpdate(
-                NetworkChunkPublisherUpdatePacket::new(center_pos, (clamped_radius as u32) * 16),
+                NetworkChunkPublisherUpdatePacket::new(center_pos, publisher_radius_blocks),
             ),
         ];
 
-        // Generate surrounding chunks around player position prioritized by proximity
+        // Send an immediate burst around player (clamped_radius.min(6)) so the local area is loaded immediately,
+        // while remaining chunks stream smoothly via PlayerAuthInput without stalling the server event loop.
         let curr_cx = (self.position.x as i32) >> 4;
         let curr_cz = (self.position.z as i32) >> 4;
+        let burst_radius = clamped_radius.min(6);
         let mut chunks_to_generate = Vec::new();
-        for dx in -clamped_radius..=clamped_radius {
-            for dz in -clamped_radius..=clamped_radius {
+        for dx in -burst_radius..=burst_radius {
+            for dz in -burst_radius..=burst_radius {
                 let cx = curr_cx + dx;
                 let cz = curr_cz + dz;
                 if !self.sent_chunks.contains(&(cx, cz)) {
@@ -552,9 +557,16 @@ impl PlayerSession {
         let curr_cx = (self.position.x as i32) >> 4;
         let curr_cz = (self.position.z as i32) >> 4;
 
+        // Prune chunks that are far away from the player (beyond radius + 16)
+        // so that if the player returns to previously visited areas, they will be resent,
+        // preventing empty transparent holes/voids when backtracking.
+        let prune_margin = radius + 16;
+        self.sent_chunks.retain(|&(cx, cz)| {
+            (cx - curr_cx).abs() <= prune_margin && (cz - curr_cz).abs() <= prune_margin
+        });
+
         let mut out = Vec::new();
         let max_chunks_per_packet = 16;
-        let mut chunks_generated = 0;
 
         let mut chunks_to_generate = Vec::new();
         for cx in (curr_cx - radius)..=(curr_cx + radius) {
@@ -570,21 +582,27 @@ impl PlayerSession {
             (cx - curr_cx).pow(2) + (cz - curr_cz).pow(2)
         });
 
-        for (cx, cz) in chunks_to_generate.into_iter().take(max_chunks_per_packet) {
-            self.sent_chunks.insert((cx, cz));
-            out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
-            chunks_generated += 1;
-        }
+        // Publisher radius in blocks MUST encompass the entire square area (diagonal = radius * sqrt(2))
+        // plus an additional margin so Bedrock client NEVER discards any boundary chunk!
+        let publisher_radius_blocks = (((radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
 
-        if chunks_generated > 0 || curr_cx != old_cx || curr_cz != old_cz {
+        // CRITICAL: NetworkChunkPublisherUpdate MUST be added to `out` FIRST, BEFORE any LevelChunk packets!
+        // In Bedrock, the client discards any chunk outside its current publisher radius.
+        // Putting the update packet first ensures the client updates its publisher area BEFORE receiving chunks.
+        if !chunks_to_generate.is_empty() || curr_cx != old_cx || curr_cz != old_cz {
             let center_pos = BlockPos::new(
                 self.position.x as i32,
                 self.position.y as i32,
                 self.position.z as i32,
             );
             out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
-                NetworkChunkPublisherUpdatePacket::new(center_pos, (radius as u32) * 16),
+                NetworkChunkPublisherUpdatePacket::new(center_pos, publisher_radius_blocks),
             ));
+        }
+
+        for (cx, cz) in chunks_to_generate.into_iter().take(max_chunks_per_packet) {
+            self.sent_chunks.insert((cx, cz));
+            out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
         }
 
         Ok(out)
