@@ -15,6 +15,7 @@ pub struct ServerConfig {
     pub level_type: String,
     pub level_seed: u64,
     pub gamemode: i32,
+    pub view_distance: i32,
     pub transports: Vec<String>,
     pub builtin_signaling_enabled: bool,
 }
@@ -32,6 +33,7 @@ impl Default for ServerConfig {
             level_type: "DEFAULT".to_string(),
             level_seed: 12345678,
             gamemode: 0,
+            view_distance: 10,
             transports: vec!["nethernet".to_string(), "raknet".to_string()],
             builtin_signaling_enabled: true,
         }
@@ -142,6 +144,9 @@ impl ServerConfig {
                 "spectator" | "sp" | "3" => 3,
                 _ => 0,
             };
+        }
+        if let Some(vd) = map.get("view-distance").and_then(|v| v.parse().ok()) {
+            self.view_distance = vd;
         }
     }
 

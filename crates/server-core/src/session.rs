@@ -135,6 +135,7 @@ pub struct PlayerSession {
     pub gamemode: i32,
     pub is_flying: bool,
     pub chunk_radius: i32,
+    pub max_view_distance: i32,
     pub sent_chunks: HashSet<(i32, i32)>,
     pub compression_enabled: bool,
     pub generator: Arc<dyn WorldGenerator>,
@@ -158,6 +159,7 @@ impl PlayerSession {
             gamemode: 0, // Survival
             is_flying: false,
             chunk_radius: 8,
+            max_view_distance: 12,
             sent_chunks: HashSet::new(),
             compression_enabled: false,
             generator,
@@ -193,6 +195,7 @@ impl PlayerSession {
             gamemode,
             is_flying: false,
             chunk_radius: 8,
+            max_view_distance: 12,
             sent_chunks: HashSet::new(),
             compression_enabled: false,
             generator,
@@ -491,11 +494,11 @@ impl PlayerSession {
             });
         }
 
-        let clamped_radius = packet.radius.clamp(8, 32);
+        let clamped_radius = packet.radius.clamp(4, self.max_view_distance);
         self.chunk_radius = clamped_radius;
         tracing::info!(
-            "Session {} handle_chunk_radius_request: requested={}, clamped={}, burst_radius={}",
-            self.session_id, packet.radius, clamped_radius, clamped_radius.min(8)
+            "Session {} handle_chunk_radius_request: requested={}, clamped={}",
+            self.session_id, packet.radius, clamped_radius
         );
 
         let center_pos = BlockPos::new(
@@ -513,14 +516,13 @@ impl PlayerSession {
             ),
         ];
 
-        // Send an immediate burst around player (clamped_radius.min(8)) so the local area is loaded immediately,
-        // while remaining chunks stream smoothly via PlayerAuthInput without stalling the server event loop.
+        // Send all chunks in the square around player so all 360 degrees (North, South, East, West)
+        // are 100% loaded immediately at spawn, avoiding directional starvation or blank horizons.
         let curr_cx = (self.position.x.floor() as i32) >> 4;
         let curr_cz = (self.position.z.floor() as i32) >> 4;
-        let burst_radius = clamped_radius.min(8);
         let mut chunks_to_generate = Vec::new();
-        for dx in -burst_radius..=burst_radius {
-            for dz in -burst_radius..=burst_radius {
+        for dx in -clamped_radius..=clamped_radius {
+            for dz in -clamped_radius..=clamped_radius {
                 let cx = curr_cx + dx;
                 let cz = curr_cz + dz;
                 if !self.sent_chunks.contains(&(cx, cz)) {
@@ -857,6 +859,7 @@ pub struct SessionManager {
     next_session_id: AtomicU64,
     generator: Arc<dyn WorldGenerator>,
     default_gamemode: i32,
+    default_view_distance: i32,
 }
 
 impl Default for SessionManager {
@@ -875,31 +878,43 @@ impl SessionManager {
     }
 
     pub fn with_generator_and_gamemode(generator: Arc<dyn WorldGenerator>, default_gamemode: i32) -> Self {
+        Self::with_generator_gamemode_and_view_distance(generator, default_gamemode, 12)
+    }
+
+    pub fn with_generator_gamemode_and_view_distance(
+        generator: Arc<dyn WorldGenerator>,
+        default_gamemode: i32,
+        default_view_distance: i32,
+    ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             generator,
             default_gamemode,
+            default_view_distance,
         }
     }
 
     pub fn create_session(&self, addr: SocketAddr) -> Arc<RwLock<PlayerSession>> {
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let session = PlayerSession::with_generator_and_gamemode(
+        let mut session = PlayerSession::with_generator_and_gamemode(
             id,
             addr,
             Arc::clone(&self.generator),
             self.default_gamemode,
         );
+        session.max_view_distance = self.default_view_distance;
         let mut map = self.sessions.write();
         map.insert(id, session);
         // Note: For direct Arc access, or callers can lookup by id
-        Arc::new(RwLock::new(PlayerSession::with_generator_and_gamemode(
+        let mut s2 = PlayerSession::with_generator_and_gamemode(
             id,
             addr,
             Arc::clone(&self.generator),
             self.default_gamemode,
-        )))
+        );
+        s2.max_view_distance = self.default_view_distance;
+        Arc::new(RwLock::new(s2))
     }
 
     pub fn add_session(&self, session: PlayerSession) {
@@ -924,12 +939,13 @@ impl SessionManager {
             Some(s) => s,
             None => {
                 let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-                let new_session = PlayerSession::with_generator_and_gamemode(
+                let mut new_session = PlayerSession::with_generator_and_gamemode(
                     id,
                     peer,
                     Arc::clone(&self.generator),
                     self.default_gamemode,
                 );
+                new_session.max_view_distance = self.default_view_distance;
                 map.insert(id, new_session);
                 map.get_mut(&id).unwrap()
             }

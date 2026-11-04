@@ -35,9 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         world_generator.generator_type(),
         world_generator.spawn_position()
     );
-    let session_manager = Arc::new(SessionManager::with_generator_and_gamemode(
+    let session_manager = Arc::new(SessionManager::with_generator_gamemode_and_view_distance(
         world_generator,
         config.gamemode,
+        config.view_distance,
     ));
     info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
 
