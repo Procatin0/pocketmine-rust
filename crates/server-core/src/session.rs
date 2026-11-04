@@ -496,21 +496,21 @@ impl PlayerSession {
         writer.write_var_u32(0);
         writer.write_var_u32(7);
         writer.write_byte(7);
-        // has_collision (bit 48) | affected_by_gravity (bit 49) | can_climb (bit 19)
-        let flags: i64 = (1i64 << 48) | (1i64 << 49) | (1i64 << 19);
+        // has_collision (bit 48) | affected_by_gravity (bit 49)
+        let flags: i64 = (1i64 << 48) | (1i64 << 49);
         writer.write_var_i64(flags);
 
-        // 2. AIR (7) -> type: short (1), legacy_type: 1 -> 300
+        // 2. AIR (7) -> type: short (1), legacy_type: 1 -> 400
         writer.write_var_u32(7);
         writer.write_var_u32(1);
         writer.write_byte(1);
-        writer.write_i16_le(300);
+        writer.write_i16_le(400);
 
-        // 3. MAX_AIR (42) -> type: short (1), legacy_type: 1 -> 300
+        // 3. MAX_AIR (42) -> type: short (1), legacy_type: 1 -> 400
         writer.write_var_u32(42);
         writer.write_var_u32(1);
         writer.write_byte(1);
-        writer.write_i16_le(300);
+        writer.write_i16_le(400);
 
         // 4. SCALE (38) -> type: float (3), legacy_type: 3 -> 1.0
         writer.write_var_u32(38);
