@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -7,9 +7,10 @@ use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
     BlockPos, ChunkRadiusUpdatedPacket, DisconnectPacket, LevelChunkPacket,
     LoginPacket, NetworkChunkPublisherUpdatePacket, NetworkSettingsPacket, Packet, PacketBatch,
-    PacketViolationWarningPacket, PlayStatusPacket, RequestChunkRadiusPacket,
-    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
-    ResourcePacksInfoPacket, SetSpawnPositionPacket, StartGamePacket, Vector3f,
+    PacketViolationWarningPacket, PlayStatusPacket, PlayerAuthInputPacket, RequestAbilityPacket,
+    RequestChunkRadiusPacket, RequestNetworkSettingsPacket, ResourcePackClientResponsePacket,
+    ResourcePackStackPacket, ResourcePacksInfoPacket, SetPlayerGameTypePacket, SetSpawnPositionPacket,
+    StartGamePacket, TextPacket, UpdateAbilitiesPacket, UpdatePlayerGameTypePacket, Vector3f,
 };
 use bedrock_world::{FlatGenerator, WorldGenerator};
 use parking_lot::RwLock;
@@ -59,6 +60,10 @@ pub enum OutgoingPacket {
     ChunkRadiusUpdated(ChunkRadiusUpdatedPacket),
     LevelChunk(LevelChunkPacket),
     Disconnect(DisconnectPacket),
+    SetPlayerGameType(SetPlayerGameTypePacket),
+    UpdatePlayerGameType(UpdatePlayerGameTypePacket),
+    UpdateAbilities(UpdateAbilitiesPacket),
+    Text(TextPacket),
     RawWire(Vec<u8>),
 }
 
@@ -75,6 +80,10 @@ impl OutgoingPacket {
             Self::ChunkRadiusUpdated(p) => p.packet_id(),
             Self::LevelChunk(p) => p.packet_id(),
             Self::Disconnect(p) => p.packet_id(),
+            Self::SetPlayerGameType(p) => p.packet_id(),
+            Self::UpdatePlayerGameType(p) => p.packet_id(),
+            Self::UpdateAbilities(p) => p.packet_id(),
+            Self::Text(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
                 reader.read_var_u32().unwrap_or(0) & 0x3FF
@@ -94,6 +103,10 @@ impl OutgoingPacket {
             Self::ChunkRadiusUpdated(p) => p.encode(writer),
             Self::LevelChunk(p) => p.encode(writer),
             Self::Disconnect(p) => p.encode(writer),
+            Self::SetPlayerGameType(p) => p.encode(writer),
+            Self::UpdatePlayerGameType(p) => p.encode(writer),
+            Self::UpdateAbilities(p) => p.encode(writer),
+            Self::Text(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
                 Ok(())
@@ -117,8 +130,12 @@ pub struct PlayerSession {
     pub entity_unique_id: i64,
     pub entity_runtime_id: u64,
     pub position: Vector3f,
+    pub pitch: f32,
+    pub yaw: f32,
     pub gamemode: i32,
+    pub is_flying: bool,
     pub chunk_radius: i32,
+    pub sent_chunks: HashSet<(i32, i32)>,
     pub compression_enabled: bool,
     pub generator: Arc<dyn WorldGenerator>,
 }
@@ -136,8 +153,12 @@ impl PlayerSession {
             entity_unique_id: session_id as i64,
             entity_runtime_id: session_id,
             position: Vector3f::new(px, py, pz),
+            pitch: 0.0,
+            yaw: 0.0,
             gamemode: 0, // Survival
+            is_flying: false,
             chunk_radius: 8,
+            sent_chunks: HashSet::new(),
             compression_enabled: false,
             generator,
         }
@@ -147,6 +168,15 @@ impl PlayerSession {
         session_id: u64,
         client_addr: SocketAddr,
         generator: Arc<dyn WorldGenerator>,
+    ) -> Self {
+        Self::with_generator_and_gamemode(session_id, client_addr, generator, 0)
+    }
+
+    pub fn with_generator_and_gamemode(
+        session_id: u64,
+        client_addr: SocketAddr,
+        generator: Arc<dyn WorldGenerator>,
+        gamemode: i32,
     ) -> Self {
         let (px, py, pz) = generator.player_position();
         Self {
@@ -158,8 +188,12 @@ impl PlayerSession {
             entity_unique_id: session_id as i64,
             entity_runtime_id: session_id,
             position: Vector3f::new(px, py, pz),
-            gamemode: 0,
+            pitch: 0.0,
+            yaw: 0.0,
+            gamemode,
+            is_flying: false,
             chunk_radius: 8,
+            sent_chunks: HashSet::new(),
             compression_enabled: false,
             generator,
         }
@@ -203,6 +237,26 @@ impl PlayerSession {
                 let mut reader = Reader::new(payload);
                 let packet = RequestChunkRadiusPacket::decode(&mut reader)?;
                 self.handle_chunk_radius_request(packet)
+            }
+            0x90 => {
+                let mut reader = Reader::new(payload);
+                let packet = PlayerAuthInputPacket::decode(&mut reader)?;
+                self.handle_player_auth_input(packet)
+            }
+            0x09 => {
+                let mut reader = Reader::new(payload);
+                let packet = TextPacket::decode(&mut reader)?;
+                self.handle_text(packet)
+            }
+            0x3E => {
+                let mut reader = Reader::new(payload);
+                let packet = SetPlayerGameTypePacket::decode(&mut reader)?;
+                self.handle_set_player_game_type(packet)
+            }
+            0xB8 => {
+                let mut reader = Reader::new(payload);
+                let packet = RequestAbilityPacket::decode(&mut reader)?;
+                self.handle_request_ability(packet)
             }
             0x9C => {
                 let mut reader = Reader::new(payload);
@@ -404,6 +458,7 @@ impl PlayerSession {
                 let spawn_cz = sz >> 4;
                 for cx in (spawn_cx - 2)..=(spawn_cx + 2) {
                     for cz in (spawn_cz - 2)..=(spawn_cz + 2) {
+                        self.sent_chunks.insert((cx, cz));
                         out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
                     }
                 }
@@ -457,15 +512,135 @@ impl PlayerSession {
         let spawn_cz = sz >> 4;
         for dx in -clamped_radius..=clamped_radius {
             for dz in -clamped_radius..=clamped_radius {
-                if dx.abs() > 2 || dz.abs() > 2 {
-                    let cx = spawn_cx + dx;
-                    let cz = spawn_cz + dz;
+                let cx = spawn_cx + dx;
+                let cz = spawn_cz + dz;
+                if self.sent_chunks.insert((cx, cz)) {
                     out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
                 }
             }
         }
 
         Ok(out)
+    }
+
+    /// Handles PlayerAuthInputPacket (0x90).
+    pub fn handle_player_auth_input(
+        &mut self,
+        packet: PlayerAuthInputPacket,
+    ) -> Result<Vec<OutgoingPacket>, SessionError> {
+        if self.state != SessionState::InGame {
+            return Ok(Vec::new());
+        }
+
+        self.position = packet.position;
+        self.pitch = packet.pitch;
+        self.yaw = packet.yaw;
+
+        let radius = self.chunk_radius;
+        let curr_cx = (self.position.x as i32) >> 4;
+        let curr_cz = (self.position.z as i32) >> 4;
+
+        let mut out = Vec::new();
+        let max_chunks_per_packet = 16;
+        let mut chunks_generated = 0;
+
+        let mut chunks_to_generate = Vec::new();
+        for cx in (curr_cx - radius)..=(curr_cx + radius) {
+            for cz in (curr_cz - radius)..=(curr_cz + radius) {
+                if !self.sent_chunks.contains(&(cx, cz)) {
+                    chunks_to_generate.push((cx, cz));
+                }
+            }
+        }
+
+        // Prioritize generating chunks closest to the player
+        chunks_to_generate.sort_by_key(|&(cx, cz)| {
+            (cx - curr_cx).pow(2) + (cz - curr_cz).pow(2)
+        });
+
+        for (cx, cz) in chunks_to_generate.into_iter().take(max_chunks_per_packet) {
+            self.sent_chunks.insert((cx, cz));
+            out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
+            chunks_generated += 1;
+        }
+
+        if chunks_generated > 0 {
+            let center_pos = BlockPos::new(
+                self.position.x as i32,
+                self.position.y as i32,
+                self.position.z as i32,
+            );
+            out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
+                NetworkChunkPublisherUpdatePacket::new(center_pos, (radius as u32) * 16),
+            ));
+        }
+
+        Ok(out)
+    }
+
+    /// Handles TextPacket (0x09) for chat and in-game slash commands.
+    pub fn handle_text(&mut self, packet: TextPacket) -> Result<Vec<OutgoingPacket>, SessionError> {
+        let trimmed = packet.message.trim();
+        if trimmed.starts_with('/') {
+            if let Some(cmd_out) = crate::command::handle_command(trimmed) {
+                let mut out = Vec::new();
+                match cmd_out.action {
+                    crate::command::CommandAction::SetGameMode(new_gm) => {
+                        self.gamemode = new_gm;
+                        if new_gm != 1 {
+                            self.is_flying = false;
+                        }
+                        out.push(OutgoingPacket::SetPlayerGameType(SetPlayerGameTypePacket::new(new_gm)));
+                        out.push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
+                        out.push(OutgoingPacket::Text(TextPacket::raw(cmd_out.message)));
+                    }
+                    crate::command::CommandAction::None => {
+                        out.push(OutgoingPacket::Text(TextPacket::raw(cmd_out.message)));
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        // Normal chat: echo back to player
+        let echo = TextPacket::chat(&self.username, &packet.message);
+        Ok(vec![OutgoingPacket::Text(echo)])
+    }
+
+    /// Handles SetPlayerGameTypePacket (0x3E) from client settings.
+    pub fn handle_set_player_game_type(
+        &mut self,
+        packet: SetPlayerGameTypePacket,
+    ) -> Result<Vec<OutgoingPacket>, SessionError> {
+        self.gamemode = packet.gamemode;
+        if self.gamemode != 1 {
+            self.is_flying = false;
+        }
+        let out = vec![
+            OutgoingPacket::SetPlayerGameType(packet),
+            OutgoingPacket::RawWire(self.create_update_abilities_packet()),
+            OutgoingPacket::Text(TextPacket::raw(format!(
+                "§aModo de juego cambiado a {}",
+                if self.gamemode == 1 { "Creativo" } else { "Supervivencia" }
+            ))),
+        ];
+        Ok(out)
+    }
+
+    /// Handles RequestAbilityPacket (0xB8) such as toggling flight.
+    pub fn handle_request_ability(
+        &mut self,
+        packet: RequestAbilityPacket,
+    ) -> Result<Vec<OutgoingPacket>, SessionError> {
+        if packet.ability_id == RequestAbilityPacket::ABILITY_FLYING {
+            if self.gamemode == 1 {
+                self.is_flying = packet.bool_value;
+            } else {
+                self.is_flying = false;
+            }
+            return Ok(vec![OutgoingPacket::RawWire(self.create_update_abilities_packet())]);
+        }
+        Ok(Vec::new())
     }
 
     /// Generates a LevelChunkPacket for (chunk_x, chunk_z) using the active WorldGenerator.
@@ -583,26 +758,48 @@ impl PlayerSession {
         writer.into_bytes().to_vec()
     }
 
-    /// Creates an UpdateAbilitiesPacket (0xBB) setting player abilities (survival, flying disabled, normal walk speed).
+    /// Creates an UpdateAbilitiesPacket (0xBB) setting player abilities (survival or creative with flight).
     pub fn create_update_abilities_packet(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         writer.write_var_u32(0xbb); // UpdateAbilities packet ID
         writer.write_i64_le(self.entity_unique_id);
-        writer.write_byte(1); // permission_level: member (1)
-        writer.write_byte(0); // command_permission: normal (0)
-        writer.write_byte(1); // layer count: 1
 
-        // Layer 0: Base layer (1)
-        writer.write_u16_le(1);
-        // Allowed abilities bitmask: build, mine, doors, containers, attack_players, attack_mobs, flying, may_fly, fly_speed, walk_speed
-        // (1<<0) | (1<<1) | (1<<2) | (1<<3) | (1<<4) | (1<<5) | (1<<9) | (1<<10) | (1<<13) | (1<<14) = 0x663f
-        writer.write_u32_le(0x0000663f);
-        // Enabled abilities bitmask: build, mine, doors, containers, attack_players, attack_mobs (flying=false, may_fly=false)
-        // (1<<0) | (1<<1) | (1<<2) | (1<<3) | (1<<4) | (1<<5) = 0x003f
-        writer.write_u32_le(0x0000003f);
-        writer.write_f32_le(0.05); // fly_speed
-        writer.write_f32_le(0.0);  // vertical_fly_speed
-        writer.write_f32_le(0.1);  // walk_speed
+        if self.gamemode == 1 {
+            // Creative Mode: operator permissions, allow flight, instabuild, invulnerable!
+            writer.write_byte(2); // permission_level: member (2)
+            writer.write_byte(1); // command_permission: operator (1)
+            writer.write_byte(1); // layer count: 1
+
+            // Layer 0: Base layer (1)
+            writer.write_u16_le(1);
+            let set_mask: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
+                | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11)
+                | (1 << 13) | (1 << 14);
+            writer.write_u32_le(set_mask);
+
+            let mut val_mask: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
+                | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11);
+            if self.is_flying {
+                val_mask |= (1 << 9);
+            }
+            writer.write_u32_le(val_mask);
+            writer.write_f32_le(0.05); // fly_speed
+            writer.write_f32_le(0.05); // vertical_fly_speed
+            writer.write_f32_le(0.1);  // walk_speed
+        } else {
+            // Survival Mode
+            writer.write_byte(1); // permission_level: member (1)
+            writer.write_byte(0); // command_permission: normal (0)
+            writer.write_byte(1); // layer count: 1
+
+            // Layer 0: Base layer (1)
+            writer.write_u16_le(1);
+            writer.write_u32_le(0x0000663f);
+            writer.write_u32_le(0x0000003f);
+            writer.write_f32_le(0.05); // fly_speed
+            writer.write_f32_le(0.0);  // vertical_fly_speed
+            writer.write_f32_le(0.1);  // walk_speed
+        }
 
         writer.into_bytes().to_vec()
     }
@@ -613,6 +810,7 @@ pub struct SessionManager {
     sessions: RwLock<HashMap<u64, PlayerSession>>,
     next_session_id: AtomicU64,
     generator: Arc<dyn WorldGenerator>,
+    default_gamemode: i32,
 }
 
 impl Default for SessionManager {
@@ -627,20 +825,35 @@ impl SessionManager {
     }
 
     pub fn with_generator(generator: Arc<dyn WorldGenerator>) -> Self {
+        Self::with_generator_and_gamemode(generator, 0)
+    }
+
+    pub fn with_generator_and_gamemode(generator: Arc<dyn WorldGenerator>, default_gamemode: i32) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             generator,
+            default_gamemode,
         }
     }
 
     pub fn create_session(&self, addr: SocketAddr) -> Arc<RwLock<PlayerSession>> {
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let session = PlayerSession::with_generator(id, addr, Arc::clone(&self.generator));
+        let session = PlayerSession::with_generator_and_gamemode(
+            id,
+            addr,
+            Arc::clone(&self.generator),
+            self.default_gamemode,
+        );
         let mut map = self.sessions.write();
         map.insert(id, session);
         // Note: For direct Arc access, or callers can lookup by id
-        Arc::new(RwLock::new(PlayerSession::with_generator(id, addr, Arc::clone(&self.generator))))
+        Arc::new(RwLock::new(PlayerSession::with_generator_and_gamemode(
+            id,
+            addr,
+            Arc::clone(&self.generator),
+            self.default_gamemode,
+        )))
     }
 
     pub fn add_session(&self, session: PlayerSession) {
@@ -665,7 +878,12 @@ impl SessionManager {
             Some(s) => s,
             None => {
                 let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-                let new_session = PlayerSession::with_generator(id, peer, Arc::clone(&self.generator));
+                let new_session = PlayerSession::with_generator_and_gamemode(
+                    id,
+                    peer,
+                    Arc::clone(&self.generator),
+                    self.default_gamemode,
+                );
                 map.insert(id, new_session);
                 map.get_mut(&id).unwrap()
             }

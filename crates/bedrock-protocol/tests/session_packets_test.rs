@@ -266,3 +266,36 @@ fn test_set_spawn_position_roundtrip() {
     assert_eq!(decoded.player_position, BlockPos::new(0, 1, 0));
     assert_eq!(decoded.dimension_id, 0);
 }
+
+#[test]
+fn test_player_auth_input_packet_roundtrip() {
+    use bedrock_protocol::PlayerAuthInputPacket;
+
+    let mut packet = PlayerAuthInputPacket::new(
+        15.5,
+        180.0,
+        Vector3f::new(12.34, 65.0, -98.76),
+        0.5,
+        -0.25,
+        182.0,
+    );
+    packet.input_data = vec![0x01, 0x02, 0x03, 0x04];
+    assert_eq!(packet.packet_id(), 0x90);
+
+    let mut writer = Writer::new();
+    packet.encode(&mut writer).expect("encode should succeed");
+
+    let bytes = writer.into_bytes();
+    let mut reader = Reader::new(&bytes);
+    let decoded = PlayerAuthInputPacket::decode(&mut reader).expect("decode should succeed");
+
+    assert_eq!(reader.remaining(), 0);
+    assert_eq!(packet, decoded);
+    assert_eq!(decoded.pitch, 15.5);
+    assert_eq!(decoded.yaw, 180.0);
+    assert_eq!(decoded.position, Vector3f::new(12.34, 65.0, -98.76));
+    assert_eq!(decoded.move_vec_x, 0.5);
+    assert_eq!(decoded.move_vec_z, -0.25);
+    assert_eq!(decoded.head_yaw, 182.0);
+    assert_eq!(decoded.input_data, vec![0x01, 0x02, 0x03, 0x04]);
+}

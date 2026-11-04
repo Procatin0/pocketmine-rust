@@ -9,6 +9,7 @@ pub use batch::PacketBatch;
 pub use binary::{Reader, Writer};
 pub use packets::*;
 pub use types::*;
+pub use packets::player_auth_input::PlayerAuthInputPacket;
 
 pub trait Packet: Send + Sync {
     fn packet_id(&self) -> u32;

@@ -14,6 +14,7 @@ pub struct ServerConfig {
     pub white_list: bool,
     pub level_type: String,
     pub level_seed: u64,
+    pub gamemode: i32,
     pub transports: Vec<String>,
     pub builtin_signaling_enabled: bool,
 }
@@ -30,6 +31,7 @@ impl Default for ServerConfig {
             white_list: false,            // Whitelist disabled
             level_type: "DEFAULT".to_string(),
             level_seed: 12345678,
+            gamemode: 0,
             transports: vec!["nethernet".to_string(), "raknet".to_string()],
             builtin_signaling_enabled: true,
         }
@@ -132,6 +134,14 @@ impl ServerConfig {
         }
         if let Some(seed) = map.get("level-seed").and_then(|s| s.parse().ok()) {
             self.level_seed = seed;
+        }
+        if let Some(gm) = map.get("gamemode") {
+            self.gamemode = match gm.to_lowercase().as_str() {
+                "creative" | "c" | "1" => 1,
+                "adventure" | "a" | "2" => 2,
+                "spectator" | "sp" | "3" => 3,
+                _ => 0,
+            };
         }
     }
 

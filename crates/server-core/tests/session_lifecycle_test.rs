@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use bedrock_protocol::{
-    LoginPacket, Packet, PlayStatusPacket, RequestChunkRadiusPacket, RequestNetworkSettingsPacket,
-    ResourcePackClientResponsePacket, Writer,
+    LoginPacket, Packet, PlayStatusPacket, PlayerAuthInputPacket, RequestChunkRadiusPacket,
+    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, Vector3f, Writer,
 };
 use server_core::{OutgoingPacket, PlayerSession, SessionManager, SessionState};
 
@@ -137,7 +137,43 @@ fn test_session_full_login_lifecycle() {
     }
 
     // All outgoing packets should be serializable into bytes
-    for resp in responses {
+    for resp in &responses {
+        let bytes = resp.to_bytes().expect("to_bytes should succeed");
+        assert!(!bytes.is_empty());
+    }
+
+    // Step 6: Client sends PlayerAuthInputPacket (0x90) with new position
+    // Move to (320.0, 65.0, 0.0) -> chunk (20, 0), well outside the previous window.
+    let auth_input = PlayerAuthInputPacket::new(
+        10.0,
+        90.0,
+        Vector3f::new(320.0, 65.0, 0.0),
+        0.0,
+        0.0,
+        90.0,
+    );
+    let mut writer = Writer::new();
+    auth_input.encode(&mut writer).unwrap();
+    let move_responses = session
+        .handle_packet(0x90, &writer.into_bytes())
+        .expect("handle 0x90 should succeed");
+
+    assert_eq!(session.position, Vector3f::new(320.0, 65.0, 0.0));
+    assert_eq!(session.pitch, 10.0);
+    assert_eq!(session.yaw, 90.0);
+    assert!(!move_responses.is_empty());
+
+    let has_chunks = move_responses
+        .iter()
+        .any(|r| matches!(r, OutgoingPacket::LevelChunk(_)));
+    let has_pub_update = move_responses
+        .iter()
+        .any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_)));
+    assert!(has_chunks);
+    assert!(has_pub_update);
+    assert!(session.sent_chunks.contains(&(20, 0)));
+
+    for resp in &move_responses {
         let bytes = resp.to_bytes().expect("to_bytes should succeed");
         assert!(!bytes.is_empty());
     }
@@ -191,4 +227,69 @@ fn test_session_manager() {
     let removed = manager.remove_session(1);
     assert!(removed.is_some());
     assert_eq!(manager.session_count(), 1);
+}
+
+#[test]
+fn test_dynamic_chunk_streaming_on_player_movement() {
+    let addr: SocketAddr = "127.0.0.1:54323".parse().unwrap();
+    let mut session = PlayerSession::new(77, addr);
+
+    // Progress session to InGame
+    session.handle_login(LoginPacket::new(685, "test")).unwrap();
+    session.handle_resource_pack_response(ResourcePackClientResponsePacket::new(
+        ResourcePackClientResponsePacket::STATUS_HAVE_ALL_PACKS,
+        Vec::new(),
+    )).unwrap();
+    session.handle_resource_pack_response(ResourcePackClientResponsePacket::new(
+        ResourcePackClientResponsePacket::STATUS_COMPLETED,
+        Vec::new(),
+    )).unwrap();
+
+    assert!(session.is_in_game());
+    assert_eq!(session.sent_chunks.len(), 25); // 5x5 initial spawn chunks
+
+    // 1. Set radius to 2 (matching initial 5x5 spawn chunks) and move slightly within same chunk (0, 0)
+    session.chunk_radius = 2;
+    let move_same_chunk = PlayerAuthInputPacket::new(
+        5.0,
+        180.0,
+        Vector3f::new(2.0, 65.0, 2.0),
+        0.1,
+        0.0,
+        180.0,
+    );
+    let responses = session.handle_player_auth_input(move_same_chunk).unwrap();
+    assert!(responses.is_empty(), "No new chunks should be sent within the already generated spawn area");
+    assert_eq!(session.position, Vector3f::new(2.0, 65.0, 2.0));
+    assert_eq!(session.pitch, 5.0);
+    assert_eq!(session.yaw, 180.0);
+
+    // 2. Move to chunk (10, 10) -> coordinate (160.0, 65.0, 160.0)
+    // Window: 8..=12, 8..=12 -> 5x5 = 25 chunks to generate
+    let move_to_10_10 = PlayerAuthInputPacket::new(
+        0.0,
+        0.0,
+        Vector3f::new(160.0, 65.0, 160.0),
+        0.0,
+        0.0,
+        0.0,
+    );
+    let responses_1 = session.handle_player_auth_input(move_to_10_10.clone()).unwrap();
+
+    // Max 16 chunks generated in first packet + 1 NetworkChunkPublisherUpdate
+    let chunks_gen_1 = responses_1.iter().filter(|r| matches!(r, OutgoingPacket::LevelChunk(_))).count();
+    assert_eq!(chunks_gen_1, 16);
+    assert!(responses_1.iter().any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))));
+    assert_eq!(session.sent_chunks.len(), 25 + 16);
+
+    // 3. Second auth input generates the remaining 9 chunks
+    let responses_2 = session.handle_player_auth_input(move_to_10_10.clone()).unwrap();
+    let chunks_gen_2 = responses_2.iter().filter(|r| matches!(r, OutgoingPacket::LevelChunk(_))).count();
+    assert_eq!(chunks_gen_2, 9);
+    assert!(responses_2.iter().any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))));
+    assert_eq!(session.sent_chunks.len(), 25 + 25);
+
+    // 4. Third auth input generates 0 chunks since all 25 chunks in the window are now sent
+    let responses_3 = session.handle_player_auth_input(move_to_10_10).unwrap();
+    assert!(responses_3.is_empty());
 }
