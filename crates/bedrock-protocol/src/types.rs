@@ -41,14 +41,14 @@ impl BlockPos {
 
     pub fn write(&self, writer: &mut Writer) {
         writer.write_var_i32(self.x);
-        writer.write_var_u32(self.y as u32);
+        writer.write_var_i32(self.y);
         writer.write_var_i32(self.z);
     }
 
     pub fn read(reader: &mut Reader) -> Result<Self, CodecError> {
         Ok(Self {
             x: reader.read_var_i32()?,
-            y: reader.read_var_u32()? as i32,
+            y: reader.read_var_i32()?,
             z: reader.read_var_i32()?,
         })
     }

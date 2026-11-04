@@ -491,13 +491,17 @@ impl PlayerSession {
             });
         }
 
-        let clamped_radius = packet.radius.clamp(2, 32);
+        let clamped_radius = packet.radius.clamp(8, 32);
         self.chunk_radius = clamped_radius;
+        tracing::info!(
+            "Session {} handle_chunk_radius_request: requested={}, clamped={}, burst_radius={}",
+            self.session_id, packet.radius, clamped_radius, clamped_radius.min(8)
+        );
 
         let center_pos = BlockPos::new(
-            self.position.x as i32,
-            self.position.y as i32,
-            self.position.z as i32,
+            self.position.x.floor() as i32,
+            self.position.y.floor() as i32,
+            self.position.z.floor() as i32,
         );
 
         let publisher_radius_blocks = (((clamped_radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
@@ -509,11 +513,11 @@ impl PlayerSession {
             ),
         ];
 
-        // Send an immediate burst around player (clamped_radius.min(6)) so the local area is loaded immediately,
+        // Send an immediate burst around player (clamped_radius.min(8)) so the local area is loaded immediately,
         // while remaining chunks stream smoothly via PlayerAuthInput without stalling the server event loop.
-        let curr_cx = (self.position.x as i32) >> 4;
-        let curr_cz = (self.position.z as i32) >> 4;
-        let burst_radius = clamped_radius.min(6);
+        let curr_cx = (self.position.x.floor() as i32) >> 4;
+        let curr_cz = (self.position.z.floor() as i32) >> 4;
+        let burst_radius = clamped_radius.min(8);
         let mut chunks_to_generate = Vec::new();
         for dx in -burst_radius..=burst_radius {
             for dz in -burst_radius..=burst_radius {
@@ -546,24 +550,27 @@ impl PlayerSession {
             return Ok(Vec::new());
         }
 
-        let old_cx = (self.position.x as i32) >> 4;
-        let old_cz = (self.position.z as i32) >> 4;
+        let old_cx = (self.position.x.floor() as i32) >> 4;
+        let old_cz = (self.position.z.floor() as i32) >> 4;
 
         self.position = packet.position;
         self.pitch = packet.pitch;
         self.yaw = packet.yaw;
 
         let radius = self.chunk_radius;
-        let curr_cx = (self.position.x as i32) >> 4;
-        let curr_cz = (self.position.z as i32) >> 4;
+        let curr_cx = (self.position.x.floor() as i32) >> 4;
+        let curr_cz = (self.position.z.floor() as i32) >> 4;
+        let moved = curr_cx != old_cx || curr_cz != old_cz;
 
-        // Prune chunks that are far away from the player (beyond radius + 16)
+        // Prune chunks that are far away from the player (beyond radius + 12)
         // so that if the player returns to previously visited areas, they will be resent,
         // preventing empty transparent holes/voids when backtracking.
-        let prune_margin = radius + 16;
-        self.sent_chunks.retain(|&(cx, cz)| {
-            (cx - curr_cx).abs() <= prune_margin && (cz - curr_cz).abs() <= prune_margin
-        });
+        if moved {
+            let prune_margin = radius + 12;
+            self.sent_chunks.retain(|&(cx, cz)| {
+                (cx - curr_cx).abs() <= prune_margin && (cz - curr_cz).abs() <= prune_margin
+            });
+        }
 
         let mut out = Vec::new();
         let max_chunks_per_packet = 16;
@@ -582,6 +589,15 @@ impl PlayerSession {
             (cx - curr_cx).pow(2) + (cz - curr_cz).pow(2)
         });
 
+        if moved || !chunks_to_generate.is_empty() {
+            tracing::info!(
+                "Session {} AuthInput: pos=({:.1}, {:.1}, {:.1}) chunk=({}, {}) old=({}, {}) radius={} chunks_to_gen={} sent_count={}",
+                self.session_id, packet.position.x, packet.position.y, packet.position.z,
+                curr_cx, curr_cz, old_cx, old_cz, radius,
+                chunks_to_generate.len(), self.sent_chunks.len()
+            );
+        }
+
         // Publisher radius in blocks MUST encompass the entire square area (diagonal = radius * sqrt(2))
         // plus an additional margin so Bedrock client NEVER discards any boundary chunk!
         let publisher_radius_blocks = (((radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
@@ -589,11 +605,11 @@ impl PlayerSession {
         // CRITICAL: NetworkChunkPublisherUpdate MUST be added to `out` FIRST, BEFORE any LevelChunk packets!
         // In Bedrock, the client discards any chunk outside its current publisher radius.
         // Putting the update packet first ensures the client updates its publisher area BEFORE receiving chunks.
-        if !chunks_to_generate.is_empty() || curr_cx != old_cx || curr_cz != old_cz {
+        if !chunks_to_generate.is_empty() || moved {
             let center_pos = BlockPos::new(
-                self.position.x as i32,
-                self.position.y as i32,
-                self.position.z as i32,
+                self.position.x.floor() as i32,
+                self.position.y.floor() as i32,
+                self.position.z.floor() as i32,
             );
             out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
                 NetworkChunkPublisherUpdatePacket::new(center_pos, publisher_radius_blocks),
@@ -1009,6 +1025,9 @@ impl SessionManager {
             } else {
                 out.push(bytes::Bytes::from(batch));
             }
+        }
+        if !out.is_empty() {
+            tracing::debug!("[:WebRTC] Returning {} batch(es) for {}", out.len(), peer);
         }
         out
     }
