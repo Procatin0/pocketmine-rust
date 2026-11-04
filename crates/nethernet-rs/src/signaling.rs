@@ -31,6 +31,7 @@ struct NetherNetWebRtcHandler {
     peer_addr: SocketAddr,
     packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
     peer_conn: Arc<Mutex<Option<Arc<dyn PeerConnection>>>>,
+    reliable_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
 }
 
 #[async_trait::async_trait]
@@ -62,8 +63,13 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
         let id = dc.id();
         info!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
 
+        if label == "ReliableDataChannel" {
+            *self.reliable_dc.lock().await = Some(Arc::clone(&dc));
+        }
+
         let handler = self.packet_handler.clone();
         let peer_conn = Arc::clone(&self.peer_conn);
+        let reliable_dc = Arc::clone(&self.reliable_dc);
         tokio::spawn(async move {
             loop {
                 match dc.poll().await {
@@ -83,7 +89,15 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                                     framed.extend_from_slice(&resp);
                                     let mut buf = bytes::BytesMut::with_capacity(framed.len());
                                     buf.extend_from_slice(&framed);
-                                    if let Err(e) = dc.send(buf).await {
+
+                                    // Chunks and all core game packets MUST be delivered over ReliableDataChannel
+                                    let target_dc = if let Some(ref rdc) = *reliable_dc.lock().await {
+                                        rdc.clone()
+                                    } else {
+                                        dc.clone()
+                                    };
+
+                                    if let Err(e) = target_dc.send(buf).await {
                                         error!("[:WebRTC] Failed to send response on '{}': {}", label, e);
                                     }
                                 }
@@ -529,11 +543,13 @@ impl SignalingServer {
 
         let gather_notify = Arc::new(tokio::sync::Notify::new());
         let peer_conn_holder: Arc<Mutex<Option<Arc<dyn PeerConnection>>>> = Arc::new(Mutex::new(None));
+        let reliable_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
         let handler: Arc<dyn PeerConnectionEventHandler> = Arc::new(NetherNetWebRtcHandler {
             gather_notify: Arc::clone(&gather_notify),
             peer_addr,
             packet_handler: packet_handler.clone(),
             peer_conn: Arc::clone(&peer_conn_holder),
+            reliable_dc,
         });
 
         // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:

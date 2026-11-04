@@ -490,7 +490,7 @@ impl PlayerSession {
             });
         }
 
-        let clamped_radius = packet.radius.clamp(2, 16);
+        let clamped_radius = packet.radius.clamp(2, 32);
         self.chunk_radius = clamped_radius;
 
         let center_pos = BlockPos::new(
@@ -506,18 +506,27 @@ impl PlayerSession {
             ),
         ];
 
-        // Generate surrounding chunks for the client requested radius around spawn chunk
-        let (sx, _sy, sz) = self.generator.spawn_position();
-        let spawn_cx = sx >> 4;
-        let spawn_cz = sz >> 4;
+        // Generate surrounding chunks around player position prioritized by proximity
+        let curr_cx = (self.position.x as i32) >> 4;
+        let curr_cz = (self.position.z as i32) >> 4;
+        let mut chunks_to_generate = Vec::new();
         for dx in -clamped_radius..=clamped_radius {
             for dz in -clamped_radius..=clamped_radius {
-                let cx = spawn_cx + dx;
-                let cz = spawn_cz + dz;
-                if self.sent_chunks.insert((cx, cz)) {
-                    out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
+                let cx = curr_cx + dx;
+                let cz = curr_cz + dz;
+                if !self.sent_chunks.contains(&(cx, cz)) {
+                    chunks_to_generate.push((cx, cz));
                 }
             }
+        }
+
+        chunks_to_generate.sort_by_key(|&(cx, cz)| {
+            (cx - curr_cx).pow(2) + (cz - curr_cz).pow(2)
+        });
+
+        for (cx, cz) in chunks_to_generate {
+            self.sent_chunks.insert((cx, cz));
+            out.push(OutgoingPacket::LevelChunk(self.create_chunk_packet(cx, cz)));
         }
 
         Ok(out)
@@ -531,6 +540,9 @@ impl PlayerSession {
         if self.state != SessionState::InGame {
             return Ok(Vec::new());
         }
+
+        let old_cx = (self.position.x as i32) >> 4;
+        let old_cz = (self.position.z as i32) >> 4;
 
         self.position = packet.position;
         self.pitch = packet.pitch;
@@ -564,7 +576,7 @@ impl PlayerSession {
             chunks_generated += 1;
         }
 
-        if chunks_generated > 0 {
+        if chunks_generated > 0 || curr_cx != old_cx || curr_cz != old_cz {
             let center_pos = BlockPos::new(
                 self.position.x as i32,
                 self.position.y as i32,
