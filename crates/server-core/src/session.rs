@@ -13,8 +13,7 @@ use bedrock_protocol::{
     ResourcePacksInfoPacket, SetPlayerGameTypePacket, SetSpawnPositionPacket, StartGamePacket,
     ActorEventPacket, InventoryContentPacket, InventorySlotPacket, InventoryTransactionPacket,
     ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket, SetTitlePacket, TextPacket,
-    TransactionData,
-    TransferPacket,
+    TransactionData, TransferPacket,
     UpdateAbilitiesPacket, UpdatePlayerGameTypePacket, Vector3f,
 };
 use bedrock_protocol::packets::actor_event::EVENT_DEATH_ANIMATION;
@@ -88,8 +87,8 @@ pub enum OutgoingPacket {
     UpdatePlayerGameType(UpdatePlayerGameTypePacket),
     UpdateAbilities(UpdateAbilitiesPacket),
     Text(TextPacket),
-    Transfer(TransferPacket),
     SetTitle(SetTitlePacket),
+    Transfer(TransferPacket),
     RawWire(Vec<u8>),
 }
 
@@ -110,8 +109,8 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.packet_id(),
             Self::UpdateAbilities(p) => p.packet_id(),
             Self::Text(p) => p.packet_id(),
-            Self::Transfer(p) => p.packet_id(),
             Self::SetTitle(p) => p.packet_id(),
+            Self::Transfer(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
                 reader.read_var_u32().unwrap_or(0) & 0x3FF
@@ -135,8 +134,8 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.encode(writer),
             Self::UpdateAbilities(p) => p.encode(writer),
             Self::Text(p) => p.encode(writer),
-            Self::Transfer(p) => p.encode(writer),
             Self::SetTitle(p) => p.encode(writer),
+            Self::Transfer(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
                 Ok(())
@@ -1924,15 +1923,16 @@ impl SessionManager {
         session
     }
 
-    pub fn create_session(&self, addr: SocketAddr) -> Arc<RwLock<PlayerSession>> {
+    /// Registers a new session and returns its id.
+    ///
+    /// The manager owns the only copy: transports address the session through
+    /// [`Self::handle_session_packet`] with the returned id, so there is no
+    /// detached handle whose queued packets could be lost.
+    pub fn create_session(&self, addr: SocketAddr) -> u64 {
         let id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let mut session = self.new_session(id, addr);
-        session.max_view_distance = self.default_view_distance;
+        let session = self.new_session(id, addr);
         self.sessions.write().insert(id, session);
-
-        let mut arc_session = self.new_session(id, addr);
-        arc_session.max_view_distance = self.default_view_distance;
-        Arc::new(RwLock::new(arc_session))
+        id
     }
 
     pub fn add_session(&self, session: PlayerSession) {

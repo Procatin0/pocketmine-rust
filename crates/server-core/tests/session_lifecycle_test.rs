@@ -451,6 +451,33 @@ fn test_session_manager() {
 }
 
 #[test]
+fn create_session_registers_a_single_session_per_client() {
+    let manager = SessionManager::new();
+    let addr: SocketAddr = "127.0.0.1:54341".parse().unwrap();
+
+    let id = manager.create_session(addr);
+    assert_eq!(manager.session_count(), 1);
+
+    // The returned id addresses the session that is actually registered, so
+    // its replies are not queued on a detached copy.
+    let mut writer = Writer::new();
+    RequestNetworkSettingsPacket {
+        client_protocol_version: 685,
+    }
+    .encode(&mut writer)
+    .unwrap();
+    let responses = manager
+        .handle_session_packet(id, 0xC1, &writer.into_bytes())
+        .expect("the registered session answers its own id");
+    assert_eq!(responses.len(), 1);
+    assert!(matches!(responses[0], OutgoingPacket::NetworkSettings(_)));
+
+    let second = manager.create_session("127.0.0.1:54342".parse().unwrap());
+    assert_ne!(second, id);
+    assert_eq!(manager.session_count(), 2);
+}
+
+#[test]
 fn test_dynamic_chunk_streaming_on_player_movement() {
     let addr: SocketAddr = "127.0.0.1:54323".parse().unwrap();
     let mut session = PlayerSession::new(77, addr);

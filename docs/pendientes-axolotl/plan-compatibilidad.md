@@ -7,9 +7,9 @@
 **Estado medido:** 33 de los 41 comandos de PM portados, 29 de 248 paquetes, permisos y
 `/gamemode` paritarios; entidades, crafteo y persistencia de chunks pendientes
 **Fecha:** 2026-11-06
-**Verificación base:** `cargo check --workspace --all-targets` OK; 51 tests de
-`server-core` (lib) + 12 (`item_health_commands_test`) + 9 (`session_lifecycle_test`) +
-31 y 11 (`bedrock-protocol`) en verde, ejecutados con `CARGO_TARGET_DIR=target/test-parity`.
+**Verificación base:** `cargo check --workspace --all-targets` OK (0 warnings); 59 tests de
+`server-core` (lib) + 12 (`item_health_commands_test`) + 10 (`session_lifecycle_test`) +
+38 y 11 (`bedrock-protocol`) en verde, ejecutados con `CARGO_TARGET_DIR=target/test-parity`.
 
 Regla del port: cada comando y cada paquete se traduce **uno a uno** desde el PHP.
 Mismos nombres, alias, argumentos, límites, nodos de permiso, mensajes (claves de
@@ -74,7 +74,7 @@ Cifras concretas:
 | Comandos de PM pendientes | 10 |
 | Paquetes implementados | 27 de 248 |
 | Nodos de permiso registrados | 46 (+16 reservados de comandos no portados) |
-| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 114 |
+| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 130 |
 
 El servidor es un **superconjunto**: lo que existe en PM existe aquí con el mismo
 comportamiento, y además hay comandos propios de Bedrock y una extensión de TPS (§4).
@@ -374,7 +374,7 @@ Criterio: CI verde y paridad documentada.
 | 3 | Jugadores no se ven entre sí | `session.rs` no envía `AddPlayerPacket` | fase 4 | abierto |
 | 4 | Inventario sólo 4 ventanas | `inventory.rs` sin contenedores | fase 5 | abierto |
 | 5 | Persistencia JSON en vez de NBT | evitar serializador NBT | fase 6 | decisión consciente |
-| 6 | `create_session` crea dos sesiones con el mismo id | inserta una y devuelve otra distinta | — | **confirmado abierto** (ver §11.1) |
+| 6 | `create_session` creaba dos sesiones con el mismo id | insertaba una y devolvía otra distinta | registra una sola sesión y devuelve su id, que es con el que se le envían paquetes | completo |
 | 7 | Desconexión "bad packet" al entrar | 441 chunks en una sola respuesta | límite de 8-16 chunks por respuesta, ordenados por distancia | aplicado; verificación en vivo pendiente |
 | 8 | Congelación al apagar con Ctrl+C | `shutdown_sync` no esperaba al worker y bloqueaba Tokio | `join` del worker + `spawn_blocking` | aplicado; verificación en vivo pendiente |
 | 9 | TPS iniciales en 0 y bajos al generar | denominador de ventana completa + generación síncrona | `start_time` en `TickMetrics`; menos chunks por respuesta | aplicado; verificación en vivo pendiente |
@@ -394,14 +394,22 @@ Criterio: CI verde y paridad documentada.
 | 23 | `transferserver` bloqueado | faltaba `TransferPacket` | `TransferPacket` (0x55) y `CommandAction::Transfer`, que cierra la sesión como `NetworkSession::transfer()` | completo |
 | 24 | Textos sin verificación contra el locale | constantes copiadas a mano sin red | `translations::Translator` con `spa.ini` embebido y test constante-por-clave | completo |
 
-### 11.1 `create_session` duplica sesiones (confirmado)
+### 11.1 `create_session` duplicaba sesiones (resuelto)
 
-`crates/server-core/src/session.rs:1898` crea `session`, la inserta en el mapa, y luego
-crea `arc_session` (mismo `id`) que devuelve al llamador. El llamador trabaja sobre una
-copia que no está en el mapa. Consecuencias: paquetes encolados en la copia no llegan al
-registro y el estado se puede dividir en dos. Arreglo: crear una sola sesión, insertarla
-y devolver un `Arc<RwLock<PlayerSession>>` que apunte a la misma instancia (por ejemplo
-guardando `Arc<RwLock<PlayerSession>>` en el mapa en vez de `PlayerSession`).
+`create_session` construía `session`, la insertaba en el mapa y después construía una
+segunda instancia con el mismo `id` que devolvía envuelta en `Arc<RwLock<_>>`. El único
+llamador (`main.rs`, el listener de RakNet) descartaba ese valor, así que la copia se
+perdía y el trabajo de construcción se duplicaba: un manejador futuro habría encolado
+paquetes en una sesión que el mapa nunca veía.
+
+Arreglo: el `SessionManager` es el único dueño de la sesión. `create_session` construye
+**una** sesión, la inserta y devuelve su `u64`, que es justo el parámetro con el que el
+transporte direcciona los paquetes en `handle_session_packet`. Un `Arc<RwLock<PlayerSession>>`
+en el mapa habría exigido bloquear cada sesión individualmente en los ~15 puntos que
+hoy recorren el mapa con un solo candado, con riesgo de interbloqueo en el bucle de red,
+sin ganancia mientras no exista un consumidor del handle. Cubierto por
+`create_session_registers_a_single_session_per_client`, que además comprueba que el id
+devuelto responde por sí mismo.
 
 ### 11.2 Comprobaciones de paridad ejecutadas (2026-11-06)
 
@@ -409,7 +417,7 @@ guardando `Arc<RwLock<PlayerSession>>` en el mapa en vez de `PlayerSession`).
 cargo check --workspace --all-targets                          → OK (0 warnings)
 cargo test -p server-core --lib                                → 59 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
-cargo test -p server-core --test session_lifecycle_test        → 9 OK
+cargo test -p server-core --test session_lifecycle_test        → 10 OK
 cargo test -p bedrock-protocol                                 → 38 + 11 OK
 ```
 
@@ -436,7 +444,8 @@ cargo test -p bedrock-protocol                                 → 38 + 11 OK
 8. **NBT mínimo** y `/give [... tags]` (fase 1).
 9. ✅ ~~`SetTitlePacket` (0x59) y `/title`~~: el paquete real es 0x58; `/title` cubre
    `clear|reset|title|subtitle|actionbar|times` con nodos `.self`/`.other` (fase 2).
-10. **Arreglar `create_session`** (§11.1).
+10. ✅ ~~Arreglar `create_session`~~: registra una sola sesión y devuelve el `u64` con el
+    que el transporte le envía paquetes (§11.1).
 11. ✅ ~~Consola en `broadcast_command_message` y `ServerCommandEvent`~~: la consola
     registra `chat.type.admin` sin color y el evento de consola ya se despachaba (fase 3.3).
 12. **Harness de comparación con PM**: mismo comando contra PM y contra este servidor,

@@ -253,7 +253,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(event) => match event {
                             RakNetEvent::Offline { packet, src, .. } => {
                                 tracing::info!("RakNet Offline Handshake on :{} from {}: {:?}", raknet_port, src, packet);
-                                let _ = session_mgr.create_session(src);
+                                let session_id = session_mgr.create_session(src);
+                                tracing::debug!(
+                                    "Registered session {} for RakNet peer {}",
+                                    session_id,
+                                    src
+                                );
                             }
                         },
                         Err(e) => {
