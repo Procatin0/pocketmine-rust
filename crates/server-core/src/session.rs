@@ -14,6 +14,7 @@ use bedrock_protocol::{
     ActorEventPacket, InventoryContentPacket, InventorySlotPacket, InventoryTransactionPacket,
     ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket, SetTitlePacket, TextPacket,
     TransactionData,
+    TransferPacket,
     UpdateAbilitiesPacket, UpdatePlayerGameTypePacket, Vector3f,
 };
 use bedrock_protocol::packets::actor_event::EVENT_DEATH_ANIMATION;
@@ -87,6 +88,7 @@ pub enum OutgoingPacket {
     UpdatePlayerGameType(UpdatePlayerGameTypePacket),
     UpdateAbilities(UpdateAbilitiesPacket),
     Text(TextPacket),
+    Transfer(TransferPacket),
     SetTitle(SetTitlePacket),
     RawWire(Vec<u8>),
 }
@@ -108,6 +110,7 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.packet_id(),
             Self::UpdateAbilities(p) => p.packet_id(),
             Self::Text(p) => p.packet_id(),
+            Self::Transfer(p) => p.packet_id(),
             Self::SetTitle(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
@@ -132,6 +135,7 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.encode(writer),
             Self::UpdateAbilities(p) => p.encode(writer),
             Self::Text(p) => p.encode(writer),
+            Self::Transfer(p) => p.encode(writer),
             Self::SetTitle(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
@@ -2795,6 +2799,27 @@ impl SessionManager {
                         } => SetTitlePacket::set_animation_times(*fade_in, *stay, *fade_out),
                     };
                     self.queue_packet(target, OutgoingPacket::SetTitle(packet));
+                }
+                CommandAction::Transfer {
+                    target,
+                    address,
+                    port,
+                } => {
+                    // `NetworkSession::transfer()` sends the packet and closes
+                    // the session without a disconnect screen.
+                    self.queue_packet(
+                        target,
+                        OutgoingPacket::Transfer(TransferPacket::new(
+                            address.clone(),
+                            *port,
+                            false,
+                        )),
+                    );
+                    if let Some(session_id) = self.session_id_for(target) {
+                        if let Some(session) = self.sessions.write().get_mut(&session_id) {
+                            session.state = SessionState::Disconnected;
+                        }
+                    }
                 }
                 CommandAction::SetTime(ticks) => {
                     let time = self.world.set_time(*ticks);

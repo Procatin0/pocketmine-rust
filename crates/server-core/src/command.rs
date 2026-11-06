@@ -209,6 +209,12 @@ pub enum CommandAction {
         target: String,
         action: TitleAction,
     },
+    /// `/transferserver`: send `TransferPacket` and close the session.
+    Transfer {
+        target: String,
+        address: String,
+        port: u16,
+    },
     SetDefaultGamemode(i32),
     SetDifficulty {
         difficulty: i32,
@@ -541,6 +547,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/title <jugador> <clear|reset|title|subtitle|actionbar|times> ...",
         description: "Controla títulos en pantalla",
     },
+    CommandInfo {
+        name: "transferserver",
+        aliases: &[],
+        usage: "/transferserver <servidor> [puerto]",
+        description: "Transferirte a otro servidor",
+    },
 ];
 
 /// Parses and evaluates a core command.
@@ -622,6 +634,7 @@ pub fn handle_command(
         "tps" => Some(tps(source)),
         "time" => Some(time(source, &args)),
         "title" => Some(title(source, players, &args)),
+        "transferserver" => Some(transfer(source, &args)),
         "weather" => Some(weather(source, &args)),
         "op" => Some(set_op(&args, true)),
         "deop" => Some(set_op(&args, false)),
@@ -1202,6 +1215,8 @@ pub mod lang {
     pub const TIME_ADDED: &str = "{%0} añadido a la hora";
     pub const TIME_QUERY: &str = "El Tiempo es {%0}";
     pub const TITLE_SUCCESS: &str = "El comando title se ejecutó correctamente";
+    pub const PLAYER_USER_ONLY: &str =
+        "Esta sintaxis de comando solo puede ser usada como jugador";
     pub const VERSION_SOFTWARE_NAME: &str = "Este servidor está ejecutando {%serverSoftwareName}";
     pub const VERSION_SOFTWARE_VERSION: &str =
         "Versión del servidor: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
@@ -1924,6 +1939,32 @@ fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
     }
 }
 
+/// `/transferserver <host> [port]`, ported from
+/// `pocketmine\command\defaults\TransferServerCommand`.
+///
+/// There is no success feedback: `Player::transfer()` sends the packet and
+/// `NetworkSession::transfer()` closes the session without a disconnect screen.
+/// `PlayerTransferEvent` is still missing from the plugin bridge.
+fn transfer(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if args.is_empty() {
+        return usage("transferserver");
+    }
+    if source.is_console {
+        return error(red(lang::PLAYER_USER_ONLY));
+    }
+
+    // `(int) ($args[1] ?? 19132)` then `writeUnsignedShort()` truncates.
+    let port = php_int_cast(args.get(1).copied().unwrap_or("19132")) as u16;
+    CommandOutput {
+        feedback: Vec::new(),
+        actions: vec![CommandAction::Transfer {
+            target: source.name.clone(),
+            address: args[0].to_string(),
+            port,
+        }],
+    }
+}
+
 /// `/defaultgamemode <mode>`, ported from
 /// `pocketmine\command\defaults\DefaultGamemodeCommand`.
 fn defaultgamemode(source: &CommandSource, args: &[&str]) -> CommandOutput {
@@ -2005,6 +2046,7 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "kill" | "suicide" => Some(&[COMMAND_KILL_SELF, COMMAND_KILL_OTHER]),
         "spawnpoint" => Some(&[COMMAND_SPAWNPOINT_SELF, COMMAND_SPAWNPOINT_OTHER]),
         "title" => Some(&[COMMAND_TITLE_SELF, COMMAND_TITLE_OTHER]),
+        "transferserver" => Some(&[COMMAND_TRANSFERSERVER]),
         "defaultgamemode" => Some(&[COMMAND_DEFAULTGAMEMODE]),
         "difficulty" => Some(&[COMMAND_DIFFICULTY]),
         "seed" => Some(&[COMMAND_SEED]),
@@ -3301,6 +3343,60 @@ mod tests {
             assert_eq!(output.feedback, vec![usage_line.to_string()], "{input}");
             assert!(output.actions.is_empty(), "{input}");
         }
+    }
+
+    #[test]
+    fn transferserver_matches_the_pocketmine_command() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        let output = handle_command("/transferserver play.example.net", &source, &players())
+            .expect("native");
+        assert!(output.feedback.is_empty());
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Transfer {
+                target: "Steve".to_string(),
+                address: "play.example.net".to_string(),
+                port: 19132,
+            }]
+        );
+
+        // `(int)` cast: "abc" is 0 and the port is truncated to 16 bits.
+        let output = handle_command("/transferserver host 25565", &source, &players())
+            .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Transfer {
+                target: "Steve".to_string(),
+                address: "host".to_string(),
+                port: 25565,
+            }]
+        );
+        let output =
+            handle_command("/transferserver host abc", &source, &players()).expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Transfer {
+                target: "Steve".to_string(),
+                address: "host".to_string(),
+                port: 0,
+            }]
+        );
+
+        let output = handle_command("/transferserver", &source, &players()).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec!["§cUso: /transferserver <servidor> [puerto]".to_string()]
+        );
+        assert!(output.actions.is_empty());
+
+        let console = CommandSource::console(1_000);
+        let output = handle_command("/transferserver host", &console, &players()).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec!["§cEsta sintaxis de comando solo puede ser usada como jugador".to_string()]
+        );
+        assert!(output.actions.is_empty());
     }
 
     #[test]

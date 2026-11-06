@@ -58,6 +58,7 @@ pub const COMMAND_SPAWNPOINT_SELF: &str = "pocketmine.command.spawnpoint.self";
 pub const COMMAND_SPAWNPOINT_OTHER: &str = "pocketmine.command.spawnpoint.other";
 pub const COMMAND_TITLE_SELF: &str = "pocketmine.command.title.self";
 pub const COMMAND_TITLE_OTHER: &str = "pocketmine.command.title.other";
+pub const COMMAND_TRANSFERSERVER: &str = "pocketmine.command.transferserver";
 pub const COMMAND_DEFAULTGAMEMODE: &str = "pocketmine.command.defaultgamemode";
 pub const COMMAND_DIFFICULTY: &str = "pocketmine.command.difficulty";
 pub const COMMAND_SEED: &str = "pocketmine.command.seed";
@@ -152,6 +153,7 @@ impl PermissionManager {
         self.register(COMMAND_SPAWNPOINT_OTHER, Op, &[]);
         self.register(COMMAND_TITLE_SELF, Op, &[]);
         self.register(COMMAND_TITLE_OTHER, Op, &[]);
+        self.register(COMMAND_TRANSFERSERVER, Op, &[]);
         self.register(COMMAND_DEFAULTGAMEMODE, Op, &[]);
         self.register(COMMAND_DIFFICULTY, Op, &[]);
         self.register(COMMAND_SEED, Op, &[]);

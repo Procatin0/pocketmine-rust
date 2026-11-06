@@ -4,7 +4,7 @@
 **Referencia de comportamiento:** `target/axolotl-pm` (PocketMine-MP 5 / Axolotl, PHP) y
 `target/axolotl-bedrock-protocol` (protocolo 2225)
 **Protocolo objetivo:** Bedrock 1.26.60 (protocolo 2225)
-**Estado medido:** 32 de los 41 comandos de PM portados, 26 de 248 paquetes, permisos y
+**Estado medido:** 33 de los 41 comandos de PM portados, 29 de 248 paquetes, permisos y
 `/gamemode` paritarios; entidades, crafteo y persistencia de chunks pendientes
 **Fecha:** 2026-11-06
 **Verificación base:** `cargo check --workspace --all-targets` OK; 51 tests de
@@ -54,7 +54,7 @@ ls crates/bedrock-protocol/src/packets/*.rs        # paquetes
 |---|---|---|---|
 | 0 | Cimientos | ✅ | — |
 | 1 | Inventario y objetos | 🟡 | falta `ItemStackRequest`, NBT y items data-driven |
-| 2 | Comandos restantes | 🟡 16/25 | 9 comandos dependen de sistemas inexistentes |
+| 2 | Comandos restantes | 🟡 17/25 | 8 comandos dependen de sistemas inexistentes |
 | 3 | Permisos, traducciones y consola | 🟡 3/4 | permisos, `AvailableCommands`, `ServerCommandEvent` y difusión administrativa a la consola listos; falta el motor de traducciones |
 | 4 | Entidades, combate y XP | 🟡 | `RemoveActorPacket` y `MoveActorAbsolutePacket` modelados; faltan `AddPlayerPacket`, `PlayerListPacket`, `AddActorPacket` y `SetEntityData` |
 | 5 | Crafteo y contenedores | 🔴 | sin `CraftingDataPacket` ni ventanas múltiples |
@@ -125,7 +125,7 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 | `time` | `<set\|add\|query> [valor]` | `time.set`, `time.add`, `time.query` | `commands.time.set`, `.added`, `.query`, con un nodo por subcomando | 🟢 |
 | `timings` | `[on\|off\|paste\|report]` | `timings` | `TimingsHandler` | 🔴 |
 | `title` | `<jugador> <clear\|reset\|title\|subtitle\|actionbar\|times> ...` | `title.self`, `title.other` | `SetTitlePacket` (0x58) con varints con signo; `commands.title.success` y `commands.title.usage`; `times` negativos se ignoran como `setTitleDuration()` | 🟢 |
-| `transfer-server` | `<host> <puerto>` | `transferserver` | `TransferPacket` | 🔴 |
+| `transferserver` | `<servidor> [puerto]` | `transferserver` | `TransferPacket` (0x55); puerto `(int)` truncado a u16, sólo jugadores (`pocketmine.command.error.playerUserOnly`) y cierre sin pantalla de desconexión | 🟢 |
 | `version` | — (alias `ver`) | `version` | `pocketmine.command.version.serverSoftwareName`, `.serverSoftwareVersion`, `.minecraftVersion` | 🟢 |
 | `whitelist` | `<on\|off\|list\|add\|remove\|reload>` | `whitelist.enable/.disable/.list/.add/.remove/.reload` | `commands.whitelist.*` a ops, expulsión de no incluidos, `white-list` en `server.properties` | 🟢 |
 | `xp` | `<cantidad> [jugador]` | `xp.self`, `xp.other` | `commands.xp.*` | 🔴 |
@@ -150,7 +150,6 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 | `particle` | Requiere `LevelEventPacket`/`SpawnParticleEffectPacket` y validación de partículas |
 | `status` | Requiere `BandwidthStatsTracker` (subida/bajada por sesión) — fase 8 |
 | `timings` | Requiere `TimingsHandler` con árbol de secciones; `metrics.rs` sólo mide TPS |
-| `transfer-server` | Requiere `TransferPacket` y multiworld real — fase 8 |
 | `xp` | Requiere experiencia y `ExperienceManager` — fase 4 |
 
 ---
@@ -392,6 +391,7 @@ Criterio: CI verde y paridad documentada.
 | 20 | `/list` y `/help` con texto propio y sin paginar | implementación preliminar sin claves ni semántica de PM | `commands.players.list`, `commands.help.header`, `pocketmine.command.help.specificCommand.*`, `pocketmine.command.notFound`; `max_players` en `CommandSource` | completo |
 | 21 | Comando desconocido en inglés y consola fuera de la difusión administrativa | texto propio en `session.rs` y `tracing::warn` en la consola | `command::not_found_message` (`pocketmine.command.notFound`) y `chat.type.admin` registrado por la consola | completo |
 | 22 | `/title` y su paquete no existían | comando pendiente de la fase 2 | `SetTitlePacket` (0x58) con varints con signo, `TitleAction` y `CommandAction::SendTitle` | completo |
+| 23 | `transferserver` bloqueado | faltaba `TransferPacket` | `TransferPacket` (0x55) y `CommandAction::Transfer`, que cierra la sesión como `NetworkSession::transfer()` | completo |
 
 ### 11.1 `create_session` duplica sesiones (confirmado)
 
@@ -406,10 +406,10 @@ guardando `Arc<RwLock<PlayerSession>>` en el mapa en vez de `PlayerSession`).
 
 ```
 cargo check --workspace --all-targets                          → OK (0 warnings)
-cargo test -p server-core --lib                                → 55 OK
+cargo test -p server-core --lib                                → 56 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
 cargo test -p server-core --test session_lifecycle_test        → 9 OK
-cargo test -p bedrock-protocol                                 → 33 + 11 OK
+cargo test -p bedrock-protocol                                 → 38 + 11 OK
 ```
 
 ---

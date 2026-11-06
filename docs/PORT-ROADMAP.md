@@ -71,6 +71,7 @@ pocketmine-rust/
     │   │   ├── set_title.rs                0x58
     │   │   ├── remove_actor.rs             0x0E
     │   │   ├── move_actor_absolute.rs      0x12
+    │   │   ├── transfer.rs                0x55
     │   │   ├── actor_event.rs              0x1B (DEATH_ANIMATION)
     │   │   └── respawn.rs                  0x2D
     │   └── tests/session_packets_test.rs   (11 tests de roundtrip)
@@ -122,7 +123,7 @@ php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 | Subsistema de axolotl-pm | Archivos PHP | Dónde vive en Rust | Estado |
 |---|---:|---|---|
 | `network/` (sesiones, sesión de jugador, raknet, compresión) | 109 | `server-core/session.rs`, `nethernet-rs`, `raklib-rs` | 🟡 login, chunks y chat funcionan; falta el resto |
-| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 28 de 248 |
+| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 29 de 248 |
 | `world/` (chunks, generadores, luz, formatos) | 278 | `bedrock-world` | 🟡 generación sin luz ni persistencia |
 | `block/` (402 bloques) | 402 | `bedrock-world/block_id.rs` | 🔴 ids planos, sin estados ni comportamientos |
 | `entity/` + `player/` | 93 | parcial en `session.rs` | 🔴 un solo jugador visible para sí mismo |
@@ -142,7 +143,7 @@ php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 
 ## 3. Estado de los comandos nativos
 
-### Portados (39 registrados, con alias)
+### Portados (40 registrados, con alias)
 
 | Comando | Alias | Notas |
 |---|---|---|
@@ -179,11 +180,11 @@ php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 | `/save-on` `/save-off` | — | bandera de autoguardado (6000 ticks) |
 | `/tps` | — | extensión nativa estilo PaperMC (1m/5m/15m) |
 | `/title` | — | `SetTitlePacket` (0x58): `clear`, `reset`, `title`, `subtitle`, `actionbar`, `times` |
+| `/transferserver` | — | `TransferPacket` (0x55); sólo jugadores y sin mensaje de éxito, como `TransferServerCommand` |
 
-### Pendientes de axolotl-pm (9)
+### Pendientes de axolotl-pm (8)
 
-`dumpmemory`, `effect`, `enchant`, `gc`, `particle`, `status`, `timings`,
-`transfer-server`, `xp`.
+`dumpmemory`, `effect`, `enchant`, `gc`, `particle`, `status`, `timings`, `xp`.
 Estos necesitan sistemas que aún no existen: métricas de tick/red,
 `TransferPacket`, efectos de entidad, experiencia, encantamientos (NBT),
 partículas y volcados de memoria.
@@ -237,14 +238,14 @@ Objetivo: que mover cosas en el cliente cambie el estado del servidor.
 servidor; `/give Steve diamond_sword 1` y `/clear` cubren armadura y offhand;
 tests de roundtrip con capturas reales de `data/bds-capture/`.
 
-### Fase 2 — Los 25 comandos restantes (🟡 16/25)
+### Fase 2 — Los 25 comandos restantes (🟡 17/25)
 
 Traducir uno a uno `command/defaults/*.php`:
 
 - **Jugador:** `spawnpoint` ✅, `defaultgamemode` ✅, `difficulty` ✅,
   `seed` ✅, `title` ✅, `effect`, `enchant`, `xp`, `particle`.
 - **Servidor:** `stop` ✅, `plugins` ✅, `save-all` ✅, `save-on` ✅,
-  `save-off` ✅, `status`, `gc`, `dumpmemory`, `timings`, `transfer-server`.
+  `save-off` ✅, `status`, `gc`, `dumpmemory`, `timings`, `transfer-server` ✅.
 - **Administración:** `ban` ✅, `ban-ip` ✅, `banlist` ✅, `pardon` ✅,
   `pardon-ip` ✅, `whitelist` ✅.
 
