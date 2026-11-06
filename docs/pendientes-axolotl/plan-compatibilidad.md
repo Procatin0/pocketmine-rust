@@ -216,14 +216,18 @@ Estado: las claves usadas están copiadas a mano en `command::lang` (constantes 
 el texto literal de `spa.ini`, y los parámetros se sustituyen con `fill_template`
 (`{%0}`, `{%1}`, `{%commandName}`, `{%playerName}`, `{%gameModeName}`).
 
-Pendiente (fase 3.2):
+Estado de la fase 3.2:
 
-1. Motor que lea `spa.ini` completo (`include_str!`) y resuelva `Translatable` con
-   parámetros, en vez de constantes sueltas.
-2. `KnownTranslationFactory` equivalente para que los plugins PHP reciban las mismas
-   claves que en PM.
-3. Fallback a `eng.ini` cuando falte una clave en el locale activo, como `Language`.
-4. Test que compare cada constante de `command::lang` con la línea correspondiente de
+1. ✅ Motor que lee `spa.ini` completo (`include_str!`) y resuelve parámetros
+   posicionales y nombrados (`translations::Translator`).
+2. **Pendiente:** `KnownTranslationFactory` equivalente para que los plugins PHP reciban
+   las mismas claves que en PM.
+3. **No aplica todavía:** `spa.ini` y `eng.ini` traen exactamente las mismas 658 claves
+   (verificado con `comm` sobre ambas listas), así que un fallback a `eng.ini` nunca se
+   activaría; no se embebe para no cargar 42 KB que no cambian ningún mensaje. Hará falta
+   al añadir un locale incompleto: el `Translator` ya devuelve `None` cuando la clave no
+   existe.
+4. ✅ Test que compara 25 constantes de `command::lang` con la línea correspondiente de
    `spa.ini` para que no vuelva a haber textos inventados.
 
 Claves ya usadas (muestra): `pocketmine.command.error.permission`,
