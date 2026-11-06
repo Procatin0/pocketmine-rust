@@ -1317,10 +1317,15 @@ impl PlayerSession {
                 }
             }
 
-            return Ok(vec![OutgoingPacket::Text(TextPacket::raw(format!(
-                "§cUnknown command '/{}'. Try /help.",
-                trimmed.trim_start_matches('/').split_whitespace().next().unwrap_or("")
-            )))]);
+            return Ok(vec![OutgoingPacket::Text(TextPacket::raw(
+                crate::command::not_found_message(
+                    trimmed
+                        .trim_start_matches('/')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(""),
+                ),
+            ))]);
         }
 
         // Normal chat: PlayerChatEvent (cancellable, message/format mutable).
@@ -2047,7 +2052,12 @@ impl SessionManager {
     /// `Command::broadcastCommandMessage`: the sender already received the
     /// plain line, administrators get the grey italic `[source: message]` one.
     fn broadcast_command_message(&self, source: &str, message: &str) {
-        let line = format!("§7§o[{}: {}]", source, message);
+        // `chat.type.admin`: the console subscribes to the administrative
+        // channel as a logger forwarder and receives the uncoloured line, while
+        // players get it in grey italics.
+        let admin = crate::command::fill_template(crate::command::lang::CHAT_ADMIN, &[source, message]);
+        crate::logging::console_message(&admin);
+        let line = format!("§7§o{admin}");
         let ops: Vec<String> = self.ops.read().iter().cloned().collect();
         for name in ops {
             if name.eq_ignore_ascii_case(source) {

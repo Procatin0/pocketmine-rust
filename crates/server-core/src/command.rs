@@ -691,10 +691,7 @@ fn help(source: &CommandSource, args: &[&str]) -> CommandOutput {
 
     let lookup = command_name.to_lowercase();
     let Some(info) = find_command(&lookup).filter(|info| command_visible(source, info.name)) else {
-        return error(red(fill_named(
-            lang::COMMAND_NOT_FOUND,
-            &[("commandName", &command_name), ("helpCommand", "/help")],
-        )));
+        return error(not_found_message(&command_name));
     };
 
     let mut aliases: Vec<&str> = info.aliases.to_vec();
@@ -1167,6 +1164,7 @@ pub mod lang {
     pub const NUM_TOO_SMALL: &str =
         "El número que ha introducido ({%0}) es demasiado pequeño, debe ser como mínimo {%1}";
     pub const CHAT_ANNOUNCEMENT: &str = "[{%0}] {%1}";
+    pub const CHAT_ADMIN: &str = "[{%0}: {%1}]";
     pub const CHAT_EMOTE: &str = "* {%0} {%1}";
     pub const MESSAGE_OUTGOING: &str = "Le susurras a {%0}: {%1}";
     pub const MESSAGE_INCOMING: &str = "{%0} te susurra: {%1}";
@@ -1212,6 +1210,15 @@ pub(crate) fn fill_named(template: &str, args: &[(&str, &str)]) -> String {
 /// Vanilla prefixes error output with red.
 pub(crate) fn red(message: impl AsRef<str>) -> String {
     format!("§c{}", message.as_ref())
+}
+
+/// `pocketmine.command.notFound` for an unknown command, prefixed red like
+/// `SimpleCommandMap::dispatch()` and `HelpCommand`.
+pub fn not_found_message(command_name: &str) -> String {
+    red(fill_named(
+        lang::COMMAND_NOT_FOUND,
+        &[("commandName", command_name), ("helpCommand", "/help")],
+    ))
 }
 
 enum BoundedIntError {

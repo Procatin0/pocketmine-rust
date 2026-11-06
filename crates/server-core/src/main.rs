@@ -166,9 +166,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 match manager.execute_command_sync(&CommandSender::Console, &command) {
                                     Ok(Some(outcome)) => actions.extend(outcome.actions),
-                                    Ok(None) => {
-                                        tracing::warn!("Unknown console command: {}", command)
-                                    }
+                                    Ok(None) => server_core::logging::console_message(
+                                        &server_core::command::not_found_message(
+                                            command.split_whitespace().next().unwrap_or(""),
+                                        ),
+                                    ),
                                     Err(error) => {
                                         tracing::error!("Console command failed: {}", error)
                                     }

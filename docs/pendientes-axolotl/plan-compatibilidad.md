@@ -55,7 +55,7 @@ ls crates/bedrock-protocol/src/packets/*.rs        # paquetes
 | 0 | Cimientos | ✅ | — |
 | 1 | Inventario y objetos | 🟡 | falta `ItemStackRequest`, NBT y items data-driven |
 | 2 | Comandos restantes | 🟡 15/25 | 10 comandos dependen de sistemas inexistentes |
-| 3 | Permisos, traducciones y consola | 🟡 2/4 | permisos y `AvailableCommands` listos; faltan motor de traducciones y consola completa |
+| 3 | Permisos, traducciones y consola | 🟡 3/4 | permisos, `AvailableCommands`, `ServerCommandEvent` y difusión administrativa a la consola listos; falta el motor de traducciones |
 | 4 | Entidades, combate y XP | 🔴 | faltan `AddPlayerPacket`, `PlayerListPacket`, `RemoveActorPacket` |
 | 5 | Crafteo y contenedores | 🔴 | sin `CraftingDataPacket` ni ventanas múltiples |
 | 6 | Mundo completo | 🔴 | sin luz, estados de bloque ni persistencia de chunks |
@@ -389,6 +389,7 @@ Criterio: CI verde y paridad documentada.
 | 18 | Un login no-JWT aceptaba cualquier cadena como nombre | estrategia 3 sin validar | validación tipo `Player::isValidUserName` | completo |
 | 19 | Tests de chunks y de métricas desactualizados | las constantes cambiaron (8 chunks, clamp de ventanas) | tests ajustados al comportamiento documentado | completo |
 | 20 | `/list` y `/help` con texto propio y sin paginar | implementación preliminar sin claves ni semántica de PM | `commands.players.list`, `commands.help.header`, `pocketmine.command.help.specificCommand.*`, `pocketmine.command.notFound`; `max_players` en `CommandSource` | completo |
+| 21 | Comando desconocido en inglés y consola fuera de la difusión administrativa | texto propio en `session.rs` y `tracing::warn` en la consola | `command::not_found_message` (`pocketmine.command.notFound`) y `chat.type.admin` registrado por la consola | completo |
 
 ### 11.1 `create_session` duplica sesiones (confirmado)
 
@@ -431,7 +432,8 @@ cargo test -p bedrock-protocol                                 → 31 + 11 OK
 9. **`SetTitlePacket` (0x59)** y `/title`, el único comando pendiente sin dependencia de
    entidades (fase 2/4).
 10. **Arreglar `create_session`** (§11.1).
-11. **Consola en `broadcast_command_message`** y `ServerCommandEvent` (fase 3.3).
+11. ✅ ~~Consola en `broadcast_command_message` y `ServerCommandEvent`~~: la consola
+    registra `chat.type.admin` sin color y el evento de consola ya se despachaba (fase 3.3).
 12. **Harness de comparación con PM**: mismo comando contra PM y contra este servidor,
    comparando mensajes de `spa.ini` (§13 de cierre).
 
