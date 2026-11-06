@@ -24,6 +24,8 @@ pub struct CommandSource {
     /// use administrative commands, like a vanilla world with cheats on.
     pub allow_cheats: bool,
     pub is_console: bool,
+    /// `max-players` from `server.properties`, reported by `/list`.
+    pub max_players: i32,
     pub world_time: i32,
     /// Seed of the current world, used by `/seed`.
     pub world_seed: u64,
@@ -48,6 +50,7 @@ impl CommandSource {
             is_op: true,
             allow_cheats: true,
             is_console: true,
+            max_players: 1000,
             world_time,
             world_seed: 0,
             world_spawn: (0.0, 64.0, 0.0),
@@ -543,7 +546,7 @@ pub fn handle_command(
     }
 
     match name.as_str() {
-        "help" | "?" => Some(help(&args)),
+        "help" | "?" => Some(help(source, &args)),
         "tp" | "teleport" => Some(teleport(source, players, &args)),
         "gamemode" | "gm" => {
             let Some(mode) = args.first() else {
@@ -570,7 +573,7 @@ pub fn handle_command(
         "say" => Some(say(source, &args)),
         "me" => Some(me(source, &args)),
         "msg" | "tell" | "w" | "whisper" => Some(whisper(source, players, &args)),
-        "list" | "players" => Some(list(players)),
+        "list" | "players" => Some(list(source, players)),
         "kick" => Some(kick(source, players, &args)),
         "give" => Some(give(source, players, &args)),
         "clear" => Some(clear(source, players, &args)),
@@ -600,23 +603,132 @@ pub fn handle_command(
     }
 }
 
-fn help(args: &[&str]) -> CommandOutput {
-    if let Some(query) = args.first() {
-        let query = query.trim_start_matches('/').to_lowercase();
-        return match find_command(&query) {
-            Some(info) => feedback(format!(
-                "§b{}§r\n§7Uso: §f{}\n§7{}",
-                info.name, info.usage, info.description
-            )),
-            None => error(format!("§cNo hay ayuda para '{}'.", query)),
+/// Lines a player's chat screen shows per page (`Player::getScreenLineHeight()`).
+const PLAYER_SCREEN_LINE_HEIGHT: usize = 7;
+
+/// PHP's `is_numeric()` followed by `(int)`, which `HelpCommand` uses to tell a
+/// page number from the beginning of a command name.
+fn php_int(value: &str) -> Option<i64> {
+    let number: f64 = value.trim().parse().ok()?;
+    if !number.is_finite() {
+        return None;
+    }
+    Some(number.trunc() as i64)
+}
+
+/// `Command::testPermissionSilent()` while building the help listing.
+fn command_visible(source: &CommandSource, name: &str) -> bool {
+    if let Some(nodes) = permission_nodes(name) {
+        return nodes.iter().any(|node| source.can(node));
+    }
+    let sub_nodes: &[&str] = match name {
+        "time" => &[
+            crate::permission::COMMAND_TIME_SET,
+            crate::permission::COMMAND_TIME_ADD,
+            crate::permission::COMMAND_TIME_QUERY,
+        ],
+        "whitelist" => &[
+            crate::permission::COMMAND_WHITELIST_ADD,
+            crate::permission::COMMAND_WHITELIST_REMOVE,
+            crate::permission::COMMAND_WHITELIST_ENABLE,
+            crate::permission::COMMAND_WHITELIST_DISABLE,
+            crate::permission::COMMAND_WHITELIST_LIST,
+            crate::permission::COMMAND_WHITELIST_RELOAD,
+        ],
+        // Extras without a PocketMine node (`/spawn`, `/tps`) stay visible.
+        _ => return true,
+    };
+    sub_nodes.iter().any(|node| source.can(node))
+}
+
+/// `/help`, ported from `pocketmine\command\defaults\HelpCommand`.
+fn help(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    let mut page_number: i64 = 1;
+    let mut command_name = String::new();
+    if let Some(last) = args.last() {
+        match php_int(last) {
+            Some(page) => {
+                page_number = page.max(1);
+                command_name = args[..args.len() - 1].join(" ");
+            }
+            None => command_name = args.join(" "),
+        }
+    }
+
+    // The console reports `PHP_INT_MAX` lines, so it never paginates.
+    let page_height = if source.is_console {
+        usize::MAX
+    } else {
+        PLAYER_SCREEN_LINE_HEIGHT
+    };
+
+    if command_name.is_empty() {
+        let mut commands: Vec<&'static CommandInfo> = COMMANDS
+            .iter()
+            .filter(|info| command_visible(source, info.name))
+            .collect();
+        // `ksort($commands, SORT_NATURAL | SORT_FLAG_CASE)`.
+        commands.sort_by_key(|info| info.name.to_lowercase());
+
+        let page_count = commands.len().div_ceil(page_height) as i64;
+        let page = page_number.min(page_count).max(1) as usize;
+        let mut lines = vec![fill_template(
+            lang::HELP_HEADER,
+            &[&page.to_string(), &page_count.to_string()],
+        )];
+        lines.extend(
+            commands
+                .iter()
+                .skip((page - 1).saturating_mul(page_height))
+                .take(page_height)
+                .map(|info| format!("§2/{}: §r{}", info.name, info.description)),
+        );
+        return CommandOutput {
+            feedback: lines,
+            actions: Vec::new(),
         };
     }
 
-    let mut message = String::from("§bComandos disponibles:");
-    for info in COMMANDS {
-        message.push_str(&format!("\n§f{} §8- §7{}", info.usage, info.description));
+    let lookup = command_name.to_lowercase();
+    let Some(info) = find_command(&lookup).filter(|info| command_visible(source, info.name)) else {
+        return error(red(fill_named(
+            lang::COMMAND_NOT_FOUND,
+            &[("commandName", &command_name), ("helpCommand", "/help")],
+        )));
+    };
+
+    let mut aliases: Vec<&str> = info.aliases.to_vec();
+    aliases.sort_unstable(); // `sort($aliases, SORT_NATURAL)`.
+    CommandOutput {
+        feedback: vec![
+            format!(
+                "§e--------- §r{}§e ---------",
+                fill_named(lang::HELP_SPECIFIC_HEADER, &[("commandName", info.name)])
+            ),
+            format!(
+                "§6{}",
+                fill_named(
+                    lang::HELP_SPECIFIC_DESCRIPTION,
+                    &[("description", &format!("§r{}", info.description))]
+                )
+            ),
+            format!(
+                "§6{}",
+                fill_named(
+                    lang::HELP_SPECIFIC_USAGE,
+                    &[("usage", &format!("§r{}", info.usage.replace('\n', "\n§r")))]
+                )
+            ),
+            format!(
+                "§6{}",
+                fill_named(
+                    lang::HELP_SPECIFIC_ALIASES,
+                    &[("aliasList", &format!("§r{}", aliases.join(", ")))]
+                )
+            ),
+        ],
+        actions: Vec::new(),
     }
-    feedback(message)
 }
 
 fn teleport(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
@@ -942,19 +1054,22 @@ fn whisper(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> C
     }
 }
 
-fn list(players: &[OnlinePlayer]) -> CommandOutput {
-    if players.is_empty() {
-        return feedback("§7No hay jugadores conectados.");
-    }
-
+/// `/list`, ported from `pocketmine\command\defaults\ListCommand`: the count
+/// line and then the names sorted with `SORT_STRING`, as two messages.
+fn list(source: &CommandSource, players: &[OnlinePlayer]) -> CommandOutput {
     let mut names: Vec<&str> = players.iter().map(|player| player.name.as_str()).collect();
-    names.sort_by_key(|name| name.to_lowercase());
+    names.sort_unstable();
 
-    feedback(format!(
-        "§bJugadores conectados ({}): §f{}",
-        names.len(),
-        names.join("§7, §f")
-    ))
+    CommandOutput {
+        feedback: vec![
+            fill_template(
+                lang::PLAYERS_LIST,
+                &[&names.len().to_string(), &source.max_players.to_string()],
+            ),
+            names.join(", "),
+        ],
+        actions: Vec::new(),
+    }
 }
 
 fn kick(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
@@ -1066,6 +1181,14 @@ pub mod lang {
         "Versión del servidor: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
     pub const VERSION_MINECRAFT: &str =
         "Versión compatible de Minecraft: {%minecraftVersion} (versión de protocolo: {%minecraftProtocolVersion})";
+    pub const PLAYERS_LIST: &str = "Hay {%0}/{%1} jugadores en línea:";
+    pub const HELP_HEADER: &str =
+        "--- Mostrando página de ayuda {%0} de {%1} (/help [página]) ---";
+    pub const HELP_SPECIFIC_HEADER: &str = "Ayuda: /{%commandName}";
+    pub const HELP_SPECIFIC_DESCRIPTION: &str = "Descripción: {%description}";
+    pub const HELP_SPECIFIC_USAGE: &str = "Uso: {%usage}";
+    pub const HELP_SPECIFIC_ALIASES: &str = "Alias: {%aliasList}";
+    pub const COMMAND_NOT_FOUND: &str = "Comando desconocido: {%commandName}. Utilice {%helpCommand} para obtener una lista de comandos disponibles.";
 }
 
 /// Replaces `{%0}`, `{%1}`, ... in a vanilla translation string.
@@ -1073,6 +1196,15 @@ pub(crate) fn fill_template(template: &str, args: &[&str]) -> String {
     let mut out = template.to_string();
     for (index, value) in args.iter().enumerate() {
         out = out.replace(&format!("{{%{}}}", index), value);
+    }
+    out
+}
+
+/// Replaces named placeholders such as `{%commandName}` in a translation.
+pub(crate) fn fill_named(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (key, value) in args {
+        out = out.replace(&format!("{{%{}}}", key), value);
     }
     out
 }
@@ -2177,6 +2309,7 @@ mod tests {
             is_op: true,
             allow_cheats: true,
             is_console: false,
+            max_players: 1000,
             world_time: 1_000,
             world_seed: 12_345_678,
             world_spawn: (0.0, 64.0, 0.0),
@@ -2897,15 +3030,96 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_and_describes_commands() {
+    fn help_paginates_like_pocketmine() {
         let source = player_source("Steve", (0.0, 64.0, 0.0));
 
         let output = handle_command("/help", &source, &players()).expect("native");
-        assert!(output.feedback[0].contains("/tp"));
-        assert!(output.feedback[0].contains("/gamemode"));
+        let pages = COMMANDS.len().div_ceil(PLAYER_SCREEN_LINE_HEIGHT);
+        assert_eq!(
+            output.feedback[0],
+            format!("--- Mostrando página de ayuda 1 de {pages} (/help [página]) ---")
+        );
+        assert_eq!(output.feedback.len(), 1 + PLAYER_SCREEN_LINE_HEIGHT);
+        assert!(output.feedback[1].starts_with("§2/ban: §r"));
+
+        // A page past the end falls back to the last one.
+        let output = handle_command("/help 99", &source, &players()).expect("native");
+        assert_eq!(
+            output.feedback[0],
+            format!("--- Mostrando página de ayuda {pages} de {pages} (/help [página]) ---")
+        );
+
+        // The console reports PHP_INT_MAX lines, so it lists everything.
+        let console = CommandSource::console(1_000);
+        let output = handle_command("/help", &console, &players()).expect("native");
+        assert_eq!(output.feedback.len(), 1 + COMMANDS.len());
+    }
+
+    #[test]
+    fn help_describes_a_single_command_with_pocketmine_keys() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        let info = find_command("tp").expect("tp is native");
 
         let output = handle_command("/help tp", &source, &players()).expect("native");
-        assert!(output.feedback[0].contains("Teletransporta"));
+        assert_eq!(
+            output.feedback,
+            vec![
+                "§e--------- §rAyuda: /tp§e ---------".to_string(),
+                format!("§6Descripción: §r{}", info.description),
+                format!("§6Uso: §r{}", info.usage),
+                "§6Alias: §rteleport".to_string(),
+            ]
+        );
+
+        let output = handle_command("/help nope", &source, &players()).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec![concat!(
+                "§cComando desconocido: nope. Utilice /help para obtener una lista de ",
+                "comandos disponibles."
+            )]
+        );
+    }
+
+    #[test]
+    fn help_hides_commands_the_sender_cannot_use() {
+        let mut guest = player_source("Guest", (0.0, 64.0, 0.0));
+        guest.is_op = false;
+        guest.allow_cheats = false;
+        guest.permissions = Some(std::sync::Arc::new(crate::permission::PermissionManager::new()));
+
+        let output = handle_command("/help op", &guest, &players()).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec![concat!(
+                "§cComando desconocido: op. Utilice /help para obtener una lista de ",
+                "comandos disponibles."
+            )]
+        );
+
+        let output = handle_command("/help help", &guest, &players()).expect("native");
+        assert_eq!(output.feedback[0], "§e--------- §rAyuda: /help§e ---------");
+        assert_eq!(output.feedback[3], "§6Alias: §r?");
+    }
+
+    #[test]
+    fn list_reports_count_max_and_sorted_names() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        let output = handle_command("/list", &source, &players()).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec![
+                "Hay 2/1000 jugadores en línea:".to_string(),
+                "Alex, Steve".to_string()
+            ]
+        );
+
+        let output = handle_command("/list", &source, &[]).expect("native");
+        assert_eq!(
+            output.feedback,
+            vec!["Hay 0/1000 jugadores en línea:".to_string(), String::new()]
+        );
     }
 
     #[test]

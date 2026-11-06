@@ -101,10 +101,10 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 | `gamemode` | `<modo> [jugador]` | `gamemode.self`, `gamemode.other` | `commands.gamemode.success.self/.other`, `gameMode.changed` al objetivo, `chat.type.admin` a ops, `pocketmine.command.gamemode.unknown/.failure` | 🟢 |
 | `gc` | — | `gc` | `pocketmine.command.gc.*` | 🔴 |
 | `give` | `<jugador> <objeto[:meta]> [cantidad] [tags...]` | `give.self`, `give.other` | `commands.give.success.single` | 🟡 |
-| `help` | `[página\|comando]` | `help` | `pocketmine.command.help.*` | 🟡 |
+| `help` | `[página\|comando]` | `help` | `commands.help.header`, `pocketmine.command.help.specificCommand.*`, `pocketmine.command.notFound`; 7 líneas por página y filtrado por `testPermissionSilent` | 🟢 |
 | `kick` | `<jugador> [razón...]` | `kick` | `commands.kick.success` / `.success.reason`; sin motivo el cliente muestra su texto por defecto | 🟢 |
 | `kill` | `[jugador]` | `kill.self`, `kill.other` | `commands.kill.successful` | 🟢 |
-| `list` | — | `list` | `commands.players.list` + `.names` (hoy texto propio) | 🟡 |
+| `list` | — | `list` | `commands.players.list` con `max-players` y segunda línea con los nombres en orden `SORT_STRING` | 🟢 |
 | `me` | `<acción...>` | `me` | `chat.type.emote` a todos, sin acuse al emisor | 🟢 |
 | `op` | `<jugador>` | `op.give` | `commands.op.success`, escribe `ops.txt` | 🟢 |
 | `pardon` | `<nombre>` | `unban.player` | `commands.unban.success` | 🟢 |
@@ -137,8 +137,6 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 | `ban` / `ban-ip` | Formato de almacenamiento propio (`banned-players.txt` / `banned-ips.txt` con `entrada\|razón`) en lugar de las listas YAML de PM; no hay `expires` ni `createdBy` tipados | `BanList`, `banned-players.yml` |
 | `clear` | No compara NBT al filtrar por objeto (`Item` + `meta` sólo); el recuento por `maxCount` sí es paritario | `ClearCommand::execute` |
 | `give` | `[... tags]` devuelve `commands.give.tagError` porque no hay NBT; el resto (clave vanilla, `item[:meta]`, 1..32767) es paritario | `GiveCommand::execute` |
-| `list` | Texto propio (`§bJugadores conectados (n): …`); PM usa `commands.players.list` con el máximo de `max-players` y una segunda línea con `commands.players.list.names` | `ListCommand::execute` |
-| `help` | Sin paginación (`/help <página>`) ni filtrado por permisos; `/help <comando>` lee la tabla local y no el `Command` registrado | `HelpCommand::execute` |
 | `save-all` / `save-on` / `save-off` | Guardan `world.json` y `players/<nombre>.json`, no chunks; `auto-save` ya se persiste en `server.properties` | `SaveCommand`, `ServerProperties::AUTO_SAVE` |
 
 ### 3.2 Deuda de las filas 🔴
@@ -390,6 +388,7 @@ Criterio: CI verde y paridad documentada.
 | 17 | `/spawnpoint` no actualizaba el cliente | faltaba el paquete | `SetSpawnPosition` al objetivo | completo |
 | 18 | Un login no-JWT aceptaba cualquier cadena como nombre | estrategia 3 sin validar | validación tipo `Player::isValidUserName` | completo |
 | 19 | Tests de chunks y de métricas desactualizados | las constantes cambiaron (8 chunks, clamp de ventanas) | tests ajustados al comportamiento documentado | completo |
+| 20 | `/list` y `/help` con texto propio y sin paginar | implementación preliminar sin claves ni semántica de PM | `commands.players.list`, `commands.help.header`, `pocketmine.command.help.specificCommand.*`, `pocketmine.command.notFound`; `max_players` en `CommandSource` | completo |
 
 ### 11.1 `create_session` duplica sesiones (confirmado)
 
@@ -404,7 +403,7 @@ guardando `Arc<RwLock<PlayerSession>>` en el mapa en vez de `PlayerSession`).
 
 ```
 cargo check --workspace --all-targets                          → OK (0 warnings)
-cargo test -p server-core --lib                                → 51 OK
+cargo test -p server-core --lib                                → 54 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
 cargo test -p server-core --test session_lifecycle_test        → 9 OK
 cargo test -p bedrock-protocol                                 → 31 + 11 OK
@@ -422,10 +421,12 @@ cargo test -p bedrock-protocol                                 → 31 + 11 OK
 4. ✅ ~~Textos propios de `say`, `me`, `tell`, `kick`, `time` y `version`~~: ahora usan
    `chat.type.*`, `commands.message.*`, `commands.kick.*`, `commands.time.*` y
    `pocketmine.command.version.*`.
-5. **`/list` con `commands.players.list`**: requiere `max_players` en `CommandSource`
-   y una segunda línea con los nombres.
+5. ✅ ~~`/list` con `commands.players.list`~~: `max_players` viaja en `CommandSource`
+   (`max-players` de `server.properties`) y los nombres van en una segunda línea.
 6. **Motor de traducciones** desde `spa.ini` + test constante-por-clave (§6).
-7. **`/help` con paginación** (`commands.help.header`) y filtrado por permisos (§3.1).
+7. ✅ ~~`/help` con paginación y filtrado por permisos~~: `commands.help.header`,
+   `pocketmine.command.help.specificCommand.*` y `pocketmine.command.notFound`, con
+   7 líneas por página (la consola no pagina) y gate `testPermissionSilent` en el listado.
 8. **NBT mínimo** y `/give [... tags]` (fase 1).
 9. **`SetTitlePacket` (0x59)** y `/title`, el único comando pendiente sin dependencia de
    entidades (fase 2/4).

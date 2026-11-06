@@ -188,6 +188,8 @@ pub struct PlayerSession {
     pub pending_core: Vec<CommandAction>,
     /// `allow-cheats` from the server configuration.
     pub allow_cheats: bool,
+    /// `max-players` from the server configuration, reported by `/list`.
+    pub max_players: i32,
     /// Current health in half-hearts; `0.0` means dead.
     pub health: f32,
     pub max_health: f32,
@@ -271,6 +273,7 @@ impl PlayerSession {
             move_events: 0,
             pending_core: Vec::new(),
             allow_cheats: true,
+            max_players: 1000,
             health: 20.0,
             max_health: 20.0,
             is_dead: false,
@@ -428,6 +431,7 @@ impl PlayerSession {
             is_op: self.is_op(),
             allow_cheats: self.allow_cheats,
             is_console: false,
+            max_players: self.max_players,
             world_time: self.world.time(),
             world_seed: self.world.seed(),
             world_spawn: {
@@ -1784,6 +1788,7 @@ pub struct SessionManager {
     ops: Arc<RwLock<HashSet<String>>>,
     default_gamemode: std::sync::atomic::AtomicI32,
     default_view_distance: i32,
+    max_players: std::sync::atomic::AtomicI32,
     allow_cheats: RwLock<bool>,
     access: Arc<crate::access::AccessList>,
     stop_requested: std::sync::atomic::AtomicBool,
@@ -1828,6 +1833,7 @@ impl SessionManager {
             ops: Arc::new(RwLock::new(HashSet::new())),
             default_gamemode: std::sync::atomic::AtomicI32::new(default_gamemode),
             default_view_distance,
+            max_players: std::sync::atomic::AtomicI32::new(1000),
             allow_cheats: RwLock::new(true),
             access: Arc::new(crate::access::AccessList::new()),
             stop_requested: std::sync::atomic::AtomicBool::new(false),
@@ -1849,6 +1855,15 @@ impl SessionManager {
         *self.allow_cheats.write() = allow;
         for session in self.sessions.write().values_mut() {
             session.allow_cheats = allow;
+        }
+    }
+
+    /// Sets `max-players`, reported by `/list` like `Server::getMaxPlayers()`.
+    pub fn set_max_players(&self, max_players: i32) {
+        self.max_players
+            .store(max_players, std::sync::atomic::Ordering::Relaxed);
+        for session in self.sessions.write().values_mut() {
+            session.max_players = max_players;
         }
     }
 
@@ -1882,6 +1897,7 @@ impl SessionManager {
         );
         session.max_view_distance = self.default_view_distance;
         session.allow_cheats = *self.allow_cheats.read();
+        session.max_players = self.max_players.load(std::sync::atomic::Ordering::Relaxed);
         session.attach_access(Arc::clone(&self.access));
         session.attach_metrics(Arc::clone(&self.metrics));
         session.attach_permissions(Arc::clone(&self.permissions));

@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.view_distance,
     ));
     session_manager.set_allow_cheats(config.allow_cheats);
+    session_manager.set_max_players(config.max_players);
     session_manager.set_auto_save_enabled(config.auto_save);
     info!(
         "SessionManager initialized (active sessions: {}, allow-cheats: {})",
