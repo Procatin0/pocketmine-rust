@@ -7,6 +7,7 @@ pub mod identity;
 pub mod inventory;
 pub mod logging;
 pub mod metrics;
+pub mod nbt_json;
 pub mod permission;
 pub mod plugin_host;
 pub mod session;

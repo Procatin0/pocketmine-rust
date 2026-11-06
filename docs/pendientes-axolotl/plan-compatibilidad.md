@@ -7,9 +7,9 @@
 **Estado medido:** 33 de los 41 comandos de PM portados, 29 de 248 paquetes, permisos y
 `/gamemode` paritarios; entidades, crafteo y persistencia de chunks pendientes
 **Fecha:** 2026-11-06
-**Verificación base:** `cargo check --workspace --all-targets` OK (0 warnings); 59 tests de
+**Verificación base:** `cargo check --workspace --all-targets` OK (0 warnings); 64 tests de
 `server-core` (lib) + 12 (`item_health_commands_test`) + 10 (`session_lifecycle_test`) +
-38 y 11 (`bedrock-protocol`) en verde, ejecutados con `CARGO_TARGET_DIR=target/test-parity`.
+42 y 11 (`bedrock-protocol`) en verde, ejecutados con `CARGO_TARGET_DIR=target/test-parity`.
 
 Regla del port: cada comando y cada paquete se traduce **uno a uno** desde el PHP.
 Mismos nombres, alias, argumentos, límites, nodos de permiso, mensajes (claves de
@@ -74,7 +74,7 @@ Cifras concretas:
 | Comandos de PM pendientes | 10 |
 | Paquetes implementados | 27 de 248 |
 | Nodos de permiso registrados | 46 (+16 reservados de comandos no portados) |
-| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 130 |
+| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 139 |
 
 El servidor es un **superconjunto**: lo que existe en PM existe aquí con el mismo
 comportamiento, y además hay comandos propios de Bedrock y una extensión de TPS (§4).
@@ -136,7 +136,7 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 |---|---|---|
 | `ban` / `ban-ip` | Formato de almacenamiento propio (`banned-players.txt` / `banned-ips.txt` con `entrada\|razón`) en lugar de las listas YAML de PM; no hay `expires` ni `createdBy` tipados | `BanList`, `banned-players.yml` |
 | `clear` | No compara NBT al filtrar por objeto (`Item` + `meta` sólo); el recuento por `maxCount` sí es paritario | `ClearCommand::execute` |
-| `give` | `[... tags]` devuelve `commands.give.tagError` porque no hay NBT; el resto (clave vanilla, `item[:meta]`, 1..32767) es paritario | `GiveCommand::execute` |
+| `give` | `[... tags]` se parsea como JSON NBT y viaja en el stack; los textos de error del parser son propios (el paquete `pocketmine/nbt` no está vendorizado) y los items data-driven siguen ausentes | `GiveCommand::execute`, `JsonNbtParser` |
 | `save-all` / `save-on` / `save-off` | Guardan `world.json` y `players/<nombre>.json`, no chunks; `auto-save` ya se persiste en `server.properties` | `SaveCommand`, `ServerProperties::AUTO_SAVE` |
 
 ### 3.2 Deuda de las filas 🔴
@@ -285,7 +285,7 @@ Falta:
 | Elemento | Detalle | Referencia |
 |---|---|---|
 | `ItemStackRequestPacket` (0x93) | Solicitudes de item de contenedores; no existe | `NetworkSession`, capturas `data/bds-capture/` |
-| NBT mínimo | `TAG_Compound/String/Int/List` para `/give [... tags]` y conservar `nbt` al mover | `crates/bedrock-protocol/src/nbt.rs` (nuevo) |
+| NBT mínimo | ✅ `Tag` + `write_network_nbt` (formato de `NetworkNbtSerializer`) y `nbt_json` para `/give [... tags]`; falta leer los fixtures `.nbt` (estados de bloque) y los arrays tipados | `crates/bedrock-protocol/src/nbt.rs`, `crates/server-core/src/nbt_json.rs` |
 | Items data-driven | Mapear identificadores string del registro de BDS a `network_id` + NBT | `data/required_item_list.json`, `inventory.rs` |
 | Drops como entidad | Depende de fase 4 | `session.rs` |
 
@@ -393,6 +393,7 @@ Criterio: CI verde y paridad documentada.
 | 22 | `/title` y su paquete no existían | comando pendiente de la fase 2 | `SetTitlePacket` (0x58) con varints con signo, `TitleAction` y `CommandAction::SendTitle` | completo |
 | 23 | `transferserver` bloqueado | faltaba `TransferPacket` | `TransferPacket` (0x55) y `CommandAction::Transfer`, que cierra la sesión como `NetworkSession::transfer()` | completo |
 | 24 | Textos sin verificación contra el locale | constantes copiadas a mano sin red | `translations::Translator` con `spa.ini` embebido y test constante-por-clave | completo |
+| 25 | `/give [... tags]` rechazaba cualquier etiqueta | no había NBT | `Tag` + `write_network_nbt` (ints/longs varint, shorts LE, strings varuint) y `nbt_json` con la inferencia de `JsonNbtParser`; `CommandAction::Give` transporta el `nbt` al stack | completo |
 
 ### 11.1 `create_session` duplicaba sesiones (resuelto)
 
@@ -415,10 +416,10 @@ devuelto responde por sí mismo.
 
 ```
 cargo check --workspace --all-targets                          → OK (0 warnings)
-cargo test -p server-core --lib                                → 59 OK
+cargo test -p server-core --lib                                → 64 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
 cargo test -p server-core --test session_lifecycle_test        → 10 OK
-cargo test -p bedrock-protocol                                 → 38 + 11 OK
+cargo test -p bedrock-protocol                                 → 42 + 11 OK
 ```
 
 ---
@@ -441,7 +442,8 @@ cargo test -p bedrock-protocol                                 → 38 + 11 OK
 7. ✅ ~~`/help` con paginación y filtrado por permisos~~: `commands.help.header`,
    `pocketmine.command.help.specificCommand.*` y `pocketmine.command.notFound`, con
    7 líneas por página (la consola no pagina) y gate `testPermissionSilent` en el listado.
-8. **NBT mínimo** y `/give [... tags]` (fase 1).
+8. ✅ ~~NBT mínimo y `/give [... tags]`~~: `Tag`/`write_network_nbt` con el formato de red
+   y `nbt_json` con la inferencia de `JsonNbtParser`; el stack entregado conserva sus tags.
 9. ✅ ~~`SetTitlePacket` (0x59) y `/title`~~: el paquete real es 0x58; `/title` cubre
    `clear|reset|title|subtitle|actionbar|times` con nodos `.self`/`.other` (fase 2).
 10. ✅ ~~Arreglar `create_session`~~: registra una sola sesión y devuelve el `u64` con el

@@ -2874,6 +2874,7 @@ impl SessionManager {
                     network_id,
                     meta,
                     count,
+                    nbt,
                     message,
                     notify,
                 } => {
@@ -2887,6 +2888,7 @@ impl SessionManager {
                         };
                         let mut stack = ItemStack::new(*network_id, *count);
                         stack.meta = *meta;
+                        stack.nbt = nbt.clone();
                         let leftover = session.inventory.add_item(&stack);
                         session.sync_inventory();
                         leftover

@@ -2,6 +2,7 @@
 
 pub mod binary;
 pub mod types;
+pub mod nbt;
 pub mod packets;
 pub mod batch;
 

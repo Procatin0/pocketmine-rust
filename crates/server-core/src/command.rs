@@ -193,6 +193,8 @@ pub enum CommandAction {
         network_id: i16,
         meta: u32,
         count: u16,
+        /// Network NBT from the `[...tags]` argument, empty when absent.
+        nbt: Vec<u8>,
         /// `commands.give.success`, already filled in.
         message: String,
         notify: String,
@@ -1399,12 +1401,16 @@ fn give(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
         },
     };
 
+    let mut nbt = Vec::new();
     if args.len() > 3 {
-        // PocketMine parses `[tags...]` as JSON NBT; this server has no NBT
-        // editor yet, so it reports the same error key instead of dropping the
-        // tags silently.
-        let reason = format!("NBT tags are not supported ('{}')", args[3..].join(" "));
-        return error(fill_template(lang::GIVE_TAG_ERROR, &[&reason]));
+        // `JsonNbtParser::parseJson(implode(" ", array_slice($args, 3)))`.
+        let data = args[3..].join(" ");
+        match crate::nbt_json::parse(&data) {
+            Ok(tag) => nbt = bedrock_protocol::nbt::write_network_nbt(&tag),
+            // `commands.give.tagError` carries the parser message and is sent
+            // without the red prefix.
+            Err(reason) => return error(fill_template(lang::GIVE_TAG_ERROR, &[&reason])),
+        }
     }
 
     let display = crate::inventory::item_display_name(network_id).unwrap_or_else(|| args[1].into());
@@ -1418,6 +1424,7 @@ fn give(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
             network_id,
             meta,
             count,
+            nbt,
             message,
             notify: source.name.clone(),
         }],
@@ -2724,6 +2731,40 @@ mod tests {
     }
 
     #[test]
+    fn give_accepts_json_nbt_tags() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        let output = handle_command(
+            "/give Alex diamond_sword 1 {\"display\":{\"Name\":\"Excalibur\"}}",
+            &source,
+            &players(),
+        )
+        .expect("native");
+        let expected = bedrock_protocol::nbt::write_network_nbt(&bedrock_protocol::nbt::Tag::Compound(
+            vec![(
+                "display".to_string(),
+                bedrock_protocol::nbt::Tag::Compound(vec![(
+                    "Name".to_string(),
+                    bedrock_protocol::nbt::Tag::String("Excalibur".to_string()),
+                )]),
+            )],
+        ));
+        match &output.actions[0] {
+            CommandAction::Give { count, nbt, .. } => {
+                assert_eq!(*count, 1);
+                assert_eq!(nbt, &expected);
+            }
+            other => panic!("expected /give, got {:?}", other),
+        }
+
+        // `commands.give.tagError` reports the parser message, uncoloured.
+        let output = handle_command("/give Alex stone 1 {\"oops\":", &source, &players())
+            .expect("native");
+        assert!(output.actions.is_empty());
+        assert!(output.feedback[0].starts_with("Error al analizar la etiqueta de datos: "));
+    }
+
+    #[test]
     fn give_resolves_items_and_counts() {
         let source = player_source("Steve", (0.0, 64.0, 0.0));
 
@@ -2735,6 +2776,7 @@ mod tests {
                 network_id: 1,
                 meta: 0,
                 count: 64,
+                nbt: Vec::new(),
                 message: "Dado Stone (stone) * 64 a Alex".to_string(),
                 notify: "Steve".to_string(),
             }]
@@ -2753,6 +2795,7 @@ mod tests {
                 network_id: 1,
                 meta: 2,
                 count: 3,
+                nbt: Vec::new(),
                 message: "Dado Stone (1:2) * 3 a Alex".to_string(),
                 notify: "Steve".to_string(),
             }]
