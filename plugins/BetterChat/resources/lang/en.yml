@@ -1,0 +1,195 @@
+# ============================
+# BetterChat Language File - English (en)
+# ============================
+# This file contains all user-facing messages.
+# Supports & color codes.
+# To add a new language, copy this file and translate the values.
+
+# ============================
+# General
+# ============================
+no-permission: "&cYou don't have permission."
+console-enabled: "BetterChat enabled!"
+console-no-ranksystem: "RankSystem integration is enabled but the plugin is not installed. Skipping..."
+
+# ============================
+# Chat Format
+# ============================
+chat-prefix: "&8[&eChat&8] &8» "
+chat-format: "{prefix}{display_name}{suffix} &7> &r{message}"
+
+# ============================
+# Anti-Spam
+# ============================
+spam:
+  cooldown: "&cYou are sending messages too fast! Wait {time}s."
+  duplicate: "&cYou already sent that message recently."
+  too-long: "&cYour message is too long! Max {max} characters."
+  too-much-caps: "&cPlease don't use so many capital letters!"
+  command-cooldown: "&cWait {time}s before using this command again."
+
+# ============================
+# Word Filter
+# ============================
+filter:
+  warning: "&cPlease watch your language!"
+
+# ============================
+# Anti-Links
+# ============================
+anti-links:
+  blocked: "&cLinks are not allowed in chat!"
+  filtered: "&cYour message contained a link and was filtered."
+
+# ============================
+# Mentions
+# ============================
+mentions:
+  format: "&e{sender} mentioned you: &f{message}"
+
+# ============================
+# Join / Quit Messages
+# ============================
+join-quit:
+  join: "&a+ &7{player} &ajoined the server"
+  quit: "&c- &7{player} &cleft the server"
+  first-join: "&a+ &7{player} &ajoined for the first time! &eWelcome!"
+
+# ============================
+# Mute
+# ============================
+mute:
+  muted: "&cYou are muted and cannot send messages. Time remaining: {time}"
+  broadcast-mute: "&7{player} muted {target} for {duration}."
+  broadcast-unmute: "&7{player} unmuted {target}."
+
+# ============================
+# Vote Mute
+# ============================
+vote-mute:
+  started: "&e{initiator} &astarted a vote to mute &c{target}&a. &7({needed} yes votes needed, {duration}s)"
+  vote-yes-word: "&ayes"
+  vote-no-word: "&cno"
+  vote-registered: "&aVote registered: &f{vote}"
+  already-voted: "&cYou already voted."
+  cannot-vote-self: "&cYou cannot vote in your own mute."
+  cannot-self: "&cYou cannot vote-mute yourself."
+  no-active-vote: "&cThere is no active vote right now."
+  already-active: "&cA vote is already in progress."
+  not-enough-players: "&cAt least {min} players must be online to start a vote."
+  target-offline: "&c{target} is not online."
+  target-immune: "&c{target} cannot be vote-muted."
+  cooldown: "&cYou must wait {time}s before starting another vote."
+  passed: "&aVote passed! &c{target} &ahas been muted for {duration}. &7(Yes: {yes} | No: {no})"
+  failed: "&cVote failed. &7{target} &7was not muted. &7(Yes: {yes} | No: {no} | Needed: {needed})"
+  target-disconnected: "&cVote cancelled: {target} disconnected."
+  usage: "&cUsage: /votemute <player> [yes|no]"
+
+# ============================
+# Commands
+# ============================
+command:
+  usage: "&cUsage: /bchat <reload|mute|unmute|setprefix|setsuffix|minigame>"
+  unknown-subcommand: "&cUnknown subcommand. Use: reload, mute, unmute, setprefix, setsuffix, minigame"
+  reloaded: "&aBetterChat configuration reloaded."
+
+  # Mute
+  mute-usage: "&cUsage: /betterchat mute <player> [duration]"
+  already-muted: "&c{target} is already muted."
+  invalid-duration: "&cInvalid duration. Use: 30s, 5m, 2h, 1d"
+  target-offline: "&eWarning: &7{target} is not currently online."
+  mute-success: "&aMuted {target}{duration}."
+  unmute-usage: "&cUsage: /betterchat unmute <player>"
+  not-muted: "&c{target} is not muted."
+  unmute-success: "&aUnmuted {target}."
+
+  # Prefix/Suffix
+  setprefix-usage: "&cUsage: /betterchat setprefix <player> <prefix>"
+  prefix-set: "&aSet prefix for {target} to: &r{prefix}"
+  setsuffix-usage: "&cUsage: /betterchat setsuffix <player> <suffix>"
+  suffix-set: "&aSet suffix for {target} to: &r{suffix}"
+
+  # Minigame
+  minigame-usage: "&cUsage: /betterchat minigame <start|stop> [trivia|unscramble|math]"
+  minigame-disabled: "&cMinigames are disabled in the config."
+  minigame-not-running: "&cNo minigame is currently running."
+
+# ============================
+# Minigames
+# ============================
+minigame:
+  start: "&e[Minigame] &a{type}: &f{question}"
+  win: "&e[Minigame] &6{winner} &awon! The answer was: &f{answer}"
+  expire: "&e[Minigame] &cTime's up! The answer was: &f{answer}"
+  no-questions: "&cNo questions available for this minigame type."
+  already-running: "&cA minigame is already running!"
+  stopped: "&e[Minigame] &7Minigame stopped."
+
+# ============================
+# Chat Groups
+# ============================
+group:
+  chat-format: "&8[&b{group}&8] {prefix}{display_name}{suffix} &7> &r{message}"
+  toggled-on: "&aNow chatting in group: &b{group}"
+  toggled-off: "&aSwitched back to global chat."
+
+  create:
+    success: "&aCreated group &b{group}&a."
+    name-taken: "&cA group named '{group}' already exists."
+    limit-reached: "&cYou have reached the maximum number of groups ({max})."
+    invalid-name: "&cInvalid group name. Use {min}-{max} characters: letters, numbers, dashes, underscores."
+    no-permission: "&cYou don't have permission to create groups."
+
+  delete:
+    success: "&aDeleted group &b{group}&a."
+    not-owner: "&cOnly the group owner can delete this group."
+    not-found: "&cGroup '{group}' not found."
+
+  invite:
+    sent: "&aInvited &b{player} &ato group &b{group}&a."
+    already-member: "&c{player} is already a member of this group."
+    not-owner: "&cOnly the group owner can invite players."
+    group-full: "&cThis group is full ({max} members)."
+    target-offline: "&c{player} is not online."
+    received: "&b{sender} &ainvited you to group &b{group}&a. Use &e/group accept {group} &aor &e/group deny {group}"
+    expired: "&cThat invite has expired."
+
+  accept:
+    success: "&aYou joined group &b{group}&a!"
+    broadcast: "&b{player} &ajoined the group!"
+    no-pending: "&cYou have no pending invite for group '{group}'."
+
+  deny:
+    success: "&aInvite to &b{group} &adenied."
+
+  leave:
+    success: "&aYou left group &b{group}&a."
+    not-member: "&cYou are not a member of that group."
+    owner-cannot-leave: "&cGroup owners cannot leave. Use /group delete instead."
+
+  kick:
+    success: "&aKicked &b{player} &afrom group &b{group}&a."
+    not-owner: "&cOnly the group owner can kick players."
+    not-member: "&c{player} is not a member of this group."
+    kicked-notification: "&cYou were kicked from group &b{group}&c."
+
+  chat:
+    not-in-group: "&cYou are not in any group. Join a group first."
+    group-not-found: "&cGroup '{group}' not found."
+    not-member: "&cYou are not a member of group '{group}'."
+
+  list:
+    header: "&eYour Groups:"
+    entry: "&8 - &b{group} &7({members} members)"
+    none: "&7You are not in any groups."
+
+  info:
+    header: "&eGroup: &b{group}"
+    owner: "&7Owner: &f{owner}"
+    members: "&7Members: &f{members}"
+    official: "&7Status: &6Official"
+    not-member: "&cYou are not a member of that group."
+    not-found: "&cGroup '{group}' not found."
+
+  command:
+    usage: "&cUsage: /group <create|delete|invite|accept|deny|leave|kick|chat|list|info>"

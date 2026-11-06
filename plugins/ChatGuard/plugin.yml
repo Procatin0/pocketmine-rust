@@ -1,0 +1,18 @@
+name: ChatGuard
+version: "1.0.0"
+main: chatguard\Main
+api: ["5.0.0"]
+author: PocketMine-Rust Team
+description: "Filtro de chat de ejemplo: mutación de eventos, permisos y scheduler."
+website: "https://github.com/pmmp/PocketMine-MP"
+
+# El comando /chatguard se registra desde código con CommandMap,
+# por eso no aparece en esta sección. Su permiso se declara abajo.
+
+permissions:
+  chatguard.bypass:
+    description: "Permite enviar mensajes sin pasar por el filtro."
+    default: op
+  chatguard.command:
+    description: "Permite consultar y cambiar el estado de ChatGuard."
+    default: op

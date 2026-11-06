@@ -285,6 +285,10 @@ impl NormalGenerator {
 }
 
 impl WorldGenerator for NormalGenerator {
+    fn seed(&self) -> i64 {
+        self.seed
+    }
+
     fn generator_type(&self) -> i32 {
         2 // DEFAULT / INFINITE
     }
@@ -300,6 +304,41 @@ impl WorldGenerator for NormalGenerator {
 
     fn generate_chunk(&self, chunk_x: i32, chunk_z: i32) -> (u32, Vec<u8>) {
         let chunk = self.generate_chunk_internal(chunk_x, chunk_z);
+        let dominant_biome = chunk.biomes[7 * 16 + 7];
+        chunk.serialize_network_payload(dominant_biome)
+    }
+
+    /// Returns the block id at absolute world coordinates.
+    ///
+    /// **Expensive:** this regenerates the target chunk (and its 3x3
+    /// neighbourhood of base chunks) on every call. Use it sparingly, e.g.
+    /// for occasional plugin `getBlock` queries; prefer reading from a cached
+    /// `Chunk` when the server already holds one.
+    fn block_at(&self, x: i32, y: i32, z: i32) -> u32 {
+        let chunk = self.generate_chunk_internal(x >> 4, z >> 4);
+        chunk.get_block((x & 15) as usize, y, (z & 15) as usize)
+    }
+
+    fn highest_block_at(&self, x: i32, z: i32) -> i32 {
+        let chunk = self.generate_chunk_internal(x >> 4, z >> 4);
+        chunk
+            .get_highest_block_at((x & 15) as usize, (z & 15) as usize)
+            .unwrap_or(-64)
+    }
+
+    fn generate_chunk_with_edits(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        edits: &[(i32, i32, i32, u32)],
+    ) -> (u32, Vec<u8>) {
+        let mut chunk = self.generate_chunk_internal(chunk_x, chunk_z);
+        for &(x, y, z, id) in edits {
+            if (x >> 4) == chunk_x && (z >> 4) == chunk_z {
+                chunk.set_block((x & 15) as usize, y, (z & 15) as usize, id);
+            }
+        }
+
         let dominant_biome = chunk.biomes[7 * 16 + 7];
         chunk.serialize_network_payload(dominant_biome)
     }

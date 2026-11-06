@@ -1,302 +1,271 @@
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::process::Stdio;
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::context::PluginAction;
 use crate::description::PluginDescription;
 use crate::error::PluginError;
 use crate::event::Event;
+use crate::host::PluginHost;
 use crate::plugin::Plugin;
+use crate::runtime::bootstrap;
 
-/// Embedded PHP script defining PocketMine-MP API stubs and the JSON IPC loop.
-pub const POCKETMINE_BOOTSTRAP_PHP: &str = r#"<?php
-declare(strict_types=1);
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-namespace pocketmine {
-    class Server {
-        private static ?Server $instance = null;
-        public array $actions = [];
-
-        public static function getInstance(): Server {
-            if (self::$instance === null) {
-                self::$instance = new Server();
-            }
-            return self::$instance;
-        }
-
-        public function broadcastMessage(string $message): void {
-            $this->actions[] = [
-                'action' => 'broadcast_message',
-                'data' => ['message' => $message]
-            ];
-        }
-
-        public function getLogger(): Logger {
-            return new Logger();
-        }
-    }
-
-    class Logger {
-        public function info(string $msg): void {
-            fwrite(STDERR, "[PHP/INFO] " . $msg . PHP_EOL);
-        }
-        public function warning(string $msg): void {
-            fwrite(STDERR, "[PHP/WARN] " . $msg . PHP_EOL);
-        }
-        public function error(string $msg): void {
-            fwrite(STDERR, "[PHP/ERROR] " . $msg . PHP_EOL);
-        }
-        public function debug(string $msg): void {
-            fwrite(STDERR, "[PHP/DEBUG] " . $msg . PHP_EOL);
-        }
-    }
+/// Manifest returned by PHP's `discover_plugins` action.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredPluginManifest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub manifest: String,
 }
 
-namespace pocketmine\player {
-    use pocketmine\Server;
-
-    class Player {
-        public string $name;
-        public function __construct(string $name) {
-            $this->name = $name;
-        }
-        public function getName(): string {
-            return $this->name;
-        }
-        public function sendMessage(string $message): void {
-            Server::getInstance()->actions[] = [
-                'action' => 'send_message',
-                'data' => [
-                    'target_player' => $this->name,
-                    'message' => $message
-                ]
-            ];
-        }
-        public function kick(string $reason = ""): void {
-            Server::getInstance()->actions[] = [
-                'action' => 'kick_player',
-                'data' => [
-                    'target_player' => $this->name,
-                    'reason' => $reason
-                ]
-            ];
-        }
-    }
-}
-
-namespace pocketmine\event {
-    abstract class Event {
-        private bool $isCancelled = false;
-        public function isCancelled(): bool {
-            return $this->isCancelled;
-        }
-        public function cancel(): void {
-            $this->isCancelled = true;
-        }
-    }
-    interface Listener {}
-    interface Cancellable {}
-}
-
-namespace pocketmine\event\player {
-    use pocketmine\event\Event;
-    use pocketmine\event\Cancellable;
-    use pocketmine\player\Player;
-
-    class PlayerJoinEvent extends Event {
-        public Player $player;
-        public string $joinMessage;
-        public function __construct(Player $player, string $joinMessage) {
-            $this->player = $player;
-            $this->joinMessage = $joinMessage;
-        }
-        public function getPlayer(): Player { return $this->player; }
-        public function getJoinMessage(): string { return $this->joinMessage; }
-        public function setJoinMessage(string $msg): void { $this->joinMessage = $msg; }
-    }
-
-    class PlayerQuitEvent extends Event {
-        public Player $player;
-        public string $quitMessage;
-        public function __construct(Player $player, string $quitMessage) {
-            $this->player = $player;
-            $this->quitMessage = $quitMessage;
-        }
-        public function getPlayer(): Player { return $this->player; }
-        public function getQuitMessage(): string { return $this->quitMessage; }
-    }
-
-    class PlayerChatEvent extends Event implements Cancellable {
-        public Player $player;
-        public string $message;
-        public function __construct(Player $player, string $message) {
-            $this->player = $player;
-            $this->message = $message;
-        }
-        public function getPlayer(): Player { return $this->player; }
-        public function getMessage(): string { return $this->message; }
-        public function setMessage(string $msg): void { $this->message = $msg; }
-    }
-}
-
-namespace pocketmine\plugin {
-    use pocketmine\Server;
-    use pocketmine\Logger;
-
-    abstract class PluginBase {
-        public string $name = "";
-        public function onLoad(): void {}
-        public function onEnable(): void {}
-        public function onDisable(): void {}
-        public function getServer(): Server { return Server::getInstance(); }
-        public function getLogger(): Logger { return Server::getInstance()->getLogger(); }
-    }
-}
-
-// IPC Protocol Loop
-namespace {
-    use pocketmine\Server;
-    use pocketmine\player\Player;
-    use pocketmine\event\player\PlayerJoinEvent;
-    use pocketmine\event\player\PlayerQuitEvent;
-    use pocketmine\event\player\PlayerChatEvent;
-
-    $plugins = [];
-    $listeners = []; // [eventName => [callable, ...]]
-
-    while ($line = fgets(STDIN)) {
-        $req = json_decode(trim($line), true);
-        if (!$req || !isset($req['action'])) {
-            continue;
-        }
-
-        $server = Server::getInstance();
-        $server->actions = [];
-        $resp = ['status' => 'ok', 'cancelled' => false, 'actions' => []];
-
-        try {
-            switch ($req['action']) {
-                case 'ping':
-                    $resp['data'] = 'pong';
-                    break;
-
-                case 'load_plugin':
-                    $file = $req['file'];
-                    $mainClass = $req['main'];
-                    if (file_exists($file)) {
-                        require_once $file;
-                    }
-                    if (class_exists($mainClass)) {
-                        $plugin = new $mainClass();
-                        $plugin->name = $req['name'];
-                        $plugin->onLoad();
-                        $plugins[$req['name']] = $plugin;
-                        $resp['message'] = "Plugin {$req['name']} loaded";
-                    } else {
-                        $resp['status'] = 'error';
-                        $resp['message'] = "Main class {$mainClass} not found";
-                    }
-                    break;
-
-                case 'enable_plugin':
-                    $name = $req['name'];
-                    if (isset($plugins[$name])) {
-                        $plugins[$name]->onEnable();
-                        // Scan for methods with Listener or standard events
-                        $ref = new ReflectionClass($plugins[$name]);
-                        foreach ($ref->getMethods() as $method) {
-                            $params = $method->getParameters();
-                            if (count($params) === 1) {
-                                $type = $params[0]->getType();
-                                if ($type && !$type->isBuiltin()) {
-                                    $className = $type->getName();
-                                    $shortName = substr($className, strrpos($className, '\\') + 1);
-                                    $listeners[$shortName][] = [$plugins[$name], $method->getName()];
-                                }
-                            }
-                        }
-                    }
-                    break;
-
-                case 'dispatch_event':
-                    $eventName = $req['event'];
-                    $data = $req['data'] ?? [];
-                    $eventObj = null;
-
-                    if ($eventName === 'PlayerJoinEvent') {
-                        $p = new Player($data['player']['name'] ?? 'Steve');
-                        $eventObj = new PlayerJoinEvent($p, $data['join_message'] ?? '');
-                    } elseif ($eventName === 'PlayerQuitEvent') {
-                        $p = new Player($data['player']['name'] ?? 'Steve');
-                        $eventObj = new PlayerQuitEvent($p, $data['quit_message'] ?? '');
-                    } elseif ($eventName === 'PlayerChatEvent') {
-                        $p = new Player($data['player']['name'] ?? 'Steve');
-                        $eventObj = new PlayerChatEvent($p, $data['message'] ?? '');
-                    }
-
-                    if ($eventObj && isset($listeners[$eventName])) {
-                        foreach ($listeners[$eventName] as $callable) {
-                            $callable($eventObj);
-                        }
-                        $resp['cancelled'] = $eventObj->isCancelled();
-                    }
-                    break;
-
-                case 'disable_plugin':
-                    $name = $req['name'];
-                    if (isset($plugins[$name])) {
-                        $plugins[$name]->onDisable();
-                        unset($plugins[$name]);
-                    }
-                    break;
-            }
-        } catch (\Throwable $e) {
-            $resp['status'] = 'error';
-            $resp['message'] = $e->getMessage();
-        }
-
-        $resp['actions'] = $server->actions;
-        echo json_encode($resp) . PHP_EOL;
-        fflush(STDOUT);
-    }
-}
-"#;
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
-struct IpcRequest {
-    action: String,
-    #[serde(flatten)]
-    extra: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+/// A single response line from the PHP worker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IpcResponse {
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
     pub cancelled: bool,
     #[serde(default)]
+    pub event: Option<Value>,
+    #[serde(default)]
     pub actions: Vec<PluginAction>,
+    #[serde(default)]
+    pub handled: bool,
+    #[serde(default)]
+    pub plugins: Vec<DiscoveredPluginManifest>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub listener_events: Vec<String>,
+    #[serde(default)]
+    pub listeners: usize,
+    #[serde(default)]
+    pub tick: u64,
+    #[serde(default)]
+    pub pending_tasks: u64,
+    #[serde(default)]
+    pub data: Option<Value>,
 }
 
-struct WorkerStream {
-    _child: Child,
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+struct WorkerRequest {
+    action: String,
+    extra: Value,
+    reply: SyncSender<Result<IpcResponse, PluginError>>,
 }
 
-/// The IPC Bridge managing the PHP worker subprocess.
+/// Cloneable handle shared with blocking tasks and the worker thread.
+#[derive(Clone)]
+struct WorkerHandle {
+    tx: Arc<Mutex<Option<Sender<WorkerRequest>>>>,
+    available: Arc<AtomicBool>,
+    host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
+    runtime_dir: Arc<Mutex<Option<PathBuf>>>,
+    worker_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl WorkerHandle {
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    fn mark_unavailable(&self) {
+        self.available.store(false, Ordering::SeqCst);
+        let _ = self.tx.lock().take();
+    }
+
+    fn start_sync(&self) -> Result<bool, PluginError> {
+        if self.is_available() && self.tx.lock().is_some() {
+            return Ok(true);
+        }
+
+        // Serialize concurrent startup attempts.
+        let mut tx_guard = self.tx.lock();
+
+        if self.is_available() && tx_guard.is_some() {
+            return Ok(true);
+        }
+
+        *tx_guard = None;
+        self.available.store(false, Ordering::SeqCst);
+
+        let runtime_dir = bootstrap::default_runtime_dir();
+        let bootstrap_path = bootstrap::write_runtime(&runtime_dir)?;
+        *self.runtime_dir.lock() = Some(bootstrap_path.clone());
+
+        let php = std::env::var("POCKETMINE_PHP").unwrap_or_else(|_| "php".to_string());
+        let mut child = match std::process::Command::new(&php)
+            .arg(&bootstrap_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                // Missing PHP is not fatal: the manager falls back to native
+                // directory discovery and the server keeps running.
+                warn!(
+                    "PHP executable '{}' could not be started ({}); PHP plugins disabled",
+                    php, error
+                );
+                return Ok(false);
+            }
+        };
+
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                return Err(PluginError::PhpRuntime(
+                    "Failed to capture PHP worker stdin".to_string(),
+                ));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                return Err(PluginError::PhpRuntime(
+                    "Failed to capture PHP worker stdout".to_string(),
+                ));
+            }
+        };
+
+        let (sender, receiver) = mpsc::channel::<WorkerRequest>();
+        let host = Arc::clone(&self.host);
+        let join_handle = match std::thread::Builder::new()
+            .name("php-plugin-worker".to_string())
+            .spawn(move || run_worker(child, stdin, stdout, receiver, host))
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Err(PluginError::PhpRuntime(format!(
+                    "Failed to spawn PHP worker thread: {}",
+                    error
+                )));
+            }
+        };
+
+        *tx_guard = Some(sender.clone());
+        self.available.store(true, Ordering::SeqCst);
+        drop(tx_guard);
+
+        // Keep the join handle so shutdown can wait for the worker thread.
+        *self.worker_thread.lock() = Some(join_handle);
+
+        // Handshake: make sure the PHP loop is alive before declaring the
+        // runtime usable.
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let ping = WorkerRequest {
+            action: "ping".to_string(),
+            extra: Value::Object(Map::new()),
+            reply: reply_tx,
+        };
+
+        if sender.send(ping).is_err() {
+            self.mark_unavailable();
+            return Ok(false);
+        }
+
+        match reply_rx.recv_timeout(PING_TIMEOUT) {
+            Ok(Ok(response)) if response.status == "ok" => {
+                info!("PHP plugin runtime worker started successfully");
+                Ok(true)
+            }
+            Ok(Ok(response)) => {
+                warn!(
+                    "PHP worker ping failed with status '{}': {:?}",
+                    response.status, response.message
+                );
+                self.mark_unavailable();
+                Ok(false)
+            }
+            Ok(Err(error)) => {
+                warn!("PHP worker ping failed: {}", error);
+                self.mark_unavailable();
+                Ok(false)
+            }
+            Err(error) => {
+                warn!("PHP worker ping timed out: {}", error);
+                self.mark_unavailable();
+                Ok(false)
+            }
+        }
+    }
+
+    fn request_sync(&self, action: &str, extra: Value) -> Result<IpcResponse, PluginError> {
+        if !self.is_available() && !self.start_sync()? {
+            return Err(PluginError::PhpRuntime(
+                "PHP runtime is not available".to_string(),
+            ));
+        }
+
+        let sender = match self.tx.lock().clone() {
+            Some(sender) => sender,
+            None => {
+                self.available.store(false, Ordering::SeqCst);
+                return Err(PluginError::PhpRuntime(
+                    "PHP worker channel is closed".to_string(),
+                ));
+            }
+        };
+
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let request = WorkerRequest {
+            action: action.to_string(),
+            extra,
+            reply: reply_tx,
+        };
+
+        if sender.send(request).is_err() {
+            self.mark_unavailable();
+            return Err(PluginError::PhpRuntime(
+                "PHP worker thread is no longer running".to_string(),
+            ));
+        }
+
+        match reply_rx.recv_timeout(REQUEST_TIMEOUT) {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                self.mark_unavailable();
+                Err(error)
+            }
+            Err(error) => {
+                self.mark_unavailable();
+                Err(PluginError::PhpRuntime(format!(
+                    "Timeout waiting for PHP action '{}': {}",
+                    action, error
+                )))
+            }
+        }
+    }
+}
+
+/// The IPC bridge managing the persistent PHP worker subprocess.
+#[derive(Clone)]
 pub struct PhpWorker {
-    stream: Mutex<Option<WorkerStream>>,
-    is_available: AtomicBool,
+    tx: Arc<Mutex<Option<Sender<WorkerRequest>>>>,
+    available: Arc<AtomicBool>,
+    host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
+    runtime_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// Join handle for the PHP worker thread, kept so shutdown can wait for it.
+    worker_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl Default for PhpWorker {
@@ -308,133 +277,463 @@ impl Default for PhpWorker {
 impl PhpWorker {
     pub fn new() -> Self {
         Self {
-            stream: Mutex::new(None),
-            is_available: AtomicBool::new(false),
+            tx: Arc::new(Mutex::new(None)),
+            available: Arc::new(AtomicBool::new(false)),
+            host: Arc::new(RwLock::new(None)),
+            runtime_dir: Arc::new(Mutex::new(None)),
+            worker_thread: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn handle(&self) -> WorkerHandle {
+        WorkerHandle {
+            tx: Arc::clone(&self.tx),
+            available: Arc::clone(&self.available),
+            host: Arc::clone(&self.host),
+            runtime_dir: Arc::clone(&self.runtime_dir),
+            worker_thread: Arc::clone(&self.worker_thread),
+        }
+    }
+
+
+
+    /// Installs the host used for synchronous PHP -> Rust calls.
+    pub fn set_host(&self, host: Arc<dyn PluginHost>) {
+        *self.host.write() = Some(host);
     }
 
     pub fn is_available(&self) -> bool {
-        self.is_available.load(Ordering::SeqCst)
+        self.available.load(Ordering::SeqCst)
     }
 
-    /// Attempts to spawn the PHP worker process.
+    /// Path of the generated `bootstrap.php`, if the runtime was started.
+    pub fn runtime_dir(&self) -> Option<PathBuf> {
+        self.runtime_dir.lock().clone()
+    }
+
+    /// Attempts to spawn the PHP worker process and ping it.
+    ///
+    /// Returns `Ok(false)` when PHP is not installed or the runtime cannot be
+    /// reached; callers should treat that as "PHP plugins unavailable".
     pub async fn start(&self) -> Result<bool, PluginError> {
-        let code = POCKETMINE_BOOTSTRAP_PHP
-            .strip_prefix("<?php")
-            .unwrap_or(POCKETMINE_BOOTSTRAP_PHP)
-            .trim_start();
-
-        let mut child = match Command::new("php")
-            .arg("-r")
-            .arg(code)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("PHP executable not available on this host: {}", e);
-                self.is_available.store(false, Ordering::SeqCst);
-                return Ok(false);
-            }
-        };
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            PluginError::PhpRuntime("Failed to capture child stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            PluginError::PhpRuntime("Failed to capture child stdout".to_string())
-        })?;
-        let reader = BufReader::new(stdout);
-        let lines = reader.lines();
-
-        let mut lock = self.stream.lock().await;
-        *lock = Some(WorkerStream {
-            _child: child,
-            stdin,
-            lines,
-        });
-
-        self.is_available.store(true, Ordering::SeqCst);
-        info!("PHP plugin runtime worker started successfully");
-        Ok(true)
+        let handle = self.handle();
+        tokio::task::spawn_blocking(move || handle.start_sync())
+            .await
+            .map_err(|error| {
+                PluginError::PhpRuntime(format!("PHP worker startup task failed: {}", error))
+            })?
     }
 
-    /// Sends a JSON IPC command to the PHP worker and waits for the response.
-    pub async fn send_command(&self, action: &str, extra: serde_json::Value) -> Result<IpcResponse, PluginError> {
-        let mut lock = self.stream.lock().await;
-        let worker = match lock.as_mut() {
-            Some(w) => w,
-            None => {
-                return Ok(IpcResponse {
-                    status: "offline".to_string(),
-                    message: Some("PHP worker offline".to_string()),
-                    cancelled: false,
-                    actions: Vec::new(),
-                });
-            }
-        };
-
-        let mut payload = serde_json::json!({ "action": action });
-        if let serde_json::Value::Object(map) = extra {
-            for (k, v) in map {
-                payload[k] = v;
-            }
-        }
-
-        let json_str = serde_json::to_string(&payload)? + "\n";
-        worker.stdin.write_all(json_str.as_bytes()).await?;
-        worker.stdin.flush().await?;
-
-        if let Some(line) = worker.lines.next_line().await? {
-            let resp: IpcResponse = serde_json::from_str(&line)?;
-            Ok(resp)
-        } else {
-            Err(PluginError::PhpRuntime("Worker closed stdout stream unexpectedly".to_string()))
-        }
+    /// Synchronous startup used by `request_sync` and `init_runtime` internals.
+    pub fn start_sync(&self) -> Result<bool, PluginError> {
+        self.handle().start_sync()
     }
 
-    /// Dispatches an event to the PHP worker.
-    pub async fn dispatch_event(&self, event: &mut dyn Event) -> Result<Vec<PluginAction>, PluginError> {
+    /// Sends a request to PHP and waits for the final response.
+    ///
+    /// If the worker is not running this attempts one restart. Timeouts and
+    /// broken pipes mark the runtime as unavailable.
+    pub fn request_sync(&self, action: &str, extra: Value) -> Result<IpcResponse, PluginError> {
+        self.handle().request_sync(action, extra)
+    }
+
+    /// Async wrapper around [`PhpWorker::request_sync`].
+    pub async fn send_command(
+        &self,
+        action: &str,
+        extra: Value,
+    ) -> Result<IpcResponse, PluginError> {
+        let handle = self.handle();
+        let action = action.to_string();
+        tokio::task::spawn_blocking(move || handle.request_sync(&action, extra))
+            .await
+            .map_err(|error| {
+                PluginError::PhpRuntime(format!("PHP worker request task failed: {}", error))
+            })?
+    }
+
+    /// Dispatches an event to PHP and applies the mutated snapshot back.
+    pub async fn dispatch_event(
+        &self,
+        event: &mut dyn Event,
+    ) -> Result<Vec<PluginAction>, PluginError> {
         if !self.is_available() {
             return Ok(Vec::new());
         }
 
-        let resp = self
+        let response = self
             .send_command(
                 "dispatch_event",
-                serde_json::json!({
+                json!({
                     "event": event.name(),
                     "data": event.to_json()
                 }),
             )
             .await?;
 
-        if resp.cancelled && event.is_cancellable() {
+        if response.status != "ok" && response.status != "offline" {
+            warn!(
+                "PHP dispatch of '{}' returned status '{}': {:?}",
+                event.name(),
+                response.status,
+                response.message
+            );
+        }
+
+        if let Some(value) = &response.event {
+            event.apply_json(value);
+        }
+        if response.cancelled && event.is_cancellable() {
             event.set_cancelled(true);
         }
 
-        Ok(resp.actions)
+        Ok(response.actions)
+    }
+
+    /// Asks the PHP worker to exit and waits for the worker thread to finish.
+    ///
+    /// Sends a `shutdown` request to the worker, then joins the worker thread
+    /// so the PHP subprocess has time to exit cleanly. If the worker thread
+    /// has already been joined or was never started, this is a no-op.
+    pub fn shutdown_sync(&self) {
+        self.available.store(false, Ordering::SeqCst);
+
+        // Send the shutdown request so the worker loop breaks.
+        if let Some(sender) = self.tx.lock().take() {
+            let (reply, _receiver) = mpsc::sync_channel(1);
+            let _ = sender.send(WorkerRequest {
+                action: "shutdown".to_string(),
+                extra: Value::Object(Map::new()),
+                reply,
+            });
+        }
+
+        // Wait for the worker thread to finish so the PHP process exits cleanly.
+        if let Some(handle) = self.worker_thread.lock().take() {
+            if let Err(error) = handle.join() {
+                warn!("PHP worker thread panicked during shutdown: {:?}", error);
+            }
+        }
+    }
+}
+
+impl Drop for PhpWorker {
+    fn drop(&mut self) {
+        self.available.store(false, Ordering::SeqCst);
+        if let Some(sender) = self.tx.lock().take() {
+            let (reply, _receiver) = mpsc::sync_channel(1);
+            let _ = sender.send(WorkerRequest {
+                action: "shutdown".to_string(),
+                extra: Value::Object(Map::new()),
+                reply,
+            });
+        }
+    }
+}
+
+fn run_worker(
+    mut child: Child,
+    mut stdin: ChildStdin,
+    stdout: ChildStdout,
+    receiver: Receiver<WorkerRequest>,
+    host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    let mut clean_shutdown = false;
+
+    while let Ok(request) = receiver.recv() {
+        let mut payload = Map::new();
+        payload.insert("action".to_string(), Value::String(request.action.clone()));
+        if let Value::Object(extra) = request.extra {
+            for (key, value) in extra {
+                payload.insert(key, value);
+            }
+        }
+
+        let line = match serde_json::to_string(&Value::Object(payload)) {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = request.reply.send(Err(PluginError::PhpRuntime(format!(
+                    "Failed to encode PHP request: {}",
+                    error
+                ))));
+                continue;
+            }
+        };
+
+        if let Err(error) = write_json_line(&mut stdin, &line) {
+            let _ = request.reply.send(Err(error));
+            break;
+        }
+
+        if request.action == "shutdown" {
+            let _ = request.reply.send(Ok(IpcResponse {
+                status: "ok".to_string(),
+                ..IpcResponse::default()
+            }));
+            clean_shutdown = true;
+            break;
+        }
+
+        let result = read_response(&mut reader, &mut stdin, &host);
+        let failed = result.is_err();
+        let _ = request.reply.send(result);
+
+        if failed {
+            break;
+        }
+    }
+
+    // Closing stdin lets a well-behaved PHP loop exit on EOF.
+    drop(stdin);
+    if !clean_shutdown {
+        if let Ok(None) = child.try_wait() {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+}
+
+fn read_response(
+    reader: &mut BufReader<ChildStdout>,
+    stdin: &mut ChildStdin,
+    host: &RwLock<Option<Arc<dyn PluginHost>>>,
+) -> Result<IpcResponse, PluginError> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Err(PluginError::PhpRuntime(
+                "PHP worker closed stdout unexpectedly".to_string(),
+            ));
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(PluginError::PhpRuntime(format!(
+                    "Invalid JSON from PHP worker: {} (line: {})",
+                    error, trimmed
+                )));
+            }
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("host_call") => {
+                handle_host_call(&value, stdin, host)?;
+                continue;
+            }
+            Some("host_result") => {
+                // Late/unsolicited result from an earlier call; ignore it.
+                debug!("Ignoring unsolicited host_result from PHP worker");
+                continue;
+            }
+            _ => {}
+        }
+
+        let response: IpcResponse = serde_json::from_value(value).map_err(|error| {
+            PluginError::PhpRuntime(format!("Invalid IPC response from PHP worker: {}", error))
+        })?;
+        return Ok(response);
+    }
+}
+
+fn handle_host_call(
+    value: &Value,
+    stdin: &mut ChildStdin,
+    host: &RwLock<Option<Arc<dyn PluginHost>>>,
+) -> Result<(), PluginError> {
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = value.get("params").cloned().unwrap_or(Value::Null);
+
+    let host = host.read().clone();
+    let result = match host {
+        Some(host) => host.call(method, &params),
+        None => Err("No plugin host installed".to_string()),
+    };
+
+    let response = match result {
+        Ok(result) => json!({
+            "type": "host_result",
+            "id": id,
+            "ok": true,
+            "result": result
+        }),
+        Err(error) => json!({
+            "type": "host_result",
+            "id": id,
+            "ok": false,
+            "error": error
+        }),
+    };
+
+    write_json_line(stdin, &response.to_string())
+}
+
+fn write_json_line(stdin: &mut ChildStdin, line: &str) -> Result<(), PluginError> {
+    stdin.write_all(line.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+/// Where a PHP plugin lives on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginSource {
+    /// A regular plugin directory containing `plugin.yml` and `src/`.
+    Dir(PathBuf),
+    /// A `.phar` archive accessed through PHP's `phar://` stream wrapper.
+    Phar(PathBuf),
+}
+
+impl PluginSource {
+    pub fn dir(path: impl Into<PathBuf>) -> Self {
+        Self::Dir(path.into())
+    }
+
+    pub fn phar(path: impl Into<PathBuf>) -> Self {
+        Self::Phar(path.into())
+    }
+
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("phar"))
+            .unwrap_or(false)
+        {
+            Self::Phar(path)
+        } else {
+            Self::Dir(path)
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Dir(path) | Self::Phar(path) => path,
+        }
+    }
+
+    pub fn is_phar(&self) -> bool {
+        matches!(self, Self::Phar(_))
+    }
+
+    /// Directory used as `plugin_dir` in `load_plugin` (a `phar://` URI for
+    /// archives).
+    pub fn root(&self) -> String {
+        match self {
+            Self::Dir(path) => path.to_string_lossy().to_string(),
+            Self::Phar(path) => {
+                let path = normalize_phar_path(path);
+                format!("phar://{}", path.to_string_lossy().replace('\\', "/"))
+            }
+        }
+    }
+
+    /// Absolute path of the plugin's main class file.
+    pub fn main_file(&self, main_class: &str) -> String {
+        let relative = main_class
+            .trim()
+            .trim_start_matches(|character| character == '\\' || character == '/')
+            .replace('\\', "/");
+        format!("{}/src/{}.php", self.root().trim_end_matches('/'), relative)
+    }
+}
+
+fn normalize_phar_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let stripped = raw
+        .strip_prefix("phar://")
+        .or_else(|| raw.strip_prefix("PHAR://"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf());
+
+    if stripped.is_absolute() {
+        stripped
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&stripped))
+            .unwrap_or(stripped)
     }
 }
 
 /// A PHP-based PocketMine plugin managed via the IPC bridge.
 pub struct PhpPlugin {
     description: PluginDescription,
-    plugin_dir: PathBuf,
+    source: PluginSource,
     worker: Arc<PhpWorker>,
     enabled: AtomicBool,
+    last_commands: RwLock<Vec<String>>,
+    last_listener_events: RwLock<Vec<String>>,
 }
 
 impl PhpPlugin {
-    pub fn new(description: PluginDescription, plugin_dir: PathBuf, worker: Arc<PhpWorker>) -> Self {
+    pub fn new(
+        description: PluginDescription,
+        source: impl Into<PluginSource>,
+        worker: Arc<PhpWorker>,
+    ) -> Self {
         Self {
             description,
-            plugin_dir,
+            source: source.into(),
             worker,
             enabled: AtomicBool::new(false),
+            last_commands: RwLock::new(Vec::new()),
+            last_listener_events: RwLock::new(Vec::new()),
         }
+    }
+
+    pub fn source(&self) -> &PluginSource {
+        &self.source
+    }
+
+    pub fn last_commands(&self) -> Vec<String> {
+        self.last_commands.read().clone()
+    }
+
+    pub fn last_listener_events(&self) -> Vec<String> {
+        self.last_listener_events.read().clone()
+    }
+
+    fn data_folder(&self) -> PathBuf {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("plugin_data")
+            .join(self.name())
+    }
+}
+
+impl From<PathBuf> for PluginSource {
+    fn from(path: PathBuf) -> Self {
+        Self::from_path(path)
+    }
+}
+
+impl From<&Path> for PluginSource {
+    fn from(path: &Path) -> Self {
+        Self::from_path(path)
+    }
+}
+
+impl From<&str> for PluginSource {
+    fn from(path: &str) -> Self {
+        Self::from_path(PathBuf::from(path))
+    }
+}
+
+impl From<String> for PluginSource {
+    fn from(path: String) -> Self {
+        Self::from_path(PathBuf::from(path))
     }
 }
 
@@ -448,21 +747,59 @@ impl Plugin for PhpPlugin {
         self.enabled.load(Ordering::SeqCst)
     }
 
+    fn commands(&self) -> Vec<String> {
+        self.last_commands.read().clone()
+    }
+
+    fn listener_events(&self) -> Vec<String> {
+        self.last_listener_events.read().clone()
+    }
+
     async fn on_load(&mut self) -> Result<(), PluginError> {
-        let main_class = &self.description.main;
-        let main_file = self.plugin_dir.join("src").join(
-            main_class.replace('\\', "/").trim_start_matches('/')
-        ).with_extension("php");
+        let main_class = self.description.main.clone();
+        let main_file = self.source.main_file(&main_class);
+        let plugin_dir = self.source.root();
+        let data_folder = self.data_folder();
 
-        info!("Loading PHP plugin '{}' (main: {})", self.name(), main_class);
-        let resp = self.worker.send_command("load_plugin", serde_json::json!({
-            "name": self.name(),
-            "file": main_file.to_string_lossy(),
-            "main": main_class
-        })).await?;
+        std::fs::create_dir_all(&data_folder)?;
 
-        if resp.status != "ok" && resp.status != "offline" {
-            warn!("Failed to load PHP plugin {}: {:?}", self.name(), resp.message);
+        info!(
+            "Loading PHP plugin '{}' (main: {}, source: {})",
+            self.name(),
+            main_class,
+            plugin_dir
+        );
+
+        let response = self
+            .worker
+            .send_command(
+                "load_plugin",
+                json!({
+                    "name": self.name(),
+                    "main": main_class,
+                    "file": main_file,
+                    "plugin_dir": plugin_dir,
+                    "data_folder": data_folder.to_string_lossy(),
+                    "description": serde_json::to_value(&self.description)?
+                }),
+            )
+            .await?;
+
+        if response.status == "error" {
+            return Err(PluginError::PhpRuntime(format!(
+                "Failed to load plugin '{}': {}",
+                self.name(),
+                response.message.unwrap_or_default()
+            )));
+        }
+
+        if response.status != "ok" {
+            warn!(
+                "Unexpected status '{}' while loading plugin '{}': {:?}",
+                response.status,
+                self.name(),
+                response.message
+            );
         }
 
         Ok(())
@@ -470,22 +807,63 @@ impl Plugin for PhpPlugin {
 
     async fn on_enable(&mut self) -> Result<(), PluginError> {
         info!("Enabling PHP plugin '{}'", self.name());
-        let resp = self.worker.send_command("enable_plugin", serde_json::json!({
-            "name": self.name()
-        })).await?;
+        let response = self
+            .worker
+            .send_command("enable_plugin", json!({ "name": self.name() }))
+            .await?;
 
-        if resp.status == "ok" || resp.status == "offline" {
-            self.enabled.store(true, Ordering::SeqCst);
+        if response.status == "error" {
+            return Err(PluginError::PhpRuntime(format!(
+                "Failed to enable plugin '{}': {}",
+                self.name(),
+                response.message.unwrap_or_default()
+            )));
         }
+
+        *self.last_commands.write() = response.commands;
+        *self.last_listener_events.write() = response.listener_events;
+        self.enabled.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn on_disable(&mut self) -> Result<(), PluginError> {
         info!("Disabling PHP plugin '{}'", self.name());
-        let _ = self.worker.send_command("disable_plugin", serde_json::json!({
-            "name": self.name()
-        })).await;
+        let result = self
+            .worker
+            .send_command("disable_plugin", json!({ "name": self.name() }))
+            .await;
+
+        if let Err(error) = &result {
+            warn!("Failed to disable PHP plugin '{}': {}", self.name(), error);
+        }
+
+        self.last_commands.write().clear();
+        self.last_listener_events.write().clear();
         self.enabled.store(false, Ordering::SeqCst);
-        Ok(())
+        result.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phar_source_builds_phar_uris() {
+        let source = PluginSource::phar("plugins/Foo.phar");
+        assert!(source.is_phar());
+        assert!(source.root().starts_with("phar://"));
+        assert!(source
+            .main_file("Acme\\Foo\\Main")
+            .ends_with("Foo.phar/src/Acme/Foo/Main.php"));
+    }
+
+    #[test]
+    fn dir_source_builds_main_file() {
+        let source = PluginSource::dir("plugins/Foo");
+        assert_eq!(
+            source.main_file("Acme\\Foo\\Main"),
+            "plugins/Foo/src/Acme/Foo/Main.php"
+        );
     }
 }

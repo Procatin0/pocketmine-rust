@@ -1,0 +1,38 @@
+name: EconomyLite
+version: "1.0.0"
+main: economylite\Main
+api: ["5.0.0"]
+author: PocketMine-Rust Team
+description: "Economía mínima: Config, JSON persistente, scheduler, permisos y comandos."
+website: "https://github.com/pmmp/PocketMine-MP"
+
+softdepend: ["TestKit"]
+
+commands:
+  money:
+    description: "Muestra tu saldo o el de otro jugador."
+    usage: "/money [jugador]"
+    aliases: ["bal", "balance"]
+    permission: economylite.command.money
+  pay:
+    description: "Transfiere dinero a otro jugador."
+    usage: "/pay <jugador> <cantidad>"
+    permission: economylite.command.pay
+  eco:
+    description: "Administra el saldo de una cuenta."
+    usage: "/eco <give|take|set> <jugador> <cantidad>"
+    permission: economylite.command.eco
+
+permissions:
+  economylite.command.money:
+    description: "Permite consultar el saldo propio."
+    default: true
+  economylite.command.money.other:
+    description: "Permite consultar el saldo de otros jugadores."
+    default: op
+  economylite.command.pay:
+    description: "Permite usar /pay."
+    default: true
+  economylite.command.eco:
+    description: "Permite administrar saldos con /eco."
+    default: op

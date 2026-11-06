@@ -6,6 +6,7 @@ pub mod description;
 pub mod error;
 pub mod event;
 pub mod events;
+pub mod host;
 pub mod manager;
 pub mod plugin;
 pub mod runtime;
@@ -16,13 +17,17 @@ pub use description::{CommandDescription, PermissionDescription, PluginDescripti
 pub use error::PluginError;
 pub use event::{Event, EventDispatcher, EventPriority, RegisteredListener};
 pub use events::*;
-pub use manager::PluginManager;
+pub use host::PluginHost;
+pub use manager::{CommandOutcome, PluginManager};
 pub use plugin::Plugin;
-pub use runtime::{NativePluginWrapper, PhpPlugin, PhpWorker};
+pub use runtime::{
+    DiscoveredPluginManifest, IpcResponse, NativePluginWrapper, PhpPlugin, PhpWorker, PluginSource,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -241,7 +246,11 @@ permissions:
             fn aliases(&self) -> &[String] {
                 &[]
             }
-            fn execute(&self, sender: &CommandSender, _args: &[String]) -> Result<Vec<PluginAction>, PluginError> {
+            fn execute(
+                &self,
+                sender: &CommandSender,
+                _args: &[String],
+            ) -> Result<Vec<PluginAction>, PluginError> {
                 Ok(vec![PluginAction::SendMessage {
                     target_player: sender.name().to_string(),
                     message: "Pong!".to_string(),
@@ -252,7 +261,10 @@ permissions:
         let map = CommandMap::new();
         map.register(Arc::new(PingCommand));
 
-        let sender = CommandSender::Player(PlayerContext::new("Alex", "127.0.0.1:19132".parse().unwrap()));
+        let sender = CommandSender::Player(PlayerContext::new(
+            "Alex",
+            "127.0.0.1:19132".parse().unwrap(),
+        ));
         let result = map.execute(&sender, "/ping").unwrap();
         assert!(result.is_some());
         let actions = result.unwrap();
@@ -264,5 +276,201 @@ permissions:
                 message: "Pong!".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_plugin_action_json_roundtrip() {
+        let cases = vec![
+            (
+                json!({"action":"send_message","data":{"target_player":"Steve","message":"hi"}}),
+                PluginAction::SendMessage {
+                    target_player: "Steve".to_string(),
+                    message: "hi".to_string(),
+                },
+            ),
+            (
+                json!({"action":"broadcast_message","data":{"message":"hello"}}),
+                PluginAction::BroadcastMessage {
+                    message: "hello".to_string(),
+                },
+            ),
+            (
+                json!({"action":"console_message","data":{"message":"to console"}}),
+                PluginAction::ConsoleMessage {
+                    message: "to console".to_string(),
+                },
+            ),
+            (
+                json!({"action":"kick_player","data":{"target_player":"Steve","reason":"bye"}}),
+                PluginAction::KickPlayer {
+                    target_player: "Steve".to_string(),
+                    reason: "bye".to_string(),
+                },
+            ),
+            (
+                json!({"action":"teleport","data":{"target_player":"@a","x":1.0,"y":64.0,"z":-2.0,"world":"world"}}),
+                PluginAction::Teleport {
+                    target_player: "@a".to_string(),
+                    x: 1.0,
+                    y: 64.0,
+                    z: -2.0,
+                    world: Some("world".to_string()),
+                },
+            ),
+            (
+                json!({"action":"set_block","data":{"world":"world","x":1,"y":64,"z":-2,"block_id":1}}),
+                PluginAction::SetBlock {
+                    world: "world".to_string(),
+                    x: 1,
+                    y: 64,
+                    z: -2,
+                    block_id: 1,
+                },
+            ),
+            (
+                json!({"action":"dispatch_command","data":{"command":"say hi","sender":"Steve"}}),
+                PluginAction::DispatchCommand {
+                    command: "say hi".to_string(),
+                    sender: Some("Steve".to_string()),
+                },
+            ),
+            (
+                json!({"action":"send_tip","data":{"target_player":"Steve","message":"tip"}}),
+                PluginAction::SendTip {
+                    target_player: "Steve".to_string(),
+                    message: "tip".to_string(),
+                },
+            ),
+            (
+                json!({"action":"send_popup","data":{"target_player":"Steve","message":"popup"}}),
+                PluginAction::SendPopup {
+                    target_player: "Steve".to_string(),
+                    message: "popup".to_string(),
+                },
+            ),
+            (
+                json!({"action":"send_title","data":{"target_player":"Steve","title":"T","subtitle":"S","fade_in":10,"stay":40,"fade_out":10}}),
+                PluginAction::SendTitle {
+                    target_player: "Steve".to_string(),
+                    title: "T".to_string(),
+                    subtitle: "S".to_string(),
+                    fade_in: 10,
+                    stay: 40,
+                    fade_out: 10,
+                },
+            ),
+            (
+                json!({"action":"broadcast_tip","data":{"message":"tip"}}),
+                PluginAction::BroadcastTip {
+                    message: "tip".to_string(),
+                },
+            ),
+            (
+                json!({"action":"broadcast_popup","data":{"message":"popup"}}),
+                PluginAction::BroadcastPopup {
+                    message: "popup".to_string(),
+                },
+            ),
+            (
+                json!({"action":"broadcast_title","data":{"title":"T","subtitle":"S","fade_in":10,"stay":40,"fade_out":10}}),
+                PluginAction::BroadcastTitle {
+                    title: "T".to_string(),
+                    subtitle: "S".to_string(),
+                    fade_in: 10,
+                    stay: 40,
+                    fade_out: 10,
+                },
+            ),
+            (
+                json!({"action":"set_gamemode","data":{"target_player":"Steve","gamemode":1}}),
+                PluginAction::SetGamemode {
+                    target_player: "Steve".to_string(),
+                    gamemode: 1,
+                },
+            ),
+        ];
+
+        for (json_value, action) in cases {
+            let parsed: PluginAction =
+                serde_json::from_value(json_value.clone()).expect("PluginAction JSON");
+            assert_eq!(parsed, action);
+            assert_eq!(serde_json::to_value(&action).unwrap(), json_value);
+        }
+    }
+
+    #[test]
+    fn test_plugin_action_optional_fields() {
+        let teleport = PluginAction::Teleport {
+            target_player: "Steve".to_string(),
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            world: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&teleport).unwrap(),
+            json!({"action":"teleport","data":{"target_player":"Steve","x":1.0,"y":2.0,"z":3.0}})
+        );
+
+        let command = PluginAction::DispatchCommand {
+            command: "say hi".to_string(),
+            sender: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            json!({"action":"dispatch_command","data":{"command":"say hi"}})
+        );
+    }
+
+    #[test]
+    fn test_player_chat_apply_json() {
+        let player = PlayerContext::new("Steve", "127.0.0.1:19132".parse().unwrap());
+        let mut event = PlayerChatEvent::new(player, "original");
+
+        event.apply_json(&json!({
+            "message": "edited",
+            "format": "[X] <Steve> edited",
+            "recipients": ["Alex", "Herobrine"],
+            "cancelled": true
+        }));
+
+        assert_eq!(event.message, "edited");
+        assert_eq!(event.format, "[X] <Steve> edited");
+        assert_eq!(event.recipients, vec!["Alex", "Herobrine"]);
+        assert!(event.is_cancelled());
+    }
+
+    #[test]
+    fn test_parse_phar_manifest() {
+        let item = DiscoveredPluginManifest {
+            kind: "phar".to_string(),
+            path: "plugins/Foo.phar".to_string(),
+            manifest: "name: Foo\nversion: 1.0.0\nmain: Foo\\\\Main\napi: [5.0.0]\n".to_string(),
+        };
+
+        let (description, source) =
+            PluginManager::parse_discovered_manifest(&item).expect("phar manifest");
+        assert_eq!(description.name, "Foo");
+        assert!(source.is_phar());
+        assert!(source.root().starts_with("phar://"));
+        assert!(source
+            .main_file("Foo\\Main")
+            .ends_with("/Foo.phar/src/Foo/Main.php"));
+    }
+
+    #[test]
+    fn test_ipc_response_defaults() {
+        let response: IpcResponse = serde_json::from_str(
+            r#"{"status":"ok","event":{"message":"x"},"cancelled":false,"actions":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, "ok");
+        assert!(response.event.is_some());
+        assert!(response.actions.is_empty());
+        assert!(!response.cancelled);
+        assert!(response.message.is_none());
+        assert!(response.plugins.is_empty());
+        assert_eq!(response.tick, 0);
     }
 }

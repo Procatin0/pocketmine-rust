@@ -12,6 +12,11 @@ pub struct ServerConfig {
     pub max_players: i32,
     pub xbox_auth: bool,
     pub white_list: bool,
+    /// `auto-save`: persists `/save-on` and `/save-off`.
+    pub auto_save: bool,
+    /// `allow-cheats`: when enabled, every player can use administrative
+    /// commands such as `/tp` and `/gamemode`.
+    pub allow_cheats: bool,
     pub level_type: String,
     pub level_seed: u64,
     pub gamemode: i32,
@@ -30,6 +35,8 @@ impl Default for ServerConfig {
             max_players: 1000,
             xbox_auth: false,
             white_list: false,            // Whitelist disabled
+            auto_save: true,
+            allow_cheats: true,           // Dev-server default: commands usable by everyone
             level_type: "DEFAULT".to_string(),
             level_seed: 12345678,
             gamemode: 0,
@@ -59,7 +66,9 @@ impl ServerConfig {
                 max-players=1000\n\
                 white-list=0\n\
                 allow-list=0\n\
-                xbox-auth=off\n";
+                xbox-auth=off\n\
+                allow-cheats=on\n\
+                auto-save=on\n";
             let _ = fs::write(&props_path, default_props);
             info!("Created default server.properties");
         }
@@ -131,6 +140,12 @@ impl ServerConfig {
         if let Some(wl) = map.get("white-list").or_else(|| map.get("allow-list")).or_else(|| map.get("whitelist")) {
             self.white_list = *wl == "on" || *wl == "true" || *wl == "1";
         }
+        if let Some(auto) = map.get("auto-save") {
+            self.auto_save = *auto == "on" || *auto == "true" || *auto == "1";
+        }
+        if let Some(cheats) = map.get("allow-cheats") {
+            self.allow_cheats = *cheats == "on" || *cheats == "true" || *cheats == "1";
+        }
         if let Some(lt) = map.get("level-type") {
             self.level_type = lt.to_string();
         }
@@ -193,6 +208,43 @@ impl ServerConfig {
     }
 }
 
+/// Writes one `server.properties` entry in place, mirroring
+/// `ConfigGroup::setConfigBool()` + `save()`. Comments and untouched keys stay.
+pub fn set_server_property(base_dir: &Path, key: &str, value: &str) {
+    let path = base_dir.join("server.properties");
+    let content = fs::read_to_string(&path).unwrap_or_default();
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let matches_key = !trimmed.starts_with('#')
+            && line
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim() == key);
+        if matches_key {
+            if !replaced {
+                lines.push(format!("{key}={value}"));
+                replaced = true;
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if !replaced {
+        lines.push(format!("{key}={value}"));
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(error) = fs::write(&path, out) {
+        warn!("Could not persist {key} in server.properties: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +255,25 @@ mod tests {
         assert_eq!(config.signaling_port_tcp, 19132);
         assert_eq!(config.server_port_udp, 19133);
         assert!(!config.white_list);
+    }
+
+    #[test]
+    fn set_server_property_replaces_and_appends() {
+        let dir = std::env::temp_dir().join(format!("pm-rust-props-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("server.properties");
+        fs::write(&path, "# comment\nmotd=Test\nwhite-list=off\n").unwrap();
+
+        set_server_property(&dir, "white-list", "on");
+        set_server_property(&dir, "auto-save", "off");
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# comment"));
+        assert!(content.contains("motd=Test"));
+        assert!(content.contains("white-list=on"));
+        assert!(!content.contains("white-list=off"));
+        assert!(content.contains("auto-save=off"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

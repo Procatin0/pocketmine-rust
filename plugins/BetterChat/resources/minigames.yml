@@ -1,0 +1,20 @@
+# ============================
+# BetterChat Minigames Data
+# ============================
+
+# Trivia minigame - first to type the correct answer wins.
+trivia:
+  - question: "What is the capital of France?"
+    answer: "paris"
+  - question: "What block can you only break with a pickaxe in Minecraft?"
+    answer: "stone"
+  - question: "How many hearts does a player have?"
+    answer: "10"
+
+# Unscramble minigame - first to unscramble the word wins.
+unscramble:
+  - "minecraft"
+  - "diamond"
+  - "creeper"
+  - "enderman"
+  - "redstone"

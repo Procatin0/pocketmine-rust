@@ -24,6 +24,9 @@ use crate::negotiation::{AnswerBuilder, IceCandidateFormatter};
 
 pub trait NetherNetPacketHandler: Send + Sync {
     fn handle_message(&self, peer: SocketAddr, channel: &str, data: bytes::Bytes) -> Vec<bytes::Bytes>;
+
+    /// Called when a peer's data channel closes. The default does nothing.
+    fn on_disconnect(&self, _peer: SocketAddr) {}
 }
 
 struct NetherNetWebRtcHandler {
@@ -106,6 +109,9 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                     }
                     Some(DataChannelEvent::OnClose) | None => {
                         info!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
+                        if let Some(ph) = &handler {
+                            ph.on_disconnect(peer);
+                        }
                         if let Some(pc) = peer_conn.lock().await.take() {
                             debug!("[:WebRTC] Closing PeerConnection on DataChannel close for {}", peer);
                             let _ = pc.close().await;

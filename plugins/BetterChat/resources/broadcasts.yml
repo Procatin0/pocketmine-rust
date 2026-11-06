@@ -1,0 +1,20 @@
+# ============================
+# BetterChat Broadcast Messages
+# ============================
+# Each key is a broadcast entry. Name it whatever you want.
+# Each entry is an array of lines sent together.
+# Supports & color codes.
+
+welcome:
+  - "&aWelcome to the server! Have fun!"
+  - "&7Use /help for available commands."
+
+discord:
+  - "&bJoin our Discord community!"
+  - "&7discord.gg/example"
+
+rules:
+  - "&c=== SERVER RULES ==="
+  - "&71. No griefing"
+  - "&72. No hacking or exploiting"
+  - "&73. Be respectful to other players"

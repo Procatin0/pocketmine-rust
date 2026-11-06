@@ -86,5 +86,12 @@ a=candidate:1 1 udp 2122260199 127.0.0.1 39240 typ host\r\n";
     assert!(response_sdp_str.contains("HTTP/1.1 200 OK"));
     assert!(response_sdp_str.contains("application/sdp"));
     assert!(response_sdp_str.contains("a=identity:"));
-    assert!(response_sdp_str.contains("a=candidate:80000000 1 udp 1694498815 192.168.100.51"));
+    // The advertised address (Host header) must appear as a candidate. On hosts
+    // whose local IP already equals 192.168.100.51 the gathered host candidate
+    // is kept as `typ host`; elsewhere it is re-announced as srflx
+    // `80000000 ... 1694498815`. Accept either form to stay environment-independent.
+    let has_advertised = response_sdp_str
+        .lines()
+        .any(|l| l.starts_with("a=candidate:") && l.contains("192.168.100.51"));
+    assert!(has_advertised, "expected advertised 192.168.100.51 candidate, got:\n{}", response_sdp_str);
 }

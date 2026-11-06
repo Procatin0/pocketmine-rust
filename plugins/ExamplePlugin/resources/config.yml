@@ -1,0 +1,5 @@
+# Mensaje que recibe el jugador al entrar al servidor.
+welcome-message: "Welcome to PocketMine-Rust Server!"
+
+# Si es true, /hello también se anuncia a los demás jugadores conectados.
+broadcast-hello: false

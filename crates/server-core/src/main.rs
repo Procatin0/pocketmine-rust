@@ -1,14 +1,18 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::{info, warn};
 use nethernet_rs::{NetherNetIdentity, ServerInfo, SignalingServer};
+use php_plugin_bridge::{CommandSender, Event, PluginManager, ServerCommandEvent};
 use raklib_rs::{RakNetEvent, RakNetListener};
-use server_core::{ServerConfig, SessionManager};
+use server_core::{ServerConfig, ServerPluginHost, SessionManager};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    server_core::logging::init();
 
     info!("============================================================");
     info!(" Starting PocketMine-Rust High Performance Bedrock Server   ");
@@ -40,9 +44,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.gamemode,
         config.view_distance,
     ));
-    info!("SessionManager initialized (active sessions: {})", session_manager.session_count());
+    session_manager.set_allow_cheats(config.allow_cheats);
+    session_manager.set_auto_save_enabled(config.auto_save);
+    info!(
+        "SessionManager initialized (active sessions: {}, allow-cheats: {})",
+        session_manager.session_count(),
+        if config.allow_cheats { "ON" } else { "OFF" }
+    );
+    info!(
+        "Native commands ready: {} (usa /help para ver la lista completa)",
+        server_core::command::COMMANDS.len()
+    );
 
-    // 2. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)
+    // 2. Motor de plugins: se crea antes del transporte para que las sesiones
+    // que entren ya tengan eventos y comandos disponibles.
+    let ops = load_ops(Path::new("ops.txt"));
+    session_manager.set_ops(ops);
+    info!("Loaded {} operator(s) from ops.txt", session_manager.ops().read().len());
+    session_manager.access().load_from_dir(Path::new("."));
+    session_manager.enable_persistence(std::path::PathBuf::from("."));
+    if session_manager.world_state().load_from(Path::new("world.json")) {
+        info!("Loaded world.json");
+    }
+    info!(
+        "Loaded {} name ban(s), {} IP ban(s) and {} whitelisted player(s)",
+        session_manager.access().banned_names().len(),
+        session_manager.access().banned_ips().len(),
+        session_manager.access().whitelist_entries().len()
+    );
+
+    let plugin_manager = Arc::new(PluginManager::new());
+    let host = Arc::new(ServerPluginHost::new(
+        Arc::clone(session_manager.world()),
+        Arc::clone(session_manager.registry()),
+        Arc::clone(session_manager.ops()),
+        config.motd.clone(),
+        config.max_players,
+    ));
+    plugin_manager.set_host(host);
+    session_manager.set_plugin_manager(Arc::clone(&plugin_manager));
+
+    let _ = plugin_manager.init_runtime().await;
+    match plugin_manager.load_plugins_from_directory("plugins").await {
+        Ok(count) => {
+            info!("PluginManager loaded {} plugin(s) from 'plugins/'", count);
+            if let Err(e) = plugin_manager.enable_plugins().await {
+                tracing::error!("Failed enabling plugins: {}", e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Could not load plugins directory: {}", e);
+        }
+    }
+
+    // 3. Tick loop: 20 TPS, ejecuta el scheduler PHP y aplica sus acciones.
+    {
+        let plugin_manager = Arc::clone(&plugin_manager);
+        let session_manager = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = 0u64;
+            loop {
+                interval.tick().await;
+                session_manager.metrics().record_tick();
+                tick = tick.wrapping_add(1);
+                let manager = Arc::clone(&plugin_manager);
+                let result =
+                    tokio::task::spawn_blocking(move || manager.tick_sync(tick)).await;
+                match result {
+                    Ok(Ok(actions)) => {
+                        if !actions.is_empty() {
+                            session_manager.apply_actions(&actions, 0);
+                        }
+                    }
+                    Ok(Err(error)) => warn!("Plugin tick {} failed: {}", tick, error),
+                    Err(error) => warn!("Plugin tick task panicked: {}", error),
+                }
+
+                // PocketMine's autosave interval is 6000 ticks (5 minutes).
+                if tick % 6000 == 0 && session_manager.auto_save_enabled() {
+                    let saver = Arc::clone(&session_manager);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(error) = saver.save_all() {
+                            warn!("Autosave failed: {}", error);
+                        }
+                    })
+                    .await;
+                }
+            }
+        });
+    }
+
+    // 4. Consola: ServerCommandEvent + comandos de plugins.
+    {
+        let plugin_manager = Arc::clone(&plugin_manager);
+        let session_manager = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let manager = Arc::clone(&plugin_manager);
+                        let sessions = Arc::clone(&session_manager);
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut event = ServerCommandEvent::new(line.clone());
+                            let mut actions = manager.dispatch_event_sync(&mut event).unwrap_or_default();
+                            if !event.is_cancelled() {
+                                let command = event.command;
+                                // Native commands first (tp, gamemode, say, ...).
+                                if let Some(feedback) = sessions.execute_console_command(&command) {
+                                    for line in feedback {
+                                        server_core::logging::console_message(&line);
+                                    }
+                                    return actions;
+                                }
+                                match manager.execute_command_sync(&CommandSender::Console, &command) {
+                                    Ok(Some(outcome)) => actions.extend(outcome.actions),
+                                    Ok(None) => {
+                                        tracing::warn!("Unknown console command: {}", command)
+                                    }
+                                    Err(error) => {
+                                        tracing::error!("Console command failed: {}", error)
+                                    }
+                                }
+                            }
+                            actions
+                        })
+                        .await;
+                        if let Ok(actions) = result {
+                            session_manager.apply_actions(&actions, 0);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!("Console input closed: {}", error);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // 5. Transporte principal de señalización: TCP 19132 EXCLUSIVAMENTE (HTTP / HTTPS demux)
     // El puerto 19133 es de WebRTC (UDP) y NUNCA debe escuchar en TCP (idéntico a Axolotl/PocketMine)
     let signaling_addr: SocketAddr = "0.0.0.0:19132".parse()?;
     let webrtc_udp_port: u16 = 19133;
@@ -57,6 +205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Vec::new();
             }
             self.session_manager.dispatch_webrtc_packet(peer, &data)
+        }
+
+        fn on_disconnect(&self, peer: SocketAddr) {
+            info!("[:WebRTC] Peer {} disconnected; firing PlayerQuitEvent", peer);
+            self.session_manager.handle_peer_disconnect(peer);
         }
     }
 
@@ -77,22 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 3. Inicializar motor y puente de plugins (php-plugin-bridge)
-    let plugin_manager = Arc::new(php_plugin_bridge::PluginManager::new());
-    let _ = plugin_manager.init_runtime().await;
-    match plugin_manager.load_plugins_from_directory("plugins").await {
-        Ok(count) => {
-            info!("PluginManager loaded {} plugin(s) from 'plugins/'", count);
-            if let Err(e) = plugin_manager.enable_plugins().await {
-                tracing::error!("Failed enabling plugins: {}", e);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Could not load plugins directory: {}", e);
-        }
-    }
-
-    // 4. Iniciar listener de RakNet en UDP 19132 (fallback para clientes sin NetherNet)
+    // 6. Iniciar listener de RakNet en UDP 19132 (fallback para clientes sin NetherNet)
     let server_id: u64 = 0x12345678_aabbccdd;
     let raknet_port = 19132;
     let raknet_addr: SocketAddr = format!("0.0.0.0:{}", raknet_port).parse()?;
@@ -139,8 +277,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("============================================================");
 
     // Mantener corriendo hasta Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = wait_for_stop(Arc::clone(&session_manager)) => {
+            info!("/stop requested, shutting down.");
+        }
+    }
     info!("Shutting down server gracefully.");
     let _ = plugin_manager.disable_plugins().await;
+    // Run shutdown_sync in spawn_blocking so it doesn't block the Tokio runtime
+    // while waiting for the PHP worker thread to exit.
+    let worker = plugin_manager.php_worker().clone();
+    let _ = tokio::task::spawn_blocking(move || worker.shutdown_sync()).await;
     Ok(())
+}
+
+/// Resolves once `/stop` sets the shutdown flag.
+async fn wait_for_stop(manager: Arc<server_core::SessionManager>) {
+    loop {
+        if manager.stop_requested() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Reads `ops.txt`, one player name per line. Missing file means no operators.
+fn load_ops(path: &Path) -> HashSet<String> {
+    let mut ops = HashSet::new();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return ops;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        ops.insert(line.to_lowercase());
+    }
+    ops
 }

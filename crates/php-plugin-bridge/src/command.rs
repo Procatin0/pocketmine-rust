@@ -38,7 +38,11 @@ pub trait Command: Send + Sync {
     fn aliases(&self) -> &[String] {
         &[]
     }
-    fn execute(&self, sender: &CommandSender, args: &[String]) -> Result<Vec<PluginAction>, PluginError>;
+    fn execute(
+        &self,
+        sender: &CommandSender,
+        args: &[String],
+    ) -> Result<Vec<PluginAction>, PluginError>;
 }
 
 pub struct CommandMap {
@@ -74,7 +78,11 @@ impl CommandMap {
         // Can be extended to track owning plugin
     }
 
-    pub fn execute(&self, sender: &CommandSender, command_line: &str) -> Result<Option<Vec<PluginAction>>, PluginError> {
+    pub fn execute(
+        &self,
+        sender: &CommandSender,
+        command_line: &str,
+    ) -> Result<Option<Vec<PluginAction>>, PluginError> {
         let trimmed = command_line.trim().trim_start_matches('/');
         if trimmed.is_empty() {
             return Ok(None);

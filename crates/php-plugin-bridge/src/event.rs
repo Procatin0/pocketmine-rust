@@ -33,9 +33,16 @@ pub trait Event: Send + Sync {
     }
     fn set_cancelled(&mut self, _cancelled: bool) {}
     fn to_json(&self) -> serde_json::Value;
+
+    /// Apply a (possibly mutated) event snapshot returned by the PHP runtime.
+    ///
+    /// Implementations must only update fields present in `value`, so partial
+    /// payloads and older PHP runtimes keep working.
+    fn apply_json(&mut self, _value: &serde_json::Value) {}
 }
 
-pub type EventCallback = Arc<dyn Fn(&mut dyn Event) -> Result<Vec<PluginAction>, PluginError> + Send + Sync>;
+pub type EventCallback =
+    Arc<dyn Fn(&mut dyn Event) -> Result<Vec<PluginAction>, PluginError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct RegisteredListener {
@@ -87,7 +94,10 @@ impl EventDispatcher {
 
         let mut actions = Vec::new();
         for listener in listeners {
-            if event.is_cancelled() && !listener.ignore_cancelled && listener.priority != EventPriority::Monitor {
+            if event.is_cancelled()
+                && !listener.ignore_cancelled
+                && listener.priority != EventPriority::Monitor
+            {
                 continue;
             }
 
