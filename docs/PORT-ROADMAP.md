@@ -69,6 +69,8 @@ pocketmine-rust/
     │   │   ├── inventory_transaction.rs    0x1E
     │   │   ├── set_health.rs               0x2A
     │   │   ├── set_title.rs                0x58
+    │   │   ├── remove_actor.rs             0x0E
+    │   │   ├── move_actor_absolute.rs      0x12
     │   │   ├── actor_event.rs              0x1B (DEATH_ANIMATION)
     │   │   └── respawn.rs                  0x2D
     │   └── tests/session_packets_test.rs   (11 tests de roundtrip)
@@ -120,7 +122,7 @@ php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 | Subsistema de axolotl-pm | Archivos PHP | Dónde vive en Rust | Estado |
 |---|---:|---|---|
 | `network/` (sesiones, sesión de jugador, raknet, compresión) | 109 | `server-core/session.rs`, `nethernet-rs`, `raklib-rs` | 🟡 login, chunks y chat funcionan; falta el resto |
-| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 26 de 248 |
+| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 28 de 248 |
 | `world/` (chunks, generadores, luz, formatos) | 278 | `bedrock-world` | 🟡 generación sin luz ni persistencia |
 | `block/` (402 bloques) | 402 | `bedrock-world/block_id.rs` | 🔴 ids planos, sin estados ni comportamientos |
 | `entity/` + `player/` | 93 | parcial en `session.rs` | 🔴 un solo jugador visible para sí mismo |
@@ -295,12 +297,13 @@ Bedrock, y cada uno tiene test de parseo con sus errores exactos.
 **Criterio de salida:** un jugador sin permisos recibe exactamente el mensaje
 de PM; los plugins pueden conceder permisos y eso cambia lo que ve el cliente.
 
-### Fase 4 — Entidades, combate y experiencia (🔴 pendiente)
+### Fase 4 — Entidades, combate y experiencia (🟡 en curso)
 
-Bloqueada por los paquetes que aún no existen en `bedrock-protocol`:
-`AddPlayerPacket` (0x0C), `PlayerListPacket` (0x3F), `RemoveActorPacket`
-(0x0E) y `MoveActorAbsolutePacket`. Sin ellos no hay visibilidad entre
-jugadores ni entidades de objeto para drops.
+Ya modelados: `RemoveActorPacket` (0x0E) y `MoveActorAbsolutePacket` (0x12),
+con tests de ida y vuelta. Siguen faltando `AddPlayerPacket` (0x0C),
+`PlayerListPacket` (0x3F) —que necesita el serializador de skins— y
+`AddActorPacket`. Sin ellos no hay visibilidad entre jugadores ni entidades de
+objeto para drops.
 
 1. Entidades en el mundo: `AddPlayerPacket`, `AddActorPacket`,
    `RemoveActorPacket`, `MoveActorAbsolutePacket`, `PlayerListPacket`.

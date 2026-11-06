@@ -56,7 +56,7 @@ ls crates/bedrock-protocol/src/packets/*.rs        # paquetes
 | 1 | Inventario y objetos | 🟡 | falta `ItemStackRequest`, NBT y items data-driven |
 | 2 | Comandos restantes | 🟡 16/25 | 9 comandos dependen de sistemas inexistentes |
 | 3 | Permisos, traducciones y consola | 🟡 3/4 | permisos, `AvailableCommands`, `ServerCommandEvent` y difusión administrativa a la consola listos; falta el motor de traducciones |
-| 4 | Entidades, combate y XP | 🔴 | faltan `AddPlayerPacket`, `PlayerListPacket`, `RemoveActorPacket` |
+| 4 | Entidades, combate y XP | 🟡 | `RemoveActorPacket` y `MoveActorAbsolutePacket` modelados; faltan `AddPlayerPacket`, `PlayerListPacket`, `AddActorPacket` y `SetEntityData` |
 | 5 | Crafteo y contenedores | 🔴 | sin `CraftingDataPacket` ni ventanas múltiples |
 | 6 | Mundo completo | 🔴 | sin luz, estados de bloque ni persistencia de chunks |
 | 7 | API de plugins | 🔴 | depende de 4, 5 y 6 |
@@ -298,10 +298,12 @@ capturas reales.
 
 ## 10. Fases 4 a 9 (detalle)
 
-### Fase 4 — Entidades, combate y experiencia (🔴)
+### Fase 4 — Entidades, combate y experiencia (🟡)
 
-Bloqueada por paquetes ausentes: `AddPlayerPacket` (0x0C), `PlayerListPacket` (0x3F),
-`RemoveActorPacket` (0x0E), `MoveActorAbsolutePacket`, `AddActorPacket`, `SetEntityData`,
+En curso: `RemoveActorPacket` (0x0E) y `MoveActorAbsolutePacket` (0x12) ya están en
+`bedrock-protocol` con tests de ida y vuelta. Faltan `AddPlayerPacket` (0x0C),
+`PlayerListPacket` (0x3F) —que arrastra el serializador de skins—, `AddActorPacket`,
+`SetEntityData`,
 `UpdateAttributes` (0x1D).
 
 1. `entity.rs`: `Entity`, `Living`, `Human`, `Player` con runtime ID, posición, skin y

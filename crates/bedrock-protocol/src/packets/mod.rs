@@ -26,6 +26,8 @@ pub mod respawn;
 pub mod set_difficulty;
 pub mod set_health;
 pub mod set_title;
+pub mod move_actor_absolute;
+pub mod remove_actor;
 
 pub use network_settings::{NetworkSettingsPacket, RequestNetworkSettingsPacket};
 pub use play_status::PlayStatusPacket;
@@ -61,3 +63,5 @@ pub use respawn::RespawnPacket;
 pub use set_difficulty::SetDifficultyPacket;
 pub use set_health::SetHealthPacket;
 pub use set_title::SetTitlePacket;
+pub use move_actor_absolute::MoveActorAbsolutePacket;
+pub use remove_actor::RemoveActorPacket;
