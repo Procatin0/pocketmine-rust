@@ -7,7 +7,7 @@
 **Estado medido:** 33 de los 41 comandos de PM portados, 29 de 248 paquetes, permisos y
 `/gamemode` paritarios; entidades, crafteo y persistencia de chunks pendientes
 **Fecha:** 2026-11-06
-**Verificación base:** `cargo check --workspace --all-targets` OK (0 warnings); 64 tests de
+**Verificación base:** `cargo check --workspace --all-targets` OK (0 warnings); 65 tests de
 `server-core` (lib) + 12 (`item_health_commands_test`) + 10 (`session_lifecycle_test`) +
 42 y 11 (`bedrock-protocol`) en verde, ejecutados con `CARGO_TARGET_DIR=target/test-parity`.
 
@@ -74,7 +74,7 @@ Cifras concretas:
 | Comandos de PM pendientes | 10 |
 | Paquetes implementados | 27 de 248 |
 | Nodos de permiso registrados | 46 (+16 reservados de comandos no portados) |
-| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 139 |
+| Tests en verde (workspace `server-core` + `bedrock-protocol`) | 140 |
 
 El servidor es un **superconjunto**: lo que existe en PM existe aquí con el mismo
 comportamiento, y además hay comandos propios de Bedrock y una extensión de TPS (§4).
@@ -135,7 +135,7 @@ constructor PHP; los mensajes son claves de `spa.ini`.
 | Comando | Deuda concreta | Referencia |
 |---|---|---|
 | `ban` / `ban-ip` | Formato de almacenamiento propio (`banned-players.txt` / `banned-ips.txt` con `entrada\|razón`) en lugar de las listas YAML de PM; no hay `expires` ni `createdBy` tipados | `BanList`, `banned-players.yml` |
-| `clear` | No compara NBT al filtrar por objeto (`Item` + `meta` sólo); el recuento por `maxCount` sí es paritario | `ClearCommand::execute` |
+| `clear` | El filtro replica `Item::equals()` (tipo, daño y tag NBT), así que un stack con tags no se borra con el item sin tags del argumento; los items data-driven siguen fuera del registro | `ClearCommand::execute` |
 | `give` | `[... tags]` se parsea como JSON NBT y viaja en el stack; los textos de error del parser son propios (el paquete `pocketmine/nbt` no está vendorizado) y los items data-driven siguen ausentes | `GiveCommand::execute`, `JsonNbtParser` |
 | `save-all` / `save-on` / `save-off` | Guardan `world.json` y `players/<nombre>.json`, no chunks; `auto-save` ya se persiste en `server.properties` | `SaveCommand`, `ServerProperties::AUTO_SAVE` |
 
@@ -394,6 +394,7 @@ Criterio: CI verde y paridad documentada.
 | 23 | `transferserver` bloqueado | faltaba `TransferPacket` | `TransferPacket` (0x55) y `CommandAction::Transfer`, que cierra la sesión como `NetworkSession::transfer()` | completo |
 | 24 | Textos sin verificación contra el locale | constantes copiadas a mano sin red | `translations::Translator` con `spa.ini` embebido y test constante-por-clave | completo |
 | 25 | `/give [... tags]` rechazaba cualquier etiqueta | no había NBT | `Tag` + `write_network_nbt` (ints/longs varint, shorts LE, strings varuint) y `nbt_json` con la inferencia de `JsonNbtParser`; `CommandAction::Give` transporta el `nbt` al stack | completo |
+| 26 | `/clear` borraba stacks con NBT | el filtro comparaba sólo `Item` + `meta` | `clear_matching` recibe el item completo y compara el tag, como `Item::equals()` | completo |
 
 ### 11.1 `create_session` duplicaba sesiones (resuelto)
 
@@ -416,7 +417,7 @@ devuelto responde por sí mismo.
 
 ```
 cargo check --workspace --all-targets                          → OK (0 warnings)
-cargo test -p server-core --lib                                → 64 OK
+cargo test -p server-core --lib                                → 65 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
 cargo test -p server-core --test session_lifecycle_test        → 10 OK
 cargo test -p bedrock-protocol                                 → 42 + 11 OK

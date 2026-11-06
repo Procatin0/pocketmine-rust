@@ -186,8 +186,12 @@ impl PlayerInventory {
     /// matching items, `-1` removes every one of them and a positive value
     /// removes at most that many across all player windows. Returns
     /// `(amount, counted_only)`.
-    pub fn clear_matching(&mut self, item: Option<(i16, u32)>, max_count: i32) -> (u32, bool) {
-        let Some((network_id, meta)) = item else {
+    ///
+    /// The filter is an item because `Item::equals()` compares the type,
+    /// damage **and** named tag: a stack carrying NBT does not match the tagless
+    /// item `/clear` builds from its argument.
+    pub fn clear_matching(&mut self, item: Option<&ItemStack>, max_count: i32) -> (u32, bool) {
+        let Some(filter) = item else {
             let mut removed = 0;
             for window_id in Self::CLEAR_ORDER {
                 if let Some(slots) = self.window_mut(window_id) {
@@ -208,9 +212,7 @@ impl PlayerInventory {
                 if let Some(slots) = self.window(window_id) {
                     count += slots
                         .iter()
-                        .filter(|slot| {
-                            !slot.is_empty() && slot.network_id == network_id && slot.meta == meta
-                        })
+                        .filter(|slot| Self::matches_filter(slot, filter))
                         .map(|slot| slot.count as u32)
                         .sum::<u32>();
                 }
@@ -232,7 +234,7 @@ impl PlayerInventory {
                 if remaining == 0 {
                     break;
                 }
-                if slot.is_empty() || slot.network_id != network_id || slot.meta != meta {
+                if !Self::matches_filter(slot, filter) {
                     continue;
                 }
                 let take = (slot.count as u32).min(remaining);
@@ -248,6 +250,15 @@ impl PlayerInventory {
             }
         }
         (removed, false)
+    }
+
+    /// `Item::equals($filter)`: same type, damage and named tag; the count is
+    /// irrelevant.
+    fn matches_filter(slot: &ItemStack, filter: &ItemStack) -> bool {
+        !slot.is_empty()
+            && slot.network_id == filter.network_id
+            && slot.meta == filter.meta
+            && slot.nbt == filter.nbt
     }
 
     /// Slots of a window, when the server models it.
@@ -586,17 +597,38 @@ mod tests {
         assert_eq!(item_display_name(1).as_deref(), Some("Stone"));
     }
 
+    /// The tagless item `/clear` builds from its argument.
+    fn filter(network_id: i16, meta: u32) -> ItemStack {
+        let mut stack = ItemStack::new(network_id, 1);
+        stack.meta = meta;
+        stack
+    }
+
+    #[test]
+    fn clear_skips_stacks_whose_named_tag_differs() {
+        let mut inventory = PlayerInventory::new();
+        let mut tagged = ItemStack::new(1, 4);
+        tagged.nbt = vec![10, 0, 0];
+        inventory.add_item(&tagged);
+        inventory.add_item(&ItemStack::new(1, 3));
+
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 0), (3, true));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (3, false));
+        // Only the tagged stack is left, and clearing everything removes it.
+        assert_eq!(inventory.clear_matching(None, -1), (4, false));
+    }
+
     #[test]
     fn clear_matching_follows_the_vanilla_rules() {
         let mut inventory = PlayerInventory::new();
         inventory.add_item(&ItemStack::new(1, 10));
         inventory.add_item(&ItemStack::new(1, 6));
 
-        assert_eq!(inventory.clear_matching(Some((1, 0)), 0), (16, true));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 0), (16, true));
         assert_eq!(inventory.total_items(), 16);
-        assert_eq!(inventory.clear_matching(Some((1, 0)), 5), (5, false));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 5), (5, false));
         assert_eq!(inventory.total_items(), 11);
-        assert_eq!(inventory.clear_matching(Some((1, 0)), -1), (11, false));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (11, false));
         assert!(inventory.is_empty());
     }
 
@@ -609,16 +641,16 @@ mod tests {
         inventory.set_window_slot(WINDOW_ID_CURSOR, 0, ItemStack::new(1, 1));
 
         // Counting mode sees every window.
-        assert_eq!(inventory.clear_matching(Some((1, 0)), 0), (8, true));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 0), (8, true));
 
         // The limit is shared, in vanilla order: main inventory first, then
         // cursor, then armor and offhand.
-        assert_eq!(inventory.clear_matching(Some((1, 0)), 5), (5, false));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 5), (5, false));
         assert_eq!(inventory.total_items(), 0);
         assert_eq!(inventory.window_slot(WINDOW_ID_ARMOR, 0).unwrap().count, 2);
         assert_eq!(inventory.window_slot(WINDOW_ID_OFFHAND, 0).unwrap().count, 1);
 
-        assert_eq!(inventory.clear_matching(Some((1, 0)), -1), (3, false));
+        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (3, false));
         assert!(inventory
             .window(WINDOW_ID_ARMOR)
             .unwrap()

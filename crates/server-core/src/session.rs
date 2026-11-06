@@ -2913,8 +2913,15 @@ impl SessionManager {
                         let Some(session) = map.get_mut(&session_id) else {
                             continue;
                         };
+                        // `ClearCommand` filters with the tagless item parsed
+                        // from its argument, so tagged stacks never match.
+                        let filter = item.map(|(network_id, meta)| {
+                            let mut stack = ItemStack::new(network_id, 1);
+                            stack.meta = meta;
+                            stack
+                        });
                         let (count, counted_only) =
-                            session.inventory.clear_matching(*item, *max_count);
+                            session.inventory.clear_matching(filter.as_ref(), *max_count);
                         if !counted_only && count > 0 {
                             session.sync_inventory();
                         }
