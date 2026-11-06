@@ -133,6 +133,21 @@ impl WeatherState {
     }
 }
 
+/// Title operation requested by `/title`, one per `Player::send*()` call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TitleAction {
+    Clear,
+    Reset,
+    Title(String),
+    Subtitle(String),
+    ActionBar(String),
+    Times {
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+}
+
 /// Side effect requested by a core command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandAction {
@@ -188,6 +203,11 @@ pub enum CommandAction {
         /// `commands.spawnpoint.success`, already filled in.
         message: String,
         notify: String,
+    },
+    /// `/title`: one `SetTitlePacket` for the target.
+    SendTitle {
+        target: String,
+        action: TitleAction,
     },
     SetDefaultGamemode(i32),
     SetDifficulty {
@@ -515,6 +535,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/version",
         description: "Obtén la versión del servidor, incluyendo los plugins que utiliza",
     },
+    CommandInfo {
+        name: "title",
+        aliases: &[],
+        usage: "/title <jugador> <clear|reset|title|subtitle|actionbar|times> ...",
+        description: "Controla títulos en pantalla",
+    },
 ];
 
 /// Parses and evaluates a core command.
@@ -595,6 +621,7 @@ pub fn handle_command(
         "save-off" => Some(set_auto_save(source, false)),
         "tps" => Some(tps(source)),
         "time" => Some(time(source, &args)),
+        "title" => Some(title(source, players, &args)),
         "weather" => Some(weather(source, &args)),
         "op" => Some(set_op(&args, true)),
         "deop" => Some(set_op(&args, false)),
@@ -1174,6 +1201,7 @@ pub mod lang {
     pub const TIME_SET: &str = "Establecer el tiempo a {%0}";
     pub const TIME_ADDED: &str = "{%0} añadido a la hora";
     pub const TIME_QUERY: &str = "El Tiempo es {%0}";
+    pub const TITLE_SUCCESS: &str = "El comando title se ejecutó correctamente";
     pub const VERSION_SOFTWARE_NAME: &str = "Este servidor está ejecutando {%serverSoftwareName}";
     pub const VERSION_SOFTWARE_VERSION: &str =
         "Versión del servidor: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
@@ -1818,6 +1846,84 @@ fn spawnpoint(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -
     }
 }
 
+/// `/title <player> <clear|reset|title|subtitle|actionbar|times> ...`, ported
+/// one to one from `pocketmine\command\defaults\TitleCommand`.
+fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.len() < 2 {
+        return usage("title");
+    }
+
+    let target = match fetch_permitted_player_target(
+        source,
+        players,
+        Some(args[0]),
+        "title",
+        source.can(crate::permission::COMMAND_TITLE_SELF),
+        source.can(crate::permission::COMMAND_TITLE_OTHER),
+    ) {
+        Ok(Some(player)) => player.name.clone(),
+        Ok(None) => source.name.clone(),
+        Err(output) => return output,
+    };
+
+    let action = match args[1] {
+        "clear" => TitleAction::Clear,
+        "reset" => TitleAction::Reset,
+        "title" | "subtitle" | "actionbar" => {
+            if args.len() < 3 {
+                return usage("title");
+            }
+            let text = args[2..].join(" ");
+            match args[1] {
+                "title" => TitleAction::Title(text),
+                "subtitle" => TitleAction::Subtitle(text),
+                _ => TitleAction::ActionBar(text),
+            }
+        }
+        "times" => {
+            if args.len() < 5 {
+                return usage("title");
+            }
+            let mut times = [0i32; 3];
+            for (index, slot) in times.iter_mut().enumerate() {
+                let value = args[2 + index];
+                match bounded_int(value, i32::MIN as i64, i32::MAX as i64) {
+                    Ok(parsed) => *slot = parsed as i32,
+                    Err(BoundedIntError::Syntax) => return usage("title"),
+                    Err(BoundedIntError::TooBig) => {
+                        return error(red(fill_template(
+                            lang::NUM_TOO_BIG,
+                            &[value, &i32::MAX.to_string()],
+                        )));
+                    }
+                    Err(BoundedIntError::TooSmall) => {
+                        return error(red(fill_template(
+                            lang::NUM_TOO_SMALL,
+                            &[value, &i32::MIN.to_string()],
+                        )));
+                    }
+                }
+            }
+            // `Player::setTitleDuration()` ignores negative durations, but the
+            // command still reports success.
+            if times.iter().any(|value| *value < 0) {
+                return feedback(lang::TITLE_SUCCESS.to_string());
+            }
+            TitleAction::Times {
+                fade_in: times[0],
+                stay: times[1],
+                fade_out: times[2],
+            }
+        }
+        _ => return usage("title"),
+    };
+
+    CommandOutput {
+        feedback: vec![lang::TITLE_SUCCESS.to_string()],
+        actions: vec![CommandAction::SendTitle { target, action }],
+    }
+}
+
 /// `/defaultgamemode <mode>`, ported from
 /// `pocketmine\command\defaults\DefaultGamemodeCommand`.
 fn defaultgamemode(source: &CommandSource, args: &[&str]) -> CommandOutput {
@@ -1898,6 +2004,7 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "clear" => Some(&[COMMAND_CLEAR_SELF, COMMAND_CLEAR_OTHER]),
         "kill" | "suicide" => Some(&[COMMAND_KILL_SELF, COMMAND_KILL_OTHER]),
         "spawnpoint" => Some(&[COMMAND_SPAWNPOINT_SELF, COMMAND_SPAWNPOINT_OTHER]),
+        "title" => Some(&[COMMAND_TITLE_SELF, COMMAND_TITLE_OTHER]),
         "defaultgamemode" => Some(&[COMMAND_DEFAULTGAMEMODE]),
         "difficulty" => Some(&[COMMAND_DIFFICULTY]),
         "seed" => Some(&[COMMAND_SEED]),
@@ -3127,6 +3234,73 @@ mod tests {
             output.feedback,
             vec!["Hay 0/1000 jugadores en línea:".to_string(), String::new()]
         );
+    }
+
+    #[test]
+    fn title_builds_the_same_packets_as_pocketmine() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        let output =
+            handle_command("/title Alex title Hola mundo", &source, &players()).expect("native");
+        assert_eq!(output.feedback, vec![lang::TITLE_SUCCESS.to_string()]);
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::SendTitle {
+                target: "Alex".to_string(),
+                action: TitleAction::Title("Hola mundo".to_string()),
+            }]
+        );
+
+        for (input, expected) in [
+            ("/title Alex clear", TitleAction::Clear),
+            ("/title Alex reset", TitleAction::Reset),
+            (
+                "/title Alex subtitle Hola",
+                TitleAction::Subtitle("Hola".to_string()),
+            ),
+            (
+                "/title Alex actionbar Eco",
+                TitleAction::ActionBar("Eco".to_string()),
+            ),
+            (
+                "/title Alex times 10 20 30",
+                TitleAction::Times {
+                    fade_in: 10,
+                    stay: 20,
+                    fade_out: 30,
+                },
+            ),
+        ] {
+            let output = handle_command(input, &source, &players()).expect("native");
+            assert_eq!(
+                output.actions,
+                vec![CommandAction::SendTitle {
+                    target: "Alex".to_string(),
+                    action: expected,
+                }],
+                "{input}"
+            );
+        }
+
+        // Negative durations are ignored by `setTitleDuration()`.
+        let output =
+            handle_command("/title Alex times -1 20 30", &source, &players()).expect("native");
+        assert!(output.actions.is_empty());
+        assert_eq!(output.feedback, vec![lang::TITLE_SUCCESS.to_string()]);
+
+        let usage_line =
+            "§cUso: /title <jugador> <clear|reset|title|subtitle|actionbar|times> ...";
+        for input in [
+            "/title Alex",
+            "/title Alex actionbar",
+            "/title Alex nope",
+            "/title Alex times 1 2",
+            "/title Alex times 1 2 muchas",
+        ] {
+            let output = handle_command(input, &source, &players()).expect("native");
+            assert_eq!(output.feedback, vec![usage_line.to_string()], "{input}");
+            assert!(output.actions.is_empty(), "{input}");
+        }
     }
 
     #[test]

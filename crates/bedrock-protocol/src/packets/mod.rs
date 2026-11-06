@@ -25,6 +25,7 @@ pub mod item_stack;
 pub mod respawn;
 pub mod set_difficulty;
 pub mod set_health;
+pub mod set_title;
 
 pub use network_settings::{NetworkSettingsPacket, RequestNetworkSettingsPacket};
 pub use play_status::PlayStatusPacket;
@@ -59,3 +60,4 @@ pub use item_stack::ItemStack;
 pub use respawn::RespawnPacket;
 pub use set_difficulty::SetDifficultyPacket;
 pub use set_health::SetHealthPacket;
+pub use set_title::SetTitlePacket;

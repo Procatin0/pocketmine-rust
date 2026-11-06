@@ -12,7 +12,8 @@ use bedrock_protocol::{
     RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
     ResourcePacksInfoPacket, SetPlayerGameTypePacket, SetSpawnPositionPacket, StartGamePacket,
     ActorEventPacket, InventoryContentPacket, InventorySlotPacket, InventoryTransactionPacket,
-    ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket, TextPacket, TransactionData,
+    ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket, SetTitlePacket, TextPacket,
+    TransactionData,
     UpdateAbilitiesPacket, UpdatePlayerGameTypePacket, Vector3f,
 };
 use bedrock_protocol::packets::actor_event::EVENT_DEATH_ANIMATION;
@@ -31,7 +32,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::command::{
-    CommandAction, CommandSource, OnlinePlayer, WeatherState, DEFAULT_WEATHER_TICKS,
+    CommandAction, CommandSource, OnlinePlayer, TitleAction, WeatherState, DEFAULT_WEATHER_TICKS,
 };
 use crate::identity::parse_login_identity;
 use crate::inventory::{
@@ -86,6 +87,7 @@ pub enum OutgoingPacket {
     UpdatePlayerGameType(UpdatePlayerGameTypePacket),
     UpdateAbilities(UpdateAbilitiesPacket),
     Text(TextPacket),
+    SetTitle(SetTitlePacket),
     RawWire(Vec<u8>),
 }
 
@@ -106,6 +108,7 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.packet_id(),
             Self::UpdateAbilities(p) => p.packet_id(),
             Self::Text(p) => p.packet_id(),
+            Self::SetTitle(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
                 reader.read_var_u32().unwrap_or(0) & 0x3FF
@@ -129,6 +132,7 @@ impl OutgoingPacket {
             Self::UpdatePlayerGameType(p) => p.encode(writer),
             Self::UpdateAbilities(p) => p.encode(writer),
             Self::Text(p) => p.encode(writer),
+            Self::SetTitle(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
                 Ok(())
@@ -2774,6 +2778,23 @@ impl SessionManager {
                         }),
                     );
                     info!("Kicked {}: {}", target, crate::logging::to_ansi(reason));
+                }
+                CommandAction::SendTitle { target, action } => {
+                    let packet = match action {
+                        TitleAction::Clear => SetTitlePacket::clear_title(),
+                        TitleAction::Reset => SetTitlePacket::reset_title_options(),
+                        TitleAction::Title(text) => SetTitlePacket::title(text.clone()),
+                        TitleAction::Subtitle(text) => SetTitlePacket::subtitle(text.clone()),
+                        TitleAction::ActionBar(text) => {
+                            SetTitlePacket::action_bar_message(text.clone())
+                        }
+                        TitleAction::Times {
+                            fade_in,
+                            stay,
+                            fade_out,
+                        } => SetTitlePacket::set_animation_times(*fade_in, *stay, *fade_out),
+                    };
+                    self.queue_packet(target, OutgoingPacket::SetTitle(packet));
                 }
                 CommandAction::SetTime(ticks) => {
                     let time = self.world.set_time(*ticks);
