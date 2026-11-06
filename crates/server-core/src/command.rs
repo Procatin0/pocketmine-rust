@@ -1234,20 +1234,12 @@ pub mod lang {
 
 /// Replaces `{%0}`, `{%1}`, ... in a vanilla translation string.
 pub(crate) fn fill_template(template: &str, args: &[&str]) -> String {
-    let mut out = template.to_string();
-    for (index, value) in args.iter().enumerate() {
-        out = out.replace(&format!("{{%{}}}", index), value);
-    }
-    out
+    crate::translations::fill_template(template, args)
 }
 
 /// Replaces named placeholders such as `{%commandName}` in a translation.
 pub(crate) fn fill_named(template: &str, args: &[(&str, &str)]) -> String {
-    let mut out = template.to_string();
-    for (key, value) in args {
-        out = out.replace(&format!("{{%{}}}", key), value);
-    }
-    out
+    crate::translations::fill_named(template, args)
 }
 
 /// Vanilla prefixes error output with red.

@@ -11,6 +11,7 @@ pub mod permission;
 pub mod plugin_host;
 pub mod session;
 pub mod static_packets;
+pub mod translations;
 pub mod world_state;
 
 pub use config::ServerConfig;

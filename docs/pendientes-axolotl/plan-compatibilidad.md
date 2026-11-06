@@ -392,6 +392,7 @@ Criterio: CI verde y paridad documentada.
 | 21 | Comando desconocido en inglés y consola fuera de la difusión administrativa | texto propio en `session.rs` y `tracing::warn` en la consola | `command::not_found_message` (`pocketmine.command.notFound`) y `chat.type.admin` registrado por la consola | completo |
 | 22 | `/title` y su paquete no existían | comando pendiente de la fase 2 | `SetTitlePacket` (0x58) con varints con signo, `TitleAction` y `CommandAction::SendTitle` | completo |
 | 23 | `transferserver` bloqueado | faltaba `TransferPacket` | `TransferPacket` (0x55) y `CommandAction::Transfer`, que cierra la sesión como `NetworkSession::transfer()` | completo |
+| 24 | Textos sin verificación contra el locale | constantes copiadas a mano sin red | `translations::Translator` con `spa.ini` embebido y test constante-por-clave | completo |
 
 ### 11.1 `create_session` duplica sesiones (confirmado)
 
@@ -406,7 +407,7 @@ guardando `Arc<RwLock<PlayerSession>>` en el mapa en vez de `PlayerSession`).
 
 ```
 cargo check --workspace --all-targets                          → OK (0 warnings)
-cargo test -p server-core --lib                                → 56 OK
+cargo test -p server-core --lib                                → 59 OK
 cargo test -p server-core --test item_health_commands_test     → 12 OK
 cargo test -p server-core --test session_lifecycle_test        → 9 OK
 cargo test -p bedrock-protocol                                 → 38 + 11 OK
@@ -426,7 +427,9 @@ cargo test -p bedrock-protocol                                 → 38 + 11 OK
    `pocketmine.command.version.*`.
 5. ✅ ~~`/list` con `commands.players.list`~~: `max_players` viaja en `CommandSource`
    (`max-players` de `server.properties`) y los nombres van en una segunda línea.
-6. **Motor de traducciones** desde `spa.ini` + test constante-por-clave (§6).
+6. ✅ ~~Motor de traducciones desde `spa.ini` + test constante-por-clave~~:
+   `resources/spa.ini` embebido, `translations::Translator` con parámetros posicionales
+   y nombrados, y test que compara 25 constantes con el locale (§6).
 7. ✅ ~~`/help` con paginación y filtrado por permisos~~: `commands.help.header`,
    `pocketmine.command.help.specificCommand.*` y `pocketmine.command.notFound`, con
    7 líneas por página (la consola no pagina) y gate `testPermissionSilent` en el listado.

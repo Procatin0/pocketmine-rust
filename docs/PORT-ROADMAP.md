@@ -136,7 +136,7 @@ php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 | `crafting/` | 25 | — | 🔴 sin empezar |
 | `form/` | 2 | — | 🔴 sin empezar |
 | `resourcepacks/` | 9 | `resource_packs.rs` | 🟡 handshake básico |
-| `lang/` (traducciones) | 3 + .ini | copiadas a mano en `command.rs` | 🟡 sólo las claves usadas |
+| `lang/` (traducciones) | 3 + .ini | `translations.rs` + `resources/spa.ini` | 🟡 locale embebido y 25 constantes verificadas; migración completa pendiente |
 | `utils/`, `console/`, `timings/`, `crash/`, `wizard/`, `data/` | 240 | disperso | 🔴 mínimo |
 
 ---
