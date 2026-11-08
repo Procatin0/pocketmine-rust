@@ -7,6 +7,7 @@ members = [
     "crates/bedrock-world",
     "crates/server-core",
     "crates/php-plugin-bridge",
+    "crates/java-bridge",
 ]
 
 [workspace.dependencies]
