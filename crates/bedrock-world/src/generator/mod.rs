@@ -36,6 +36,16 @@ pub trait WorldGenerator: Send + Sync {
     /// Returns `(sub_chunk_count, payload_bytes)`.
     fn generate_chunk(&self, chunk_x: i32, chunk_z: i32) -> (u32, Vec<u8>);
 
+    /// Builds the in-memory [`Chunk`](crate::chunk::Chunk) for a column,
+    /// without edits. Used by the Java bridge to frame `ModernChunk` /
+    /// `ChunkBuilder` payloads; the default is an empty plains column and
+    /// concrete generators override it (the per-block `block_at` for
+    /// `NormalGenerator` regenerates this column internally, so the
+    /// Java path must not go through `block_at` per voxel).
+    fn generate_chunk_object(&self, _chunk_x: i32, _chunk_z: i32) -> crate::chunk::Chunk {
+        crate::chunk::Chunk::new(1)
+    }
+
     /// Returns the network block id at absolute world coordinates.
     ///
     /// The default returns air because the trait has no access to a chunk store.

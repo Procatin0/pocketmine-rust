@@ -80,10 +80,15 @@ mod tests {
         )
         .expect("valid JSON NBT");
 
-        // `serde_json` keeps object keys sorted, so `Damage` and `Unbreakable`
-        // come before `display`; compound order carries no meaning in NBT.
+        // Compound order carries no meaning in NBT, and `serde_json` may
+        // keep input order (`preserve_order`, enabled workspace-wide by
+        // `java-protocol`) or sorted keys: compare by key.
+        let Tag::Compound(mut entries) = tag else {
+            panic!("root must be a compound");
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
-            tag,
+            Tag::Compound(entries),
             Tag::Compound(vec![
                 ("Damage".to_string(), Tag::Int(3)),
                 ("Unbreakable".to_string(), Tag::Byte(1)),

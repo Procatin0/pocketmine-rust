@@ -2132,6 +2132,8 @@ dependencies = [
  "bedrock-protocol",
  "bedrock-world",
  "bytes",
+ "java-bridge",
+ "java-protocol",
  "nethernet-rs",
  "parking_lot",
  "php-plugin-bridge",

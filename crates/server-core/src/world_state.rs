@@ -462,6 +462,22 @@ impl WorldState {
         self.edits.read().len()
     }
 
+    /// In-memory [`Chunk`](bedrock_world::chunk::Chunk) for a column,
+    /// base terrain from the generator plus every persistent edit in
+    /// the column. Used by the native Java bridge to frame
+    /// `ModernChunk` / `ChunkBuilder` payloads without going through
+    /// per-block `block_at` (which for the default generator
+    /// regenerates the column per voxel).
+    pub fn get_chunk(&self, chunk_x: i32, chunk_z: i32) -> bedrock_world::chunk::Chunk {
+        let mut chunk = self.generator.generate_chunk_object(chunk_x, chunk_z);
+        if let Some(edits) = self.edits.read().get(&(chunk_x, chunk_z)) {
+            for ((x, y, z), id) in edits.iter() {
+                chunk.set_block((*x & 15) as usize, *y, (*z & 15) as usize, *id);
+            }
+        }
+        chunk
+    }
+
     /// Writes the world snapshot (`world.json`, format v2): time, weather,
     /// difficulty, spawn, seed, `auto_save`/`time_running` and every block
     /// edit.

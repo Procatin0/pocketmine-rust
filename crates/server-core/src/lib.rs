@@ -8,6 +8,7 @@ pub mod config;
 pub mod crash;
 pub mod identity;
 pub mod inventory;
+pub mod java_hooks;
 pub mod java_sync;
 pub mod logging;
 pub mod metrics;

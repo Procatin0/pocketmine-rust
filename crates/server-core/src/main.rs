@@ -280,6 +280,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Native Java Edition listener (`java-bridge`): the `plugins/JavaBridge`
+    // PHP plugin is retired; Tokio serves `JavaServer` on TCP 25565 with
+    // the core as its `ServerHooks` (`server_core::java_hooks::CoreHooks`).
+    {
+        let hooks: Arc<dyn java_bridge::ServerHooks> = Arc::new(
+            server_core::java_hooks::CoreHooks::new(
+                Arc::clone(&session_manager),
+                config.motd.clone(),
+                config.view_distance,
+                config.gamemode,
+                config.level_type.clone(),
+            ),
+        );
+        let java_server = Arc::new(java_bridge::JavaServer::new(hooks));
+        info!("Java Edition listener starting on 0.0.0.0:25565 (java-bridge, native Rust)");
+        tokio::spawn(async move {
+            java_server.run_arc("0.0.0.0:25565").await;
+        });
+    }
+
     // `Server::__construct`: `configGroup->save()` (silent), default gamemode.
     info!(
         "{}",

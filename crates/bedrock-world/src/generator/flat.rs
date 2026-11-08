@@ -71,6 +71,10 @@ impl WorldGenerator for FlatGenerator {
         (self.cached_subchunk_count, self.cached_payload.clone())
     }
 
+    fn generate_chunk_object(&self, _chunk_x: i32, _chunk_z: i32) -> Chunk {
+        self.base_chunk.clone()
+    }
+
     /// Analytic flat terrain query. `x` and `z` do not affect the result.
     fn block_at(&self, _x: i32, y: i32, _z: i32) -> u32 {
         match y {

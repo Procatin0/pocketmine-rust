@@ -9,6 +9,12 @@ nethernet-rs = { path = "../nethernet-rs" }
 raklib-rs = { path = "../raklib-rs" }
 bedrock-world = { path = "../bedrock-world" }
 php-plugin-bridge = { path = "../php-plugin-bridge" }
+# Native Java Edition bridge: the Tokio listener formerly owned by the
+# `plugins/JavaBridge` PHP plugin now lives in `java-bridge` (`JavaServer`)
+# and is started from `main.rs`. `java-protocol` carries the shared
+# Protocol/NBT/ModernProfile tables the bridge frames against.
+java-bridge = { path = "../java-bridge" }
+java-protocol = { path = "../java-protocol" }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

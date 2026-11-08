@@ -308,6 +308,10 @@ impl WorldGenerator for NormalGenerator {
         chunk.serialize_network_payload(dominant_biome)
     }
 
+    fn generate_chunk_object(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
+        self.generate_chunk_internal(chunk_x, chunk_z)
+    }
+
     /// Returns the block id at absolute world coordinates.
     ///
     /// **Expensive:** this regenerates the target chunk (and its 3x3
