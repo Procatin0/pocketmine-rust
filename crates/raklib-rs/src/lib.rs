@@ -6,10 +6,10 @@ pub use offline::*;
 
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tracing::{info, warn};
+use tracing::debug;
 
 pub const RAKNET_PROTOCOL_VERSION: u8 = 11;
 pub const OFFLINE_MESSAGE_DATA_ID: [u8; 16] = [
@@ -37,17 +37,24 @@ pub struct RakNetListener {
     socket: UdpSocket,
     pub server_id: u64,
     motd: RwLock<String>,
+    /// `Network::registerRawPacketHandler`: e.g. GS4 Query (`0xFE 0xFD`).
+    /// Runs on the RakNet socket so Query shares the RakLib port like PM.
+    raw_handler: RwLock<Option<Arc<dyn Fn(SocketAddr, &[u8]) -> Option<Vec<u8>> + Send + Sync>>>,
 }
 
 impl RakNetListener {
     pub async fn bind(addr: SocketAddr, server_id: u64) -> std::io::Result<Self> {
+        // `RakLibInterface::start()` debug pair.
+        debug!("Waiting for RakLib to start...");
         let socket = UdpSocket::bind(addr).await?;
-        info!("RakNet listener bound to {}", addr);
+        debug!("RakNet listener bound to {}", addr);
+        debug!("RakLib booted successfully");
         let motd = format_bedrock_motd(server_id);
         Ok(Self {
             socket,
             server_id,
             motd: RwLock::new(motd),
+            raw_handler: RwLock::new(None),
         })
     }
 
@@ -65,6 +72,17 @@ impl RakNetListener {
 
     pub fn set_motd(&self, motd: impl Into<String>) {
         *self.motd.write().unwrap() = motd.into();
+    }
+
+    /// Registers a raw-packet handler (`Network::registerRawPacketHandler`).
+    /// The handler returns `Some(response)` to answer (GS4 Query handshake /
+    /// statistics reply on the same socket) or `None` to leave the packet
+    /// to normal RakNet processing.
+    pub fn set_raw_handler(
+        &self,
+        handler: Arc<dyn Fn(SocketAddr, &[u8]) -> Option<Vec<u8>> + Send + Sync>,
+    ) {
+        *self.raw_handler.write().unwrap() = Some(handler);
     }
 
     /// Pure offline packet processor that produces an offline response packet when applicable.
@@ -128,7 +146,7 @@ impl RakNetListener {
             // 1. Check for WebRTC ICE STUN Binding Request (RFC 5389 / RFC 8489)
             // Starts with 0x00 0x01, Magic Cookie 0x21 0x12 0xA4 0x42 at bytes 4..8
             if len >= 20 && buf[0] == 0x00 && buf[1] == 0x01 && &buf[4..8] == [0x21, 0x12, 0xA4, 0x42] {
-                info!("Received WebRTC ICE STUN Binding Request from {} ({} bytes)", src, len);
+                debug!("Received WebRTC ICE STUN Binding Request from {} ({} bytes)", src, len);
                 let mut resp = Vec::with_capacity(32);
                 resp.extend_from_slice(&[0x01, 0x01]); // Binding Success Response
                 resp.extend_from_slice(&0x000Cu16.to_be_bytes()); // Message Length: 12 bytes
@@ -153,10 +171,26 @@ impl RakNetListener {
                 ];
                 resp.extend_from_slice(&xor_ip);
                 if let Err(e) = self.socket.send_to(&resp, src).await {
-                    warn!("Failed to send STUN response to {}: {}", src, e);
+                    debug!("Failed to send STUN response to {}: {}", src, e);
                 } else {
-                    info!("Responded with WebRTC STUN Binding Success Response to {}", src);
+                    debug!("Responded with WebRTC STUN Binding Success Response to {}", src);
                 }
+                continue;
+            }
+
+            // 1b. GS4 Query (UT3): `0xFE 0xFD` — intercepted like PM's
+            // `QueryHandler` raw-packet handler on the RakLib socket.
+            if len >= 2 && buf[0] == 0xFE && buf[1] == 0xFD {
+                let handler = self.raw_handler.read().unwrap().clone();
+                if let Some(handler) = handler {
+                    if let Some(response) = handler(src, &buf[..len]) {
+                        if let Err(e) = self.socket.send_to(&response, src).await {
+                            debug!("Failed to send Query reply to {}: {}", src, e);
+                        }
+                    }
+                    continue;
+                }
+                debug!("GS4 Query datagram from {} with no handler registered", src);
                 continue;
             }
 
@@ -177,7 +211,7 @@ impl RakNetListener {
                     });
                 }
                 Err(e) => {
-                    info!("UDP datagram from {}: len={} header=[{:02X?}], err: {}", src, len, &buf[..len.min(16)], e);
+                    debug!("UDP datagram from {}: len={} header=[{:02X?}], err: {}", src, len, &buf[..len.min(16)], e);
                     continue;
                 }
             }

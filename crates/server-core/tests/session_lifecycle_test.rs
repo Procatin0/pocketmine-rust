@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 
 use bedrock_protocol::{
-    LoginPacket, Packet, PlayStatusPacket, PlayerAuthInputPacket, RequestChunkRadiusPacket,
-    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, TextPacket, Vector3f, Writer,
+    LoginPacket, MovePlayerPacket, MovePlayerTeleportData, Packet, PlayStatusPacket,
+    PlayerAuthInputPacket, Reader, RequestChunkRadiusPacket, RequestNetworkSettingsPacket,
+    ResourcePackClientResponsePacket, TextPacket, Vector3f, Writer,
 };
 use server_core::command::{CommandAction, WeatherState};
 use server_core::{OutgoingPacket, PlayerSession, SessionManager, SessionState};
@@ -89,9 +90,30 @@ fn test_session_full_login_lifecycle() {
         .handle_packet(0x08, &writer.into_bytes())
         .expect("handle 0x08 COMPLETED should succeed");
 
-    assert_eq!(session.state, SessionState::InGame);
+    assert_eq!(session.state, SessionState::PreSpawn);
     assert!(session.is_in_game());
     assert!(responses.len() >= 3);
+    // PLAYER_SPAWN is NOT sent until the client confirms init.
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
+        "PLAYER_SPAWN must wait for 0x71"
+    );
+
+    // Client sends SetLocalPlayerAsInitializedPacket (0x71) with runtime id.
+    let mut writer = Writer::new();
+    writer.write_var_u64(42);
+    let spawn_responses = session
+        .handle_packet(0x71, &writer.into_bytes())
+        .expect("handle 0x71 should succeed");
+    assert_eq!(session.state, SessionState::InGame);
+    assert!(session.is_spawned());
+    let play_status = spawn_responses.iter().find_map(|r| match r {
+        OutgoingPacket::PlayStatus(p) => Some(p),
+        _ => None,
+    }).expect("Expected PLAYER_SPAWN after 0x71");
+    assert_eq!(play_status.status, PlayStatusPacket::PLAYER_SPAWN);
 
     // Verify StartGamePacket is present
     let start_game = responses.iter().find_map(|r| match r {
@@ -106,7 +128,7 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(start_game.actor_unique_id, session.entity_unique_id);
     assert_eq!(start_game.actor_runtime_id, 42);
     assert_eq!(start_game.player_gamemode, 0);
-    assert_eq!(start_game.world_name, "PocketMine-Rust World");
+    assert_eq!(start_game.world_name, "Axolotl-PM World");
 
     // Verify spawn LevelChunkPacket is present
     let chunk = responses.iter().find_map(|r| match r {
@@ -118,8 +140,8 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(chunk.sub_chunk_count, 5);
     assert!(!chunk.payload.is_empty());
 
-    // Verify PlayStatusPacket (PLAYER_SPAWN) is present
-    let play_status = responses.iter().find_map(|r| match r {
+    // Verify PlayStatusPacket (PLAYER_SPAWN) is present (after 0x71).
+    let play_status = spawn_responses.iter().find_map(|r| match r {
         OutgoingPacket::PlayStatus(p) => Some(p),
         _ => None,
     }).expect("Expected PlayStatusPacket in responses");
@@ -174,7 +196,8 @@ fn test_session_full_login_lifecycle() {
         .handle_packet(0x90, &writer.into_bytes())
         .expect("handle 0x90 should succeed");
 
-    assert_eq!(session.position, Vector3f::new(320.0, 65.0, 0.0));
+    // Client position is the eye; server stores the feet (eye - 1.62).
+    assert_eq!(session.position, Vector3f::new(320.0, 65.0 - 1.62, 0.0));
     assert_eq!(session.pitch, 10.0);
     assert_eq!(session.yaw, 90.0);
     assert!(!move_responses.is_empty());
@@ -241,7 +264,10 @@ fn test_auth_input_with_unparsable_tail_still_moves() {
         ResourcePackClientResponsePacket::STATUS_COMPLETED,
         Vec::new(),
     )).unwrap();
+    // Client confirms init before movement is accepted.
+    session.handle_set_local_player_as_initialized().unwrap();
     assert!(session.is_in_game());
+    assert!(session.is_spawned());
     session.chunk_radius = 2;
 
     // 1. Random garbage tail: movement must work exactly as without a tail.
@@ -251,7 +277,7 @@ fn test_auth_input_with_unparsable_tail_still_moves() {
     garbage.input_data = vec![0xFF, 0x00, 0x13, 0x77, 0x42, 0x80, 0x80, 0x80];
     let responses = session.handle_player_auth_input(garbage).unwrap();
     assert!(responses.is_empty());
-    assert_eq!(session.position, Vector3f::new(2.0, 65.0, 2.0));
+    assert_eq!(session.position, Vector3f::new(2.0, 65.0 - 1.62, 2.0));
     assert!(session.pending_actions.is_empty());
 
     // 2. Well-formed legacy START_BREAK tail at (0, 65, 0) face 1, but with
@@ -274,7 +300,7 @@ fn test_auth_input_with_unparsable_tail_still_moves() {
     ];
     let responses = session.handle_player_auth_input(with_tail).unwrap();
     assert!(responses.is_empty());
-    assert_eq!(session.position, Vector3f::new(3.0, 65.0, 3.0));
+    assert_eq!(session.position, Vector3f::new(3.0, 65.0 - 1.62, 3.0));
     assert!(session.pending_actions.is_empty());
 }
 
@@ -318,6 +344,87 @@ fn test_player_tp_command_queues_a_teleport() {
         .handle_text(TextPacket::raw("/definitely_not_a_command"))
         .expect("handle unknown command");
     assert_eq!(responses.len(), 1);
+}
+
+#[test]
+fn test_tp_to_0_100_0_sends_a_byte_exact_move_player_packet() {
+    // Regression test for the Bedrock `/tp` disconnect
+    // (`CLIENT PACKET VIOLATION packet_id=0x12 ... read() incomplete`):
+    // the teleport used to go out as 0x12 (MoveActorAbsolute) with a
+    // MovePlayer payload, missing the telemetry optional bool and writing
+    // the teleport source as a VarInt instead of u32 LE.
+    let addr: SocketAddr = "127.0.0.1:54333".parse().unwrap();
+    let mut session = PlayerSession::new(63, addr);
+    session.username = "Steve".to_string();
+    session.state = SessionState::InGame;
+
+    session.teleport(0.0, 100.0, 0.0, None, None);
+
+    assert_eq!(session.position, Vector3f::new(0.0, 100.0, 0.0));
+    assert!(session.force_move_sync);
+    assert_eq!(session.pending_outgoing.len(), 1);
+    assert_eq!(session.pending_outgoing[0].packet_id(), 0x13);
+
+    let OutgoingPacket::RawWire(bytes) = &session.pending_outgoing[0] else {
+        panic!("teleport must queue raw wire bytes");
+    };
+    let mut reader = Reader::new(bytes);
+    assert_eq!(reader.read_var_u32().unwrap(), 0x13);
+    let packet = MovePlayerPacket::decode(&mut reader).expect("decode MovePlayer");
+    assert_eq!(reader.remaining(), 0, "no trailing bytes");
+    assert_eq!(packet.actor_runtime_id, 63);
+    // Eye position, like PocketMine's syncMovement (feet + 1.62).
+    assert_eq!(packet.position, Vector3f::new(0.0, 101.62, 0.0));
+    assert_eq!(packet.mode, MovePlayerPacket::MODE_TELEPORT);
+    assert!(packet.on_ground);
+    assert_eq!(packet.riding_actor_runtime_id, 0);
+    assert_eq!(
+        packet.telemetry_data,
+        Some(MovePlayerTeleportData::new(0, 0))
+    );
+    assert_eq!(packet.tick, 0);
+    // 1 header + 1 actor + 12 position + 12 rotation + 1 mode + 1 onGround
+    // + 1 riding + 1 optional + 8 telemetry + 1 tick.
+    assert_eq!(bytes.len(), 39);
+
+    // forceMoveSync: a client input that has not reached the destination
+    // yet must not move the server position, and the corrective re-send
+    // must be the same well-formed 0x13 packet (not 0x12).
+    let stale = PlayerAuthInputPacket::new(
+        0.0,
+        0.0,
+        Vector3f::new(32.0, 66.62, 32.0),
+        0.0,
+        0.0,
+        0.0,
+    );
+    let responses = session.handle_player_auth_input(stale).unwrap();
+    assert!(responses.is_empty());
+    assert_eq!(session.position, Vector3f::new(0.0, 100.0, 0.0));
+    assert!(session.force_move_sync, "still waiting for confirmation");
+    assert_eq!(session.pending_outgoing.len(), 2);
+    assert_eq!(session.pending_outgoing[1].packet_id(), 0x13);
+    let OutgoingPacket::RawWire(resend) = &session.pending_outgoing[1] else {
+        panic!("forceMoveSync re-send must queue raw wire bytes");
+    };
+    let mut reader = Reader::new(resend);
+    assert_eq!(reader.read_var_u32().unwrap(), 0x13);
+    let resent = MovePlayerPacket::decode(&mut reader).expect("decode re-send");
+    assert_eq!(reader.remaining(), 0);
+    assert_eq!(resent.position, Vector3f::new(0.0, 101.62, 0.0));
+    assert_eq!(resent.mode, MovePlayerPacket::MODE_TELEPORT);
+
+    // Once the client confirms (within 1 block), forceMoveSync clears.
+    let confirmed = PlayerAuthInputPacket::new(
+        0.0,
+        0.0,
+        Vector3f::new(0.0, 101.62, 0.0),
+        0.0,
+        0.0,
+        0.0,
+    );
+    let _ = session.handle_player_auth_input(confirmed).unwrap();
+    assert!(!session.force_move_sync);
 }
 
 #[test]
@@ -492,8 +599,10 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
         ResourcePackClientResponsePacket::STATUS_COMPLETED,
         Vec::new(),
     )).unwrap();
+    session.handle_set_local_player_as_initialized().unwrap();
 
     assert!(session.is_in_game());
+    assert!(session.is_spawned());
     assert_eq!(session.sent_chunks.len(), 25); // 5x5 initial spawn chunks
 
     // 1. Set radius to 2 (matching initial 5x5 spawn chunks) and move slightly within same chunk (0, 0)
@@ -508,7 +617,7 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
     );
     let responses = session.handle_player_auth_input(move_same_chunk).unwrap();
     assert!(responses.is_empty(), "No new chunks should be sent within the already generated spawn area");
-    assert_eq!(session.position, Vector3f::new(2.0, 65.0, 2.0));
+    assert_eq!(session.position, Vector3f::new(2.0, 65.0 - 1.62, 2.0));
     assert_eq!(session.pitch, 5.0);
     assert_eq!(session.yaw, 180.0);
 
@@ -549,4 +658,96 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
     }
     assert_eq!(sent, 25 + 25);
     assert_eq!(session.sent_chunks.len(), 25 + 25);
+}
+
+fn drive_to_prespawn(session: &mut PlayerSession) {
+    session.handle_login(LoginPacket::new(685, "test")).unwrap();
+    session
+        .handle_resource_pack_response(ResourcePackClientResponsePacket::new(
+            ResourcePackClientResponsePacket::STATUS_HAVE_ALL_PACKS,
+            Vec::new(),
+        ))
+        .unwrap();
+    session
+        .handle_resource_pack_response(ResourcePackClientResponsePacket::new(
+            ResourcePackClientResponsePacket::STATUS_COMPLETED,
+            Vec::new(),
+        ))
+        .unwrap();
+    assert_eq!(session.state, SessionState::PreSpawn);
+    assert!(!session.is_spawned());
+    assert!(session.prespawn_started_at.is_some());
+}
+
+#[test]
+fn chunk_radius_forces_spawn_without_0x71() {
+    // Regression: Bedrock clients that send RequestChunkRadius but never
+    // 0x71 must still reach PLAYER_SPAWN + PlayerJoinEvent (joined).
+    let addr: SocketAddr = "127.0.0.1:54401".parse().unwrap();
+    let mut session = PlayerSession::new(101, addr);
+    drive_to_prespawn(&mut session);
+
+    let radius_req = RequestChunkRadiusPacket::new(8, 16);
+    let responses = session.handle_chunk_radius_request(radius_req).unwrap();
+
+    assert!(session.is_spawned());
+    assert!(session.joined);
+    assert_eq!(session.state, SessionState::InGame);
+    assert!(session.prespawn_started_at.is_none());
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
+        "chunk radius fallback must emit PLAYER_SPAWN"
+    );
+    assert!(responses
+        .iter()
+        .any(|r| matches!(r, OutgoingPacket::ChunkRadiusUpdated(_))));
+    // A late 0x71 is a no-op (spawned already).
+    assert!(session
+        .handle_set_local_player_as_initialized()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn auth_input_forces_spawn_without_0x71() {
+    let addr: SocketAddr = "127.0.0.1:54402".parse().unwrap();
+    let mut session = PlayerSession::new(102, addr);
+    drive_to_prespawn(&mut session);
+
+    let input = PlayerAuthInputPacket::new(
+        0.0,
+        0.0,
+        Vector3f::new(0.5, 65.0, 0.5),
+        0.0,
+        0.0,
+        0.0,
+    );
+    let responses = session.handle_player_auth_input(input).unwrap();
+
+    assert!(session.is_spawned());
+    assert!(session.joined);
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
+        "auth input fallback must emit PLAYER_SPAWN"
+    );
+    assert_eq!(session.position, Vector3f::new(0.5, 65.0 - 1.62, 0.5));
+}
+
+#[test]
+fn prespawn_timeout_forces_spawn_via_manager_poll() {
+    use std::time::{Duration, Instant};
+    // No 0x71, no chunk radius: after the timeout the manager must spawn
+    // so TestKit/plugins see 1 online.
+    let addr: SocketAddr = "127.0.0.1:54403".parse().unwrap();
+    let manager = SessionManager::new();
+    let mut session = PlayerSession::new(103, addr);
+    drive_to_prespawn(&mut session);
+    session.prespawn_started_at = Some(Instant::now() - Duration::from_secs(11));
+    manager.add_session(session);
+    assert_eq!(manager.poll_prespawn_timeouts(), 1);
+    assert_eq!(manager.poll_prespawn_timeouts(), 0);
 }

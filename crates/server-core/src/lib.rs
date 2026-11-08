@@ -1,8 +1,10 @@
 //! PocketMine-Rust Server Core: Session and Player Management
 
 pub mod access;
+pub mod auth_keys;
 pub mod command;
 pub mod config;
+pub mod crash;
 pub mod identity;
 pub mod inventory;
 pub mod logging;
@@ -10,9 +12,11 @@ pub mod metrics;
 pub mod nbt_json;
 pub mod permission;
 pub mod plugin_host;
+pub mod query;
 pub mod session;
 pub mod static_packets;
 pub mod translations;
+pub mod updater;
 pub mod world_state;
 
 pub use config::ServerConfig;

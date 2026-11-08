@@ -5,10 +5,32 @@ namespace pocketmine\runtime;
 
 /**
  * Per-plugin PSR-4 autoloader. Supports normal directories and phar:// roots.
+ *
+ * PM-parity notes (see `pocketmine\thread\ThreadSafeClassLoader`):
+ * `registerPlugin()` maps the plugin's effective src-namespace prefix to
+ * its `src/` directory — for `.phar` plugins that is `phar://<file>/src`,
+ * the equivalent of `PharPluginLoader::loadPlugin()` calling
+ * `$loader->addPath($prefix, "$file/src")`. Entries are isolated by
+ * `description name + plugin root`, so two `.phar` archives never overwrite
+ * each other's registration (the archive may be named differently from the
+ * plugin inside it).
+ *
+ * This class *is* the `ThreadSafeClassLoader` equivalent: like
+ * `ThreadSafeClassLoader::register()`, it registers a single
+ * `spl_autoload_register` callback serving every plugin. When PHP's Phar
+ * support is available the callback resolves `phar://` paths directly;
+ * without it, phar entries simply never resolve (the loader logs a clear
+ * message instead of crashing).
  */
 final class PluginAutoloader
 {
-    /** @var array<string, array{root:string, prefix:string}> */
+    /**
+     * Isolation key => entry. The key combines the case-insensitive
+     * description name with the plugin root (for phar archives the full
+     * `phar://<path>`), so distinct archives never collide.
+     *
+     * @var array<string, array{name:string, root:string, prefix:string, srcPrefix:string, mainNs:string, srcDir:string}>
+     */
     private static array $plugins = [];
 
     /** @var array<string, bool> */
@@ -25,25 +47,70 @@ final class PluginAutoloader
     }
 
     /**
+     * Registers a plugin source.
+     *
+     * @param string $name Description name (`plugin.yml` `name:`).
      * @param string $root Plugin root directory, or a phar:// URI to the .phar archive.
+     * @param string $mainClass FQCN of the `main:` class.
+     * @param string|null $srcPrefix `src-namespace-prefix` from the manifest,
+     *     or null/'' to fall back to the namespace of `$mainClass`.
      */
-    public static function registerPlugin(string $name, string $root, string $mainClass): void
+    public static function registerPlugin(string $name, string $root, string $mainClass, ?string $srcPrefix = null): void
     {
         self::register();
 
         $root = self::normalizeRoot($root);
         $mainClass = ltrim(str_replace('/', '\\', $mainClass), '\\');
-        $pos = strrpos($mainClass, '\\');
-        $prefix = $pos === false ? '' : substr($mainClass, 0, $pos + 1);
+        $mainNs = self::mainNamespace($mainClass);
+        $explicit = self::normalizePrefix($srcPrefix ?? '');
+        // Effective prefix (PM `addPath($prefix, "<root>/src")` equivalent):
+        // the manifest prefix wins, otherwise the namespace of `main`.
+        $prefix = $explicit !== '' ? $explicit : ($mainNs !== '' ? $mainNs . '\\' : '');
 
-        self::$plugins[$name] = [
+        $key = self::isolationKey($name, $root);
+        self::$plugins[$key] = [
+            'name' => $name,
             'root' => $root,
             'prefix' => $prefix,
+            'srcPrefix' => $explicit,
+            'mainNs' => $mainNs,
+            'srcDir' => $root . '/src',
         ];
-        self::$vendorLoaded[$name] = false;
+        self::$vendorLoaded[$key] = false;
 
         // Composer dependencies are usually needed while the main class is parsed.
-        self::loadVendor($name);
+        self::loadVendor($key);
+    }
+
+    /**
+     * PM `ThreadSafeClassLoader::addPath()` equivalent: maps a namespace
+     * prefix to an explicit `src/` directory (e.g. `phar://<file>/src`).
+     * Prefer {@see registerPlugin} for manifest-based plugins; this exists
+     * for PM-parity standalone use.
+     */
+    public static function addPath(string $namespacePrefix, string $path): void
+    {
+        self::register();
+
+        $prefix = self::normalizePrefix($namespacePrefix);
+        $srcDir = self::normalizePath(rtrim(str_replace('\\', '/', $path), '/'));
+        if ($srcDir === '') {
+            return;
+        }
+        $key = 'path:' . $prefix . "\0" . $srcDir;
+        self::$plugins[$key] = [
+            'name' => '',
+            'root' => '',
+            'prefix' => $prefix,
+            'srcPrefix' => $prefix,
+            'mainNs' => '',
+            'srcDir' => $srcDir,
+        ];
+        self::$vendorLoaded[$key] = false;
+
+        if ($prefix !== '') {
+            self::loadVendor($key);
+        }
     }
 
     public static function unregisterPlugin(string $name): void
@@ -52,10 +119,10 @@ final class PluginAutoloader
             unset(self::$plugins[$name], self::$vendorLoaded[$name]);
             return;
         }
+        // Plain description name: remove every isolated entry with that name.
         foreach (array_keys(self::$plugins) as $registered) {
-            if (strcasecmp($registered, $name) === 0) {
+            if (strcasecmp(self::$plugins[$registered]['name'], $name) === 0) {
                 unset(self::$plugins[$registered], self::$vendorLoaded[$registered]);
-                return;
             }
         }
     }
@@ -65,15 +132,17 @@ final class PluginAutoloader
         if (isset(self::$plugins[$name])) {
             return true;
         }
-        foreach (array_keys(self::$plugins) as $registered) {
-            if (strcasecmp($registered, $name) === 0) {
+        foreach (self::$plugins as $registered) {
+            if (strcasecmp($registered['name'], $name) === 0) {
                 return true;
             }
         }
         return false;
     }
 
-    /** @return array<string, array{root:string, prefix:string}> */
+    /**
+     * @return array<string, array{name:string, root:string, prefix:string, srcPrefix:string, mainNs:string, srcDir:string}>
+     */
     public static function getPrefixes(): array
     {
         return self::$plugins;
@@ -88,12 +157,15 @@ final class PluginAutoloader
 
         $relative = str_replace('\\', '/', $class) . '.php';
 
-        // 1. Prefix-specific PSR-4 lookup.
+        // 1. Prefix-specific PSR-4 lookup (PM `ThreadSafeClassLoader`):
+        // strip the effective src-namespace prefix, resolve below `src/`.
+        // This covers `src-namespace-prefix` layouts (`BetterChat\Main` ->
+        // `src/Main.php`) as well as the namespace-of-`main` default.
         foreach (self::$plugins as $plugin) {
             $prefix = $plugin['prefix'];
             if ($prefix !== '' && stripos($class, $prefix) === 0) {
                 $inner = substr($class, strlen($prefix));
-                $candidate = $plugin['root'] . '/src/' . str_replace('\\', '/', $inner) . '.php';
+                $candidate = $plugin['srcDir'] . '/' . str_replace('\\', '/', $inner) . '.php';
                 if (self::loadFile($candidate)) {
                     return;
                 }
@@ -102,14 +174,29 @@ final class PluginAutoloader
 
         // 2. Fallback: the full class name relative to every plugin src/ directory.
         foreach (self::$plugins as $plugin) {
-            if (self::loadFile($plugin['root'] . '/src/' . $relative)) {
+            if (self::loadFile($plugin['srcDir'] . '/' . $relative)) {
                 return;
             }
         }
 
-        // 3. Composer autoloaders, at most once per plugin.
-        foreach (array_keys(self::$plugins) as $name) {
-            self::loadVendor($name);
+        // 3. Legacy: strip the *main* namespace even when a manifest prefix
+        // was set (bridge plugins that used the derived-prefix layout).
+        foreach (self::$plugins as $plugin) {
+            $mainNs = $plugin['mainNs'];
+            if ($mainNs !== '' && $plugin['prefix'] !== $mainNs . '\\'
+                && stripos($class, $mainNs . '\\') === 0
+            ) {
+                $inner = substr($class, strlen($mainNs) + 1);
+                $candidate = $plugin['srcDir'] . '/' . str_replace('\\', '/', $inner) . '.php';
+                if (self::loadFile($candidate)) {
+                    return;
+                }
+            }
+        }
+
+        // 4. Composer autoloaders, at most once per plugin.
+        foreach (array_keys(self::$plugins) as $key) {
+            self::loadVendor($key);
         }
     }
 
@@ -144,13 +231,18 @@ final class PluginAutoloader
         return true;
     }
 
-    private static function loadVendor(string $name): void
+    private static function loadVendor(string $key): void
     {
-        if (!isset(self::$plugins[$name]) || !empty(self::$vendorLoaded[$name])) {
+        $key = self::resolveKey($key);
+        if ($key === null || !empty(self::$vendorLoaded[$key])) {
             return;
         }
-        self::$vendorLoaded[$name] = true;
-        $vendor = self::$plugins[$name]['root'] . '/vendor/autoload.php';
+        self::$vendorLoaded[$key] = true;
+        $root = self::$plugins[$key]['root'];
+        if ($root === '') {
+            return;
+        }
+        $vendor = $root . '/vendor/autoload.php';
         $resolved = self::resolve($vendor);
         if ($resolved === null) {
             return;
@@ -158,8 +250,53 @@ final class PluginAutoloader
         try {
             require_once $resolved;
         } catch (\Throwable $e) {
-            self::log('Failed to load vendor autoload for ' . $name . ': ' . $e->getMessage());
+            self::log('Failed to load vendor autoload for ' . $key . ': ' . $e->getMessage());
         }
+    }
+
+    /**
+     * Isolation key for one plugin source: case-insensitive description name
+     * plus the plugin root. Two `.phar` files (or a dir and a phar) can never
+     * share a key, even when their description names collide.
+     */
+    private static function isolationKey(string $name, string $root): string
+    {
+        return strtolower(trim($name)) . "\0" . $root;
+    }
+
+    /** Accepts an isolation key or a plain description name; returns the key. */
+    private static function resolveKey(string $name): ?string
+    {
+        if (isset(self::$plugins[$name])) {
+            return $name;
+        }
+        foreach (self::$plugins as $key => $plugin) {
+            if (strcasecmp($plugin['name'], $name) === 0) {
+                return $key;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Normalizes `src-namespace-prefix` to `Foo\Bar\` form (trailing
+     * backslash), or `''` when unset — the PM `addPath()` prefix shape.
+     */
+    private static function normalizePrefix(string $prefix): string
+    {
+        $prefix = trim(str_replace('/', '\\', $prefix), '\\');
+        if ($prefix === '') {
+            return '';
+        }
+        return $prefix . '\\';
+    }
+
+    /** Namespace of a FQCN (`Acme\Foo\Main` -> `Acme\Foo`), or `''`. */
+    private static function mainNamespace(string $mainClass): string
+    {
+        $mainClass = ltrim(str_replace('/', '\\', $mainClass), '\\');
+        $pos = strrpos($mainClass, '\\');
+        return $pos === false ? '' : substr($mainClass, 0, $pos);
     }
 
     private static function normalizeRoot(string $root): string
@@ -330,9 +467,14 @@ final class Autoloader
         PluginAutoloader::register();
     }
 
-    public static function registerPlugin(string $name, string $root, string $mainClass): void
+    public static function registerPlugin(string $name, string $root, string $mainClass, ?string $srcPrefix = null): void
     {
-        PluginAutoloader::registerPlugin($name, $root, $mainClass);
+        PluginAutoloader::registerPlugin($name, $root, $mainClass, $srcPrefix);
+    }
+
+    public static function addPath(string $namespacePrefix, string $path): void
+    {
+        PluginAutoloader::addPath($namespacePrefix, $path);
     }
 
     public static function unregisterPlugin(string $name): void
@@ -345,7 +487,7 @@ final class Autoloader
         return PluginAutoloader::isRegistered($name);
     }
 
-    /** @return array<string, array{root:string, prefix:string}> */
+    /** @return array<string, array{name:string, root:string, prefix:string, srcPrefix:string, mainNs:string, srcDir:string}> */
     public static function getPrefixes(): array
     {
         return PluginAutoloader::getPrefixes();

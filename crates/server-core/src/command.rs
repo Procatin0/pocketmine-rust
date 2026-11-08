@@ -114,12 +114,19 @@ impl WeatherState {
         }
     }
 
-    pub fn name_es(self) -> &'static str {
+    /// English display name for command feedback.
+    pub fn name_en(self) -> &'static str {
         match self {
-            Self::Clear => "despejado",
-            Self::Rain => "lluvia",
-            Self::Thunder => "tormenta",
+            Self::Clear => "clear",
+            Self::Rain => "rain",
+            Self::Thunder => "thunder",
         }
+    }
+
+    /// Historical Spanish accessor, kept for API compatibility. New code
+    /// should use [`WeatherState::name_en`]; this returns the English name.
+    pub fn name_es(self) -> &'static str {
+        self.name_en()
     }
 
     /// LevelEvent ids that put every client in this state.
@@ -293,6 +300,70 @@ pub enum CommandAction {
         message: String,
         notify: String,
     },
+    /// `/time start|stop`: `World::startTime()/stopTime()` on every world.
+    SetTimeRunning {
+        running: bool,
+        /// `Restarted the time` / `Stopped the time`, already filled in.
+        message: String,
+        notify: String,
+    },
+    /// `/effect`: apply or remove a mob effect. `duration_secs: None` with
+    /// `remove=false` means infinite. Session applies the MobEffect packet
+    /// (currently a logged no-op until the protocol grows it).
+    ApplyEffect {
+        target: String,
+        effect: String,
+        duration_secs: Option<i32>,
+        amplifier: i32,
+        particles: bool,
+        remove: bool,
+        message: String,
+        notify: String,
+    },
+    /// `/enchant`: enchant the held item. `enchantment` is the raw id;
+    /// validation (max level, item compatibility) happens in the session.
+    Enchant {
+        target: String,
+        enchantment: String,
+        level: i32,
+        message: String,
+        notify: String,
+    },
+    /// `/xp`: `amount` signed; `is_levels` selects levels (`L` suffix) vs xp.
+    AddXp {
+        target: String,
+        amount: i32,
+        is_levels: bool,
+        message: String,
+        notify: String,
+    },
+    /// `/particle`: visual-only; the session logs it until a
+    /// `LevelEvent`/`Particle` packet path exists.
+    SpawnParticle {
+        name: String,
+        position: (f64, f64, f64),
+        delta: (f64, f64, f64),
+        count: i32,
+        data: Option<String>,
+        message: String,
+    },
+    /// `/timings <on|off|reset|report|paste>`: `mode` is the literal arg.
+    /// `message` is the `broadcastCommandMessage` line (already filled).
+    Timings {
+        mode: String,
+        message: String,
+        notify: String,
+    },
+    /// `/gc`: fire garbage collection. The session counts collected chunks
+    /// and entities; the command itself only reports the header here.
+    GarbageCollect {
+        notify: String,
+    },
+    /// `/dumpmemory [path]`: dump a memory snapshot. `path` is the requested
+    /// output (the session fills the default when `None`).
+    DumpMemory {
+        path: Option<String>,
+    },
 }
 
 /// Result of a recognized core command.
@@ -318,242 +389,290 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "help",
         aliases: &["?"],
-        usage: "/help [página|comando]",
-        description: "Muestra el menú de ayuda",
+        usage: "/help [page|command name]",
+        description: "Shows the help menu",
     },
     CommandInfo {
         name: "tp",
         aliases: &["teleport"],
-        usage: "/tp [jugador objetivo] <jugador destino> O /tp [jugador objetivo] <x> <y> <z> [<y-rot> <x-rot>]",
-        description: "Teletransporta a un jugador (O a ti mismo) a otro jugador o coordenadas",
+        usage: "/tp [target player] <destination player> OR /tp [target player] <x> <y> <z> [<y-rot> <x-rot>]",
+        description: "Teleports the given player (or yourself) to another player or coordinates",
     },
     CommandInfo {
         name: "gamemode",
         aliases: &["gm"],
-        usage: "/gamemode <modo> [jugador]",
-        description: "Cambia el modo de juego del jugador",
+        usage: "/gamemode <mode> [player]",
+        description: "Changes the player to a specific game mode",
     },
     CommandInfo {
         name: "gmc",
         aliases: &[],
-        usage: "/gmc [jugador]",
-        description: "Atajo de /gamemode creative",
+        usage: "/gmc [player]",
+        description: "Shortcut for /gamemode creative",
     },
     CommandInfo {
         name: "gms",
         aliases: &[],
-        usage: "/gms [jugador]",
-        description: "Atajo de /gamemode survival",
+        usage: "/gms [player]",
+        description: "Shortcut for /gamemode survival",
     },
     CommandInfo {
         name: "gma",
         aliases: &[],
-        usage: "/gma [jugador]",
-        description: "Atajo de /gamemode adventure",
+        usage: "/gma [player]",
+        description: "Shortcut for /gamemode adventure",
     },
     CommandInfo {
         name: "gmsp",
         aliases: &[],
-        usage: "/gmsp [jugador]",
-        description: "Atajo de /gamemode spectator",
+        usage: "/gmsp [player]",
+        description: "Shortcut for /gamemode spectator",
     },
     CommandInfo {
         name: "spawn",
         aliases: &[],
-        usage: "/spawn [jugador]",
-        description: "Teletransporta al punto de aparición del mundo",
+        usage: "/spawn [player]",
+        description: "Teleports to the world spawn point",
     },
     CommandInfo {
         name: "setworldspawn",
         aliases: &[],
         usage: "/setworldspawn [<x> <y> <z>]",
-        description: "Establece el punto de aparición de un mundo. Si no se especifican coordenadas, se utilizarán las coordenadas del jugador.",
+        description: "Sets a world's spawn point. If no coordinates are specified, the player's coordinates will be used.",
     },
     CommandInfo {
         name: "say",
         aliases: &[],
-        usage: "/say <mensaje ...>",
-        description: "Transmitir el mensaje como servidor",
+        usage: "/say <message ...>",
+        description: "Broadcasts the given message as the sender",
     },
     CommandInfo {
         name: "me",
         aliases: &[],
-        usage: "/me <acción ...>",
-        description: "Ejecuta una acción específica en el chat",
+        usage: "/me <action ...>",
+        description: "Performs the specified action in chat",
     },
     CommandInfo {
         name: "tell",
         aliases: &["msg", "w", "whisper"],
-        usage: "/tell <jugador> <mensaje privado>",
-        description: "Enviar mensaje privado a un jugador",
+        usage: "/tell <player> <private message ...>",
+        description: "Sends a private message to the given player",
     },
     CommandInfo {
         name: "list",
         aliases: &["players"],
         usage: "/list",
-        description: "Lista de todos los jugadores en línea",
+        description: "Lists all online players",
     },
     CommandInfo {
         name: "kick",
         aliases: &[],
-        usage: "/kick <jugador> [razón ...]",
-        description: "Expulsa al jugador especificado del servidor",
+        usage: "/kick <player> [reason ...]",
+        description: "Removes the specified player from the server",
     },
     CommandInfo {
         name: "give",
         aliases: &[],
-        usage: "/give <jugador> <objeto[:extra]> [cantidad] [etiquetas...]",
-        description: "Da al jugador especificado una cierta cantidad de objetos",
+        usage: "/give <player> <item[:damage]> [amount] [tags...]",
+        description: "Gives the specified player a certain amount of items",
     },
     CommandInfo {
         name: "clear",
         aliases: &[],
-        usage: "/clear [jugador] [objeto] [cantidadMáxima]",
-        description: "Borra objetos del inventario del jugador",
+        usage: "/clear [player] [item] [maxCount]",
+        description: "Clears items from player inventory",
     },
     CommandInfo {
         name: "kill",
         aliases: &["suicide"],
-        usage: "/kill [jugador]",
-        description: "Cometer un suicidio o matar a otros jugadores",
+        usage: "/kill [player]",
+        description: "Commit suicide or kill other players",
     },
     CommandInfo {
         name: "spawnpoint",
         aliases: &[],
-        usage: "/spawnpoint [jugador] [<x> <y> <z>]",
-        description: "Define un punto de aparición de los jugadores",
+        usage: "/spawnpoint [player] [<x> <y> <z>]",
+        description: "Sets a player's spawn point",
     },
     CommandInfo {
         name: "defaultgamemode",
         aliases: &[],
-        usage: "/defaultgamemode <modo>",
-        description: "Establece el modo de juego por defecto",
+        usage: "/defaultgamemode <mode>",
+        description: "Set the default gamemode",
     },
     CommandInfo {
         name: "difficulty",
         aliases: &[],
-        usage: "/difficulty <nueva dificultad>",
-        description: "Definir dificultad de el juego",
+        usage: "/difficulty <new difficulty>",
+        description: "Sets the game difficulty",
     },
     CommandInfo {
         name: "seed",
         aliases: &[],
         usage: "/seed",
-        description: "Muestra la semilla del mundo",
+        description: "Shows the world seed",
     },
     CommandInfo {
         name: "ban",
         aliases: &[],
-        usage: "/ban <nombre> [razón ...]",
-        description: "Previene que el jugador especificado utilice este servidor",
+        usage: "/ban <name> [reason ...]",
+        description: "Prevents the specified player from using this server",
     },
     CommandInfo {
         name: "ban-ip",
         aliases: &[],
-        usage: "/ban-ip <dirección|nombre> [Razón ...]",
-        description: "Previene que la dirección IP especificada utilice este servidor",
+        usage: "/ban-ip <address|name> [reason ...]",
+        description: "Prevents the specified IP address from using this server",
     },
     CommandInfo {
         name: "banlist",
         aliases: &[],
-        usage: "/banlist [ips|jugadores]",
-        description: "Muestra todos los jugadores vetados de este servidor",
+        usage: "/banlist [ips|players]",
+        description: "View all players banned from this server",
     },
     CommandInfo {
         name: "pardon",
         aliases: &["unban"],
-        usage: "/pardon <nombre>",
-        description: "Permite al jugador especificado utilizar este servidor",
+        usage: "/pardon <name>",
+        description: "Allows the specified player to use this server",
     },
     CommandInfo {
         name: "pardon-ip",
         aliases: &["unban-ip"],
-        usage: "/pardon-ip <dirección>",
-        description: "Permite que la IP especificada utilice este servidor",
+        usage: "/pardon-ip <address>",
+        description: "Allows the specified IP address to use this server",
     },
     CommandInfo {
         name: "whitelist",
         aliases: &[],
         usage: "/whitelist <on|off|list|add|remove|reload>",
-        description: "Administra la lista de jugadores permitidos en el servidor",
+        description: "Manages the list of players allowed to use this server",
     },
     CommandInfo {
         name: "stop",
         aliases: &[],
         usage: "/stop",
-        description: "Detiene el servidor",
+        description: "Stops the server",
     },
     CommandInfo {
         name: "plugins",
         aliases: &["pl"],
         usage: "/plugins",
-        description: "Obtén una lista de plugins ejecutándose en el servidor",
+        description: "Gets a list of plugins running on the server",
     },
     CommandInfo {
         name: "save-all",
         aliases: &[],
         usage: "/save-all",
-        description: "Guarda el servidor en el disco",
+        description: "Saves the server to disk",
     },
     CommandInfo {
         name: "save-on",
         aliases: &[],
         usage: "/save-on",
-        description: "Habilita el \"Auto-Guardado\" del servidor",
+        description: "Enables server autosaving",
     },
     CommandInfo {
         name: "save-off",
         aliases: &[],
         usage: "/save-off",
-        description: "Deshabilita el \"Auto-Guardado\" del servidor",
+        description: "Disables server autosaving",
     },
     CommandInfo {
         name: "tps",
         aliases: &[],
         usage: "/tps",
-        description: "Muestra los TPS del servidor en 1m, 5m y 15m",
+        description: "Shows server TPS in 1m, 5m and 15m (Paper extra, use /status for PocketMine format)",
+    },
+    CommandInfo {
+        name: "status",
+        aliases: &[],
+        usage: "/status",
+        description: "Reads back the server's performance.",
+    },
+    CommandInfo {
+        name: "effect",
+        aliases: &[],
+        usage: "/effect <player> <effect> [seconds] [amplifier] [hideParticles] OR /effect <player> clear OR /effect <player> <effect> infinite [amplifier] [hideParticles]",
+        description: "Adds/Removes effects on players",
+    },
+    CommandInfo {
+        name: "enchant",
+        aliases: &[],
+        usage: "/enchant <player> <enchantment ID> [level]",
+        description: "Adds enchantments on items",
+    },
+    CommandInfo {
+        name: "xp",
+        aliases: &[],
+        usage: "/xp <experience[L]> [player]",
+        description: "Adds or removes player experience",
+    },
+    CommandInfo {
+        name: "particle",
+        aliases: &[],
+        usage: "/particle <name> <x> <y> <z> <xd> <yd> <zd> [count] [data]",
+        description: "Adds particles to a world",
+    },
+    CommandInfo {
+        name: "timings",
+        aliases: &[],
+        usage: "/timings <reset|report|on|off|paste>",
+        description: "Records timings to see performance of the server.",
+    },
+    CommandInfo {
+        name: "gc",
+        aliases: &[],
+        usage: "/gc",
+        description: "Fires garbage collection tasks",
+    },
+    CommandInfo {
+        name: "dumpmemory",
+        aliases: &[],
+        usage: "/dumpmemory [path]",
+        description: "Dumps diagnostic information about memory usage to disk",
     },
     CommandInfo {
         name: "time",
         aliases: &[],
-        usage: "/time <set|add|query> [valor]",
-        description: "Cambia la hora en cada mundo",
+        usage: "/time <set|add> <value> OR /time <start|stop|query>",
+        description: "Changes the time on each world",
     },
     CommandInfo {
         name: "weather",
         aliases: &[],
-        usage: "/weather <clear|rain|thunder> [duración]",
-        description: "Cambia el clima del mundo",
+        usage: "/weather <clear|rain|thunder> [duration]",
+        description: "Changes world weather",
     },
     CommandInfo {
         name: "op",
         aliases: &[],
-        usage: "/op <jugador>",
-        description: "Obsequia al jugador especificado el modo \"Operador\"",
+        usage: "/op <player>",
+        description: "Gives the specified player operator status",
     },
     CommandInfo {
         name: "deop",
         aliases: &[],
-        usage: "/deop <jugador>",
-        description: "Retira el modo \"operador\" del jugador especificado",
+        usage: "/deop <player>",
+        description: "Takes the specified player's operator status",
     },
     CommandInfo {
         name: "version",
-        aliases: &["ver"],
-        usage: "/version",
-        description: "Obtén la versión del servidor, incluyendo los plugins que utiliza",
+        aliases: &["ver", "about"],
+        usage: "/version [plugin name]",
+        description: "Gets the version of this server including any plugins in use",
     },
     CommandInfo {
         name: "title",
         aliases: &[],
-        usage: "/title <jugador> <clear|reset|title|subtitle|actionbar|times> ...",
-        description: "Controla títulos en pantalla",
+        usage: "/title <player> <clear|reset|title|subtitle|actionbar|times> ...",
+        description: "Controls screen titles",
     },
     CommandInfo {
         name: "transferserver",
         aliases: &[],
-        usage: "/transferserver <servidor> [puerto]",
-        description: "Transferirte a otro servidor",
+        usage: "/transferserver <server> [port]",
+        description: "Transfer yourself to another server",
     },
 ];
 
@@ -570,7 +689,9 @@ pub fn handle_command(
     let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
     let mut parts = without_slash.split_whitespace();
     let name = parts.next()?.to_lowercase();
-    let args: Vec<&str> = parts.collect();
+    let raw_args: Vec<&str> = parts.collect();
+    let merged = merge_selector_tokens(&raw_args);
+    let args: Vec<&str> = merged.iter().map(String::as_str).collect();
 
     // PocketMine checks the command's permissions before running it. Commands
     // registered with `setPermissions([self, other])` accept *any* of the set
@@ -634,13 +755,21 @@ pub fn handle_command(
         "save-on" => Some(set_auto_save(source, true)),
         "save-off" => Some(set_auto_save(source, false)),
         "tps" => Some(tps(source)),
+        "status" => Some(status(source, players)),
+        "effect" => Some(effect(source, players, &args)),
+        "enchant" => Some(enchant(source, players, &args)),
+        "xp" => Some(xp(source, players, &args)),
+        "particle" => Some(particle(source, players, &args)),
+        "timings" => Some(timings(source, &args)),
+        "gc" => Some(gc(source)),
+        "dumpmemory" => Some(dumpmemory(source, &args)),
         "time" => Some(time(source, &args)),
         "title" => Some(title(source, players, &args)),
         "transferserver" => Some(transfer(source, &args)),
         "weather" => Some(weather(source, &args)),
         "op" => Some(set_op(&args, true)),
         "deop" => Some(set_op(&args, false)),
-        "version" | "ver" => Some(version()),
+        "version" | "ver" | "about" => Some(version(source, &args)),
         _ => None,
     }
 }
@@ -667,6 +796,8 @@ fn command_visible(source: &CommandSource, name: &str) -> bool {
         "time" => &[
             crate::permission::COMMAND_TIME_SET,
             crate::permission::COMMAND_TIME_ADD,
+            crate::permission::COMMAND_TIME_START,
+            crate::permission::COMMAND_TIME_STOP,
             crate::permission::COMMAND_TIME_QUERY,
         ],
         "whitelist" => &[
@@ -782,7 +913,7 @@ fn teleport(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> 
             if source.is_console {
                 return usage("tp");
             }
-            let Some(destination) = resolve_player(players, args[0], &source.name) else {
+            let Some(destination) = resolve_player(source, players, args[0]) else {
                 return player_not_found(args[0]);
             };
             teleport_output(
@@ -794,57 +925,154 @@ fn teleport(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> 
                 None,
             )
         }
-        // /tp <objetivo> <jugador>
+        // /tp <objetivo> <jugador>: objetivos `@a`/`@p`/`@e`/`@r`
+        // teleportan a cada uno a la posición del destino.
         2 => {
-            let Some(target) = resolve_player(players, args[0], &source.name) else {
+            let targets = resolve_players(source, players, args[0]);
+            if targets.is_empty() {
                 return player_not_found(args[0]);
-            };
-            let Some(destination) = resolve_player(players, args[1], &source.name) else {
+            }
+            let Some(destination) = resolve_player(source, players, args[1]) else {
                 return player_not_found(args[1]);
             };
-            teleport_output(
-                source,
-                &target.name,
-                destination.position,
-                Some(&destination.name),
-                None,
-                None,
-            )
+            let target_names: Vec<String> =
+                targets.iter().map(|player| player.name.clone()).collect();
+            if let Some(denied) = teleport_permission_error(source, &target_names) {
+                return denied;
+            }
+            let mut feedback = Vec::new();
+            let mut actions = Vec::new();
+            for target in targets {
+                feedback.push(teleport_feedback(
+                    source,
+                    &target.name,
+                    destination.position,
+                    Some(&destination.name),
+                    None,
+                    None,
+                ));
+                actions.push(CommandAction::Teleport {
+                    target: target.name.clone(),
+                    position: destination.position,
+                    yaw: None,
+                    pitch: None,
+                });
+            }
+            CommandOutput { feedback, actions }
         }
         // /tp <x> <y> <z> and /tp <objetivo> <x> <y> <z>
         // /tp <x> <y> <z> <yaw> <pitch> and /tp <objetivo> <x> <y> <z> <yaw> <pitch>
         3 | 4 | 5 | 6 => {
-            let (target_name, origin, coord_start) = if args.len() == 3 || args.len() == 5 {
-                if source.is_console {
-                    return usage("tp");
-                }
-                (source.name.clone(), source.position, 0)
-            } else {
-                let Some(target) = resolve_player(players, args[0], &source.name) else {
-                    return player_not_found(args[0]);
+            // `len == 3 || len == 5` is the sender teleporting themselves.
+            // Otherwise the first arg is the (possibly `@a`/`@e`/...) target.
+            let (targets, coord_start): (Vec<(String, (f64, f64, f64))>, usize) =
+                if args.len() == 3 || args.len() == 5 {
+                    if source.is_console {
+                        return usage("tp");
+                    }
+                    (vec![(source.name.clone(), source.position)], 0)
+                } else {
+                    let resolved = resolve_players(source, players, args[0]);
+                    if resolved.is_empty() {
+                        return player_not_found(args[0]);
+                    }
+                    (
+                        resolved
+                            .iter()
+                            .map(|player| (player.name.clone(), player.position))
+                            .collect(),
+                        1,
+                    )
                 };
-                (target.name.clone(), target.position, 1)
-            };
 
-            let coord_count = if args.len() == 3 || args.len() == 4 { 3 } else { 3 };
-            let coordinates = &args[coord_start..coord_start + coord_count];
-            let Some(position) = parse_position(coordinates, origin) else {
-                return usage("tp");
-            };
+            let target_names: Vec<String> =
+                targets.iter().map(|(name, _)| name.clone()).collect();
+            if let Some(denied) = teleport_permission_error(source, &target_names) {
+                return denied;
+            }
 
             let (yaw, pitch) = if args.len() == 5 || args.len() == 6 {
-                let yaw_idx = coord_start + 3;
-                let pitch_idx = coord_start + 4;
-                let yaw_val = args[yaw_idx].parse::<f32>().ok();
-                let pitch_val = args[pitch_idx].parse::<f32>().ok();
-                (yaw_val, pitch_val)
+                let yaw_value = args[coord_start + 3].parse::<f32>().ok();
+                let pitch_value = args[coord_start + 4].parse::<f32>().ok();
+                (yaw_value, pitch_value)
             } else {
                 (None, None)
             };
+            let coordinates = &args[coord_start..coord_start + 3];
 
-            teleport_output(source, &target_name, position, None, yaw, pitch)
+            let mut feedback = Vec::new();
+            let mut actions = Vec::new();
+            for (target, origin) in &targets {
+                let Some(position) = parse_position(coordinates, *origin) else {
+                    return usage("tp");
+                };
+                feedback.push(teleport_feedback(source, target, position, None, yaw, pitch));
+                actions.push(CommandAction::Teleport {
+                    target: target.clone(),
+                    position,
+                    yaw,
+                    pitch,
+                });
+            }
+            CommandOutput { feedback, actions }
         }
         _ => usage("tp"),
+    }
+}
+
+fn teleport_permission_error(
+    source: &CommandSource,
+    target_names: &[String],
+) -> Option<CommandOutput> {
+    let has_self = target_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&source.name));
+    let has_other = target_names
+        .iter()
+        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+    if (has_self && !source.can(crate::permission::COMMAND_TELEPORT_SELF))
+        || (has_other && !source.can(crate::permission::COMMAND_TELEPORT_OTHER))
+    {
+        Some(permission_for("tp"))
+    } else {
+        None
+    }
+}
+
+fn teleport_feedback(
+    source: &CommandSource,
+    target: &str,
+    position: (f64, f64, f64),
+    destination_name: Option<&str>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
+) -> String {
+    let (x, y, z) = position;
+    if target.eq_ignore_ascii_case(&source.name) {
+        match destination_name {
+            Some(name) => format!("§aTeleported to §f{}.", name),
+            None => match (yaw, pitch) {
+                (Some(yaw), Some(pitch)) => format!(
+                    "§aTeleported to §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
+                    x, y, z, yaw, pitch
+                ),
+                _ => format!("§aTeleported to §f{:.1}, {:.1}, {:.1}§a.", x, y, z),
+            },
+        }
+    } else {
+        match destination_name {
+            Some(name) => format!("§aTeleporting §f{} §ato §f{}.", target, name),
+            None => match (yaw, pitch) {
+                (Some(yaw), Some(pitch)) => format!(
+                    "§aTeleporting §f{} §ato §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
+                    target, x, y, z, yaw, pitch
+                ),
+                _ => format!(
+                    "§aTeleporting §f{} §ato §f{:.1}, {:.1}, {:.1}§a.",
+                    target, x, y, z
+                ),
+            },
+        }
     }
 }
 
@@ -856,46 +1084,11 @@ fn teleport_output(
     yaw: Option<f32>,
     pitch: Option<f32>,
 ) -> CommandOutput {
-    // `fetchPermittedPlayerTarget`: `.self` for the sender, `.other` otherwise.
-    let node = if target.eq_ignore_ascii_case(&source.name) {
-        crate::permission::COMMAND_TELEPORT_SELF
-    } else {
-        crate::permission::COMMAND_TELEPORT_OTHER
-    };
-    if !source.can(node) {
-        return permission_for("tp");
+    let target_names = vec![target.to_string()];
+    if let Some(denied) = teleport_permission_error(source, &target_names) {
+        return denied;
     }
-    let (x, y, z) = position;
-    let feedback = if target.eq_ignore_ascii_case(&source.name) {
-        match destination_name {
-            Some(name) => format!("§aTeletransportado a §f{}.", name),
-            None => {
-                match (yaw, pitch) {
-                    (Some(yaw), Some(pitch)) => format!(
-                        "§aTeletransportado a §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
-                        x, y, z, yaw, pitch
-                    ),
-                    _ => format!("§aTeletransportado a §f{:.1}, {:.1}, {:.1}§a.", x, y, z),
-                }
-            }
-        }
-    } else {
-        match destination_name {
-            Some(name) => format!("§aTeletransportando a §f{} §aa §f{}.", target, name),
-            None => {
-                match (yaw, pitch) {
-                    (Some(yaw), Some(pitch)) => format!(
-                        "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
-                        target, x, y, z, yaw, pitch
-                    ),
-                    _ => format!(
-                        "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1}§a.",
-                        target, x, y, z
-                    ),
-                }
-            }
-        }
-    };
+    let feedback = teleport_feedback(source, target, position, destination_name, yaw, pitch);
 
     action(
         feedback,
@@ -914,87 +1107,112 @@ fn change_gamemode(
     gamemode: i32,
     target_arg: Option<&str>,
 ) -> CommandOutput {
-    let target = match target_arg {
-        Some(name) => match resolve_player(players, name, &source.name) {
-            Some(player) => player.name.clone(),
-            None => return player_not_found(name),
-        },
+    // Selector-aware target list (`@a`, `@p`, `@e`, `@r`, ...). Silently
+    // resolves through `resolve_players` then applies the same self/other
+    // split as the single-target path.
+    let targets: Vec<String> = match target_arg {
+        Some(query) => {
+            let resolved = resolve_players(source, players, query);
+            if resolved.is_empty() {
+                return player_not_found(query);
+            }
+            resolved.iter().map(|player| player.name.clone()).collect()
+        }
         None => {
             if source.is_console {
-                return error("§cDebes especificar un jugador.");
+                return error("§cYou must specify a player.");
             }
-            source.name.clone()
+            vec![source.name.clone()]
         }
     };
 
-    // PocketMine reports a failure when the target already has that mode.
-    let current = players
+    // `fetchPermittedPlayerTarget` permission split over the whole set: any
+    // `other` target needs `.other`, any self target needs `.self`.
+    let has_self = targets
         .iter()
-        .find(|player| player.name.eq_ignore_ascii_case(&target))
-        .map(|player| player.gamemode);
-    if current == Some(gamemode) {
-        return feedback(lang::GAMEMODE_FAILURE.replace("{%playerName}", &target));
-    }
-
-    // `fetchPermittedPlayerTarget`: `.self` for the sender, `.other` otherwise.
-    let node = if target.eq_ignore_ascii_case(&source.name) {
-        crate::permission::COMMAND_GAMEMODE_SELF
-    } else {
-        crate::permission::COMMAND_GAMEMODE_OTHER
-    };
-    if !source.can(node) {
+        .any(|name| name.eq_ignore_ascii_case(&source.name));
+    let has_other = targets
+        .iter()
+        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+    if (has_self && !source.can(crate::permission::COMMAND_GAMEMODE_SELF))
+        || (has_other && !source.can(crate::permission::COMMAND_GAMEMODE_OTHER))
+    {
         return permission_for("gamemode");
     }
 
     let mode_name = gamemode_translatable(gamemode);
-    let feedback = if target.eq_ignore_ascii_case(&source.name) {
-        fill_template(lang::GAMEMODE_SUCCESS_SELF, &[mode_name])
-    } else {
-        fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &target])
-    };
-
-    let message = feedback.clone();
-    action(
-        feedback,
-        CommandAction::SetGamemode {
+    let mut feedback_lines = Vec::new();
+    let mut actions = Vec::new();
+    for target in targets {
+        // PocketMine reports a failure when the target already has that mode.
+        let current = players
+            .iter()
+            .find(|player| player.name.eq_ignore_ascii_case(&target))
+            .map(|player| player.gamemode);
+        if current == Some(gamemode) {
+            feedback_lines.push(lang::GAMEMODE_FAILURE.replace("{%playerName}", &target));
+            continue;
+        }
+        let success = if target.eq_ignore_ascii_case(&source.name) {
+            fill_template(lang::GAMEMODE_SUCCESS_SELF, &[mode_name])
+        } else {
+            fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &target])
+        };
+        let message = success.clone();
+        feedback_lines.push(success);
+        actions.push(CommandAction::SetGamemode {
             target,
             gamemode,
             message,
             notify: source.name.clone(),
-        },
-    )
+        });
+    }
+    if actions.is_empty() && feedback_lines.is_empty() {
+        return feedback(lang::GAMEMODE_FAILURE.to_string());
+    }
+    CommandOutput {
+        feedback: feedback_lines,
+        actions,
+    }
 }
 
 fn spawn(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
-    let target = match args.first() {
-        Some(name) => {
+    let targets: Vec<String> = match args.first() {
+        Some(query) => {
             if !source.can_use_privileged() {
                 return permission_error();
             }
-            match resolve_player(players, name, &source.name) {
-                Some(player) => player.name.clone(),
-                None => return player_not_found(name),
+            let resolved = resolve_players(source, players, query);
+            if resolved.is_empty() {
+                return player_not_found(query);
             }
+            resolved
+                .iter()
+                .map(|player| player.name.clone())
+                .collect()
         }
         None => {
             if source.is_console {
-                return error("§cDebes especificar un jugador.");
+                return error("§cYou must specify a player.");
             }
-            source.name.clone()
+            vec![source.name.clone()]
         }
     };
 
-    action(
-        format!(
-            "§a{} al punto de aparición del mundo.",
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for target in targets {
+        feedback.push(format!(
+            "§a{} to the world spawn point.",
             if target.eq_ignore_ascii_case(&source.name) {
-                "Teletransportado"
+                "Teleported"
             } else {
-                "Jugador teletransportado"
+                "Player teleported"
             }
-        ),
-        CommandAction::TeleportToSpawn { target },
-    )
+        ));
+        actions.push(CommandAction::TeleportToSpawn { target });
+    }
+    CommandOutput { feedback, actions }
 }
 
 fn set_world_spawn(source: &CommandSource, args: &[&str]) -> CommandOutput {
@@ -1026,7 +1244,7 @@ fn set_world_spawn(source: &CommandSource, args: &[&str]) -> CommandOutput {
 
     action(
         format!(
-            "§aPunto de aparición del mundo fijado en §f{}, {}, {}§a.",
+            "§aWorld spawn point set to §f{}, {}, {}§a.",
             position.0, position.1, position.2
         ),
         CommandAction::SetWorldSpawn {
@@ -1070,7 +1288,7 @@ fn whisper(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> C
         return usage("msg");
     }
 
-    let Some(target) = resolve_player(players, args[0], &source.name) else {
+    let Some(target) = resolve_player(source, players, args[0]) else {
         return player_not_found(args[0]);
     };
     if target.name.eq_ignore_ascii_case(&source.name) {
@@ -1112,126 +1330,192 @@ fn list(source: &CommandSource, players: &[OnlinePlayer]) -> CommandOutput {
 }
 
 fn kick(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
-    let Some(name) = args.first() else {
+    let Some(query) = args.first() else {
         return usage("kick");
     };
-    let Some(target) = resolve_player(players, name, &source.name) else {
-        return player_not_found(name);
-    };
+    let targets = resolve_players(source, players, query);
+    if targets.is_empty() {
+        return player_not_found(query);
+    }
 
     let reason = if args.len() > 1 {
-        Some(args[1..].join(" "))
+        args[1..].join(" ")
     } else {
-        None
+        String::new()
     };
-    let message = match &reason {
-        Some(reason) => fill_template(lang::KICK_SUCCESS_REASON, &[&target.name, reason]),
-        None => fill_template(lang::KICK_SUCCESS, &[&target.name]),
-    };
-
-    action(
-        message,
-        CommandAction::Kick {
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for target in targets {
+        let message = if reason.is_empty() {
+            fill_template(lang::KICK_SUCCESS, &[&target.name])
+        } else {
+            fill_template(lang::KICK_SUCCESS_REASON, &[&target.name, &reason])
+        };
+        feedback.push(message);
+        actions.push(CommandAction::Kick {
             target: target.name.clone(),
-            reason: reason.unwrap_or_default(),
-        },
-    )
+            reason: reason.clone(),
+        });
+    }
+    CommandOutput { feedback, actions }
 }
 
-/// Vanilla translation strings used by `/give`, `/clear` and `/kill`, copied
-/// verbatim from PocketMine-MP's `spa.ini` so the output matches the PHP server
+/// Vanilla translation strings, copied verbatim from PocketMine-MP's
+/// `eng.ini` (the runtime `eng` locale) so the output matches the PHP server
 /// key for key.
 pub mod lang {
-    pub const USAGE: &str = "Uso: {%0}";
-    pub const PERMISSION: &str = "No tienes permiso para ejecutar el comando: {%commandName}";
-    pub const PLAYER_NOT_FOUND: &str =
-        "No se pudo encontrar un jugador que coincida con \"{%playerName}\"";
-    pub const GIVE_ITEM_NOT_FOUND: &str = "No existe tal objeto con el nombre {%0}";
-    pub const GIVE_SUCCESS: &str = "Dado {%0} * {%1} a {%2}";
-    pub const GIVE_TAG_ERROR: &str = "Error al analizar la etiqueta de datos: {%0}";
-    pub const SPAWNPOINT_SUCCESS: &str =
-        "Punto de aparición de {%0} establecido en ({%1}, {%2}, {%3})";
-    pub const DEFAULTGAMEMODE_SUCCESS: &str =
-        "El modo de juego por defecto del mundo es ahora {%0}";
-    pub const DIFFICULTY_SUCCESS: &str = "Cambiada la dificultad del juego a {%0}";
-    pub const SEED_SUCCESS: &str = "Semilla: {%0}";
-    pub const GAMEMODE_UNKNOWN: &str = "Modo de juego desconocido \"{%gameModeName}\"";
-    pub const GAMEMODE_FAILURE: &str = "¡Error al cambiar el modo de juego de {%playerName}!";
-    pub const GAMEMODE_SUCCESS_SELF: &str = "Modo de juego propio establecido a {%0}";
-    pub const GAMEMODE_SUCCESS_OTHER: &str = "Se ha cambiado el modo de juego de {%1} a {%0}";
-    pub const GAMEMODE_CHANGED: &str = "Tu modo de juego ha sido actualizado a {%0}";
-    pub const BAN_SUCCESS: &str = "Jugador {%0} baneado";
-    pub const BAN_USAGE: &str = "/ban <nombre> [razón ...]";
-    pub const BANIP_INVALID: &str =
-        "Has ingresado una dirección IP inválida o el jugador no está en línea";
-    pub const BANIP_SUCCESS: &str = "IP {%0} bloqueada";
-    pub const BANIP_SUCCESS_PLAYERS: &str = "Se ha bloqueado la IP {%0} perteneciente a {%1}";
-    pub const BANIP_USAGE: &str = "/ban-ip <dirección|nombre> [Razón ...]";
-    pub const BANLIST_IPS: &str = "Hay {%0} IPs bloqueadas:";
-    pub const BANLIST_PLAYERS: &str = "Hay un total de {%0} jugadores baneados:";
-    pub const BANLIST_USAGE: &str = "/banlist [ips|jugadores]";
-    pub const UNBAN_SUCCESS: &str = "Levantado castigo de jugador {%0}";
-    pub const UNBAN_USAGE: &str = "/pardon <nombre>";
-    pub const UNBANIP_SUCCESS: &str = "La IP {%0} ha sido desbaneada";
-    pub const UNBANIP_INVALID: &str = "Has ingresado una dirección IP no válida";
-    pub const UNBANIP_USAGE: &str = "/pardon-ip <dirección>";
-    pub const WHITELIST_ADD_SUCCESS: &str = "Se ha añadido a {%0} a la lista blanca";
-    pub const WHITELIST_ADD_USAGE: &str = "/whitelist add <jugador>";
-    pub const WHITELIST_DISABLED: &str = "Lista blanca apagada";
-    pub const WHITELIST_ENABLED: &str = "Lista blanca encendida";
-    pub const WHITELIST_LIST: &str =
-        "Hay {%0} (de cada {%1} vistos) jugadores en la lista blanca:";
-    pub const WHITELIST_RELOADED: &str = "Lista blanca recargada";
-    pub const WHITELIST_REMOVE_SUCCESS: &str = "Se ha removido a {%0} de la lista blanca";
-    pub const WHITELIST_REMOVE_USAGE: &str = "/whitelist remove <jugador>";
+    // Values mirror `resources/eng.ini` (the runtime `eng` locale).
+    pub const USAGE: &str = "Usage: {%0}";
+    pub const PERMISSION: &str = "You don't have permission to use the command: {%commandName}";
+    pub const PLAYER_NOT_FOUND: &str = "Cannot find a player matching \"{%playerName}\"";
+    pub const GIVE_ITEM_NOT_FOUND: &str = "There is no such item with name {%0}";
+    pub const GIVE_SUCCESS: &str = "Given {%0} * {%1} to {%2}";
+    pub const GIVE_TAG_ERROR: &str = "Data tag parsing failed: {%0}";
+    pub const SPAWNPOINT_SUCCESS: &str = "Set {%0}'s spawn point to ({%1}, {%2}, {%3})";
+    pub const DEFAULTGAMEMODE_SUCCESS: &str = "The world's default game mode is now {%0}";
+    pub const DIFFICULTY_SUCCESS: &str = "Set game difficulty to {%0}";
+    pub const SEED_SUCCESS: &str = "Seed: {%0}";
+    pub const GAMEMODE_UNKNOWN: &str = "Unknown game mode \"{%gameModeName}\"";
+    pub const GAMEMODE_FAILURE: &str = "Game mode change for {%playerName} failed!";
+    pub const GAMEMODE_SUCCESS_SELF: &str = "Set own game mode to {%0}";
+    pub const GAMEMODE_SUCCESS_OTHER: &str = "Set {%1}'s game mode to {%0}";
+    pub const GAMEMODE_CHANGED: &str = "Your game mode has been updated to {%0}";
+    pub const BAN_SUCCESS: &str = "Banned player {%0}";
+    pub const BAN_USAGE: &str = "/ban <name> [reason ...]";
+    pub const BANIP_INVALID: &str = "You have entered an invalid IP address or a player that is not online";
+    pub const BANIP_SUCCESS: &str = "Banned IP address {%0}";
+    pub const BANIP_SUCCESS_PLAYERS: &str = "Banned IP address {%0} belonging to {%1}";
+    pub const BANIP_USAGE: &str = "/ban-ip <address|name> [reason ...]";
+    pub const BANLIST_IPS: &str = "There are {%0} total banned IP addresses:";
+    pub const BANLIST_PLAYERS: &str = "There are {%0} total banned players:";
+    pub const BANLIST_USAGE: &str = "/banlist [ips|players]";
+    pub const UNBAN_SUCCESS: &str = "Unbanned player {%0}";
+    pub const UNBAN_USAGE: &str = "/pardon <name>";
+    pub const UNBANIP_SUCCESS: &str = "Unbanned IP address {%0}";
+    pub const UNBANIP_INVALID: &str = "You have entered an invalid IP address";
+    pub const UNBANIP_USAGE: &str = "/pardon-ip <address>";
+    pub const WHITELIST_ADD_SUCCESS: &str = "Added {%0} to the whitelist";
+    pub const WHITELIST_ADD_USAGE: &str = "/whitelist add <player>";
+    pub const WHITELIST_DISABLED: &str = "Turned off the whitelist";
+    pub const WHITELIST_ENABLED: &str = "Turned on the whitelist";
+    pub const WHITELIST_LIST: &str = "There are {%0} (out of {%1} seen) whitelisted players:";
+    pub const WHITELIST_RELOADED: &str = "Reloaded the whitelist";
+    pub const WHITELIST_REMOVE_SUCCESS: &str = "Removed {%0} from the whitelist";
+    pub const WHITELIST_REMOVE_USAGE: &str = "/whitelist remove <player>";
     pub const WHITELIST_USAGE: &str = "/whitelist <on|off|list|add|remove|reload>";
-    pub const STOP_START: &str = "Deteniendo el servidor";
-    pub const DISCONNECT_BAN: &str = "Estás baneado de este servidor. Motivo: {%reason}";
-    pub const DISCONNECT_BAN_NOREASON: &str = "Estás baneado de este servidor";
-    pub const DISCONNECT_BAN_IP: &str = "Baneado de IP";
-    pub const DISCONNECT_WHITELISTED: &str = "El servidor está en modo lista blanca";
-    pub const DISCONNECT_KICK: &str = "Expulsado por un administrador. Motivo: {%reason}";
+    pub const STOP_START: &str = "Stopping the server";
+    pub const DISCONNECT_BAN: &str = "You are banned from this server. Reason: {%reason}";
+    pub const DISCONNECT_BAN_NOREASON: &str = "You are banned from this server";
+    pub const DISCONNECT_BAN_IP: &str = "IP banned";
+    pub const DISCONNECT_WHITELISTED: &str = "Server is whitelisted";
+    pub const DISCONNECT_KICK: &str = "Kicked by admin. Reason: {%reason}";
     pub const PLUGINS_SUCCESS: &str = "Plugins ({%0}): {%1}";
-    pub const SAVE_START: &str = "Guardando datos del servidor...";
-    pub const SAVE_SUCCESS: &str = "Se completó el guardado en {%0} segundos";
-    pub const SAVE_ENABLED: &str = "El autoguardado del mundo ha sido activado";
-    pub const SAVE_DISABLED: &str = "El autoguardado del mundo ha sido desactivado";
-    pub const CLEAR_SUCCESS: &str = "Se vació el inventario de {%0}, {%1} objetos eliminados";
-    pub const CLEAR_FAILURE_NO_ITEMS: &str =
-        "No se ha podido vaciar el inventario de {%0}: no tiene objetos para eliminar";
-    pub const CLEAR_TESTING: &str = "{%0} tiene {%1} objetos que coinciden con los criterios";
-    pub const KILL_SUCCESSFUL: &str = "{%0} Murió";
-    pub const NUM_TOO_BIG: &str =
-        "El número que ha introducido ({%0}) es demasiado grande, debe ser como mucho {%1}";
-    pub const NUM_TOO_SMALL: &str =
-        "El número que ha introducido ({%0}) es demasiado pequeño, debe ser como mínimo {%1}";
+    pub const SAVE_START: &str = "Saving server data...";
+    pub const SAVE_SUCCESS: &str = "Save completed in {%0} seconds";
+    pub const SAVE_ENABLED: &str = "Turned on world auto-saving";
+    pub const SAVE_DISABLED: &str = "Turned off world auto-saving";
+    pub const CLEAR_SUCCESS: &str = "Cleared the inventory of {%0}, removing {%1} items";
+    pub const CLEAR_FAILURE_NO_ITEMS: &str = "Could not clear inventory of {%0}, no items to remove";
+    pub const CLEAR_TESTING: &str = "{%0} has {%1} items that match the criteria";
+    pub const KILL_SUCCESSFUL: &str = "Killed {%0}";
+    pub const NUM_TOO_BIG: &str = "The number you have entered ({%0}) is too big, it must be at most {%1}";
+    pub const NUM_TOO_SMALL: &str = "The number you have entered ({%0}) is too small, it must be at least {%1}";
     pub const CHAT_ANNOUNCEMENT: &str = "[{%0}] {%1}";
     pub const CHAT_ADMIN: &str = "[{%0}: {%1}]";
     pub const CHAT_EMOTE: &str = "* {%0} {%1}";
-    pub const MESSAGE_OUTGOING: &str = "Le susurras a {%0}: {%1}";
-    pub const MESSAGE_INCOMING: &str = "{%0} te susurra: {%1}";
-    pub const MESSAGE_SAME_TARGET: &str = "¡No puedes enviarte un mensaje privado a ti mismo!";
-    pub const KICK_SUCCESS: &str = "{%0} ha sido expulsado del juego";
-    pub const KICK_SUCCESS_REASON: &str = "{%0} ha sido expulsado del juego: '{%1}'";
-    pub const TIME_SET: &str = "Establecer el tiempo a {%0}";
-    pub const TIME_ADDED: &str = "{%0} añadido a la hora";
-    pub const TIME_QUERY: &str = "El Tiempo es {%0}";
-    pub const TITLE_SUCCESS: &str = "El comando title se ejecutó correctamente";
-    pub const PLAYER_USER_ONLY: &str =
-        "Esta sintaxis de comando solo puede ser usada como jugador";
-    pub const VERSION_SOFTWARE_NAME: &str = "Este servidor está ejecutando {%serverSoftwareName}";
-    pub const VERSION_SOFTWARE_VERSION: &str =
-        "Versión del servidor: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
-    pub const VERSION_MINECRAFT: &str =
-        "Versión compatible de Minecraft: {%minecraftVersion} (versión de protocolo: {%minecraftProtocolVersion})";
-    pub const PLAYERS_LIST: &str = "Hay {%0}/{%1} jugadores en línea:";
-    pub const HELP_HEADER: &str =
-        "--- Mostrando página de ayuda {%0} de {%1} (/help [página]) ---";
-    pub const HELP_SPECIFIC_HEADER: &str = "Ayuda: /{%commandName}";
-    pub const HELP_SPECIFIC_DESCRIPTION: &str = "Descripción: {%description}";
-    pub const HELP_SPECIFIC_USAGE: &str = "Uso: {%usage}";
-    pub const HELP_SPECIFIC_ALIASES: &str = "Alias: {%aliasList}";
-    pub const COMMAND_NOT_FOUND: &str = "Comando desconocido: {%commandName}. Utilice {%helpCommand} para obtener una lista de comandos disponibles.";
+    pub const MESSAGE_OUTGOING: &str = "You whisper to {%0}: {%1}";
+    pub const MESSAGE_INCOMING: &str = "{%0} whispers to you: {%1}";
+    pub const MESSAGE_SAME_TARGET: &str = "You can't send a private message to yourself!";
+    pub const KICK_SUCCESS: &str = "Kicked {%0} from the game";
+    pub const KICK_SUCCESS_REASON: &str = "Kicked {%0} from the game: '{%1}'";
+    pub const TIME_SET: &str = "Set the time to {%0}";
+    pub const TIME_ADDED: &str = "Added {%0} to the time";
+    pub const TIME_QUERY: &str = "Time is {%0}";
+    pub const TITLE_SUCCESS: &str = "Title command successfully executed";
+    pub const PLAYER_USER_ONLY: &str = "This command syntax can only be used as a player";
+    pub const VERSION_SOFTWARE_NAME: &str = "This server is running {%serverSoftwareName}";
+    pub const VERSION_SOFTWARE_VERSION: &str = "Server version: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
+    pub const VERSION_MINECRAFT: &str = "Compatible Minecraft version: {%minecraftVersion} (protocol version: {%minecraftProtocolVersion})";
+    pub const PLAYERS_LIST: &str = "There are {%0}/{%1} players online:";
+    pub const HELP_HEADER: &str = "--- Showing help page {%0} of {%1} (/help [page]) ---";
+    pub const HELP_SPECIFIC_HEADER: &str = "Help: /{%commandName}";
+    pub const HELP_SPECIFIC_DESCRIPTION: &str = "Description: {%description}";
+    pub const HELP_SPECIFIC_USAGE: &str = "Usage: {%usage}";
+    pub const HELP_SPECIFIC_ALIASES: &str = "Aliases: {%aliasList}";
+    pub const COMMAND_NOT_FOUND: &str = "Unknown command: {%commandName}. Use {%helpCommand} for a list of available commands.";
+    // /effect (eng.ini: commands.effect.*)
+    pub const EFFECT_NOT_FOUND: &str = "There is no such mob effect with ID {%0}";
+    pub const EFFECT_SUCCESS_REMOVED_ALL: &str = "Took all effects from {%0}";
+    pub const EFFECT_SUCCESS_REMOVED: &str = "Took {%0} from {%1}";
+    pub const EFFECT_SUCCESS: &str = "Given {%0} * {%1} to {%2} for {%3} seconds";
+    pub const EFFECT_SUCCESS_INFINITE: &str = "Given {%0} * {%1} to {%2} for an infinite duration";
+    pub const EFFECT_FAILURE_NOT_ACTIVE_ALL: &str = "Couldn't take any effects from {%0} as they do not have any";
+    pub const EFFECT_FAILURE_NOT_ACTIVE: &str = "Couldn't take {%0} from {%1} as they do not have the effect";
+    // /enchant (eng.ini: commands.enchant.*)
+    pub const ENCHANT_NO_ITEM: &str = "The target does not hold an item";
+    pub const ENCHANT_NOT_FOUND: &str = "There is no such enchantment with ID {%0}";
+    pub const ENCHANT_SUCCESS: &str = "Enchanting succeeded for {%0}";
+    // /xp (eng.ini: commands.xp.*)
+    pub const XP_FAILURE_WIDTHDRAW: &str = "Cannot give player negative experience points";
+    pub const XP_SUCCESS: &str = "Gave {%0} experience to {%1}";
+    pub const XP_SUCCESS_LEVELS: &str = "Gave {%0} experience levels to {%1}";
+    pub const XP_SUCCESS_NEGATIVE_LEVELS: &str = "Taken {%0} levels from {%1}";
+    // /particle (eng.ini: commands.particle.*)
+    pub const PARTICLE_NOT_FOUND: &str = "Unknown effect name {%0}";
+    pub const PARTICLE_SUCCESS: &str = "Playing effect {%0} for {%1} times";
+    // /status (eng.ini: pocketmine.command.status.*)
+    pub const STATUS_HEADER: &str = "Server status";
+    pub const STATUS_UPTIME: &str = "Uptime: {%uptime}";
+    pub const STATUS_UPTIME_SECONDS: &str = "{%seconds} seconds";
+    pub const STATUS_UPTIME_MINUTES: &str = "{%minutes} minutes {%seconds} seconds";
+    pub const STATUS_UPTIME_HOURS: &str = "{%hours} hours {%minutes} minutes {%seconds} seconds";
+    pub const STATUS_UPTIME_DAYS: &str = "{%days} days {%hours} hours {%minutes} minutes {%seconds} seconds";
+    pub const STATUS_TPS_CURRENT: &str = "Current TPS: {%info}";
+    pub const STATUS_TPS_AVERAGE: &str = "Average TPS: {%info}";
+    pub const STATUS_TPS_STAT: &str = "{%ticksPerSecond} ({%loadPercent}%)";
+    pub const STATUS_NETWORK_UPLOAD: &str = "Network upload: {%info}";
+    pub const STATUS_NETWORK_DOWNLOAD: &str = "Network download: {%info}";
+    pub const STATUS_NETWORK_STAT: &str = "{%kbps} kB/s";
+    pub const STATUS_THREADS: &str = "Thread count: {%count}";
+    pub const STATUS_MEMORY_MAIN: &str = "Main thread memory: {%info}";
+    pub const STATUS_MEMORY_TOTAL: &str = "Total memory: {%info}";
+    pub const STATUS_MEMORY_VIRTUAL: &str = "Total virtual memory: {%info}";
+    pub const STATUS_MEMORY_MANAGER: &str = "Maximum memory (manager): {%info}";
+    pub const STATUS_MEMORY_STAT: &str = "{%megabytes} MB.";
+    pub const STATUS_WORLD: &str = "World {%worldName}: {%loadedChunks} loaded chunks, {%tickingChunks} ticking chunks, {%entities} entities. Time {%timeStat}";
+    pub const STATUS_WORLD_TIME_STAT: &str = "{%milliseconds}ms";
+    // /timings (eng.ini: pocketmine.command.timings.*)
+    pub const TIMINGS_ALREADY_ENABLED: &str = "Timings are already enabled";
+    pub const TIMINGS_ENABLE: &str = "Enabled Timings & Reset";
+    pub const TIMINGS_DISABLE: &str = "Disabled Timings";
+    pub const TIMINGS_DISABLED: &str = "Please enable timings by typing /timings on";
+    pub const TIMINGS_RESET: &str = "Timings reset";
+    pub const TIMINGS_COLLECT: &str = "Collecting timing results...";
+    pub const TIMINGS_WRITE: &str = "Timings written to {%0}";
+    pub const TIMINGS_READ: &str = "You can read the results at {%0}";
+    pub const TIMINGS_PASTE_ERROR: &str = "An error happened while pasting the report";
+    pub const TIMINGS_USAGE: &str = "/timings <reset|report|on|off|paste>";
+    // /gc (eng.ini: pocketmine.command.gc.*)
+    pub const GC_HEADER: &str = "Garbage collection result";
+    pub const GC_CHUNKS: &str = "Chunks: {%chunksCollected}";
+    pub const GC_ENTITIES: &str = "Entities: {%entitiesCollected}";
+    pub const GC_CYCLES: &str = "Cycles: {%cyclesCollected}";
+    pub const GC_MEMORY_FREED: &str = "Memory freed: {%memoryFreed} MB";
+    // /time start|stop (PM broadcasts these literally, untranslated)
+    pub const TIME_RESTARTED: &str = "Restarted the time";
+    pub const TIME_STOPPED: &str = "Stopped the time";
+    // /version <plugin>
+    pub const VERSION_NO_SUCH_PLUGIN: &str = "This server is not running any plugin by that name. Use /plugins to get a list of plugins.";
+    pub const VERSION_PLUGIN_HEADER: &str = "{%pluginName} version {%version}";
+    pub const VERSION_PLUGIN_AUTHOR: &str = "Author: {%author}";
+    pub const VERSION_PLUGIN_AUTHORS: &str = "Authors: {%authors}";
+    pub const VERSION_PLUGIN_WEBSITE: &str = "Website: {%website}";
+    pub const TIME_USAGE: &str = "/time <set|add> <value> OR /time <start|stop|query>";
+    pub const EFFECT_USAGE: &str = "/effect <player> <effect> [seconds] [amplifier] [hideParticles] OR /effect <player> clear OR /effect <player> <effect> infinite [amplifier] [hideParticles]";
+    pub const ENCHANT_USAGE: &str = "/enchant <player> <enchantment ID> [level]";
+    pub const XP_USAGE: &str = "/xp <experience[L]> [player]";
+    pub const PARTICLE_USAGE: &str = "/particle <name> <x> <y> <z> <xd> <yd> <zd> [count] [data]";
+    pub const VERSION_USAGE: &str = "/version [plugin name]";
 }
 
 /// Replaces `{%0}`, `{%1}`, ... in a vanilla translation string.
@@ -1315,24 +1599,324 @@ fn player_by_prefix<'a>(players: &'a [OnlinePlayer], name: &str) -> Option<&'a O
     prefixed
 }
 
-/// `VanillaCommand::fetchPermittedPlayerTarget`: `@s` (or no argument) resolves
-/// to the sender, and the self/other permission split is done by the caller.
-fn fetch_permitted_player_target<'a>(
+/// Merges whitespace-split tokens that belong to a single selector `[...]`.
+/// `handle_command` splits on whitespace for the command name/args, so a
+/// selector written `@a[distance=1..5, name=Steve]` would split at the space
+/// after the comma. This joins tokens until brackets balance again.
+/// It also keeps JSON/NBT bracket pairs together; both callers rejoin with
+/// spaces anyway (`/give` tags, `/title` text), so merging is safe there.
+fn merge_selector_tokens(raw: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buffer: Option<String> = None;
+    let mut depth: i32 = 0;
+    for token in raw {
+        let delta = token.matches('[').count() as i32 - token.matches(']').count() as i32;
+        match &mut buffer {
+            None => {
+                depth = delta;
+                if depth <= 0 {
+                    out.push((*token).to_string());
+                } else {
+                    buffer = Some((*token).to_string());
+                }
+            }
+            Some(current) => {
+                current.push(' ');
+                current.push_str(token);
+                depth += delta;
+                if depth <= 0 {
+                    out.push(buffer.take().expect("buffer present"));
+                    depth = 0;
+                }
+            }
+        }
+    }
+    if let Some(current) = buffer {
+        out.push(current);
+    }
+    out
+}
+
+/// Sort order for selector results (`sort=nearest|furthest|arbitrary|random`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorSort {
+    Nearest,
+    Furthest,
+    Arbitrary,
+    Random,
+}
+
+/// Parsed `[...]` arguments shared by every `@` selector.
+#[derive(Debug, Clone, Default)]
+struct SelectorArgs {
+    x: Option<f64>,
+    y: Option<f64>,
+    z: Option<f64>,
+    distance_min: Option<f64>,
+    distance_max: Option<f64>,
+    limit: Option<usize>,
+    sort: Option<SelectorSort>,
+    name: Option<String>,
+    type_: Option<String>,
+    gamemode: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorKind {
+    Self_,
+    Nearest,
+    AllPlayers,
+    AllEntities,
+    Random,
+}
+
+/// `@s`, `@p`, `@a`, `@e`, `@r` plus the `@n`/`@c` aliases. `@n` is nearest
+/// (alias of `@p`); `@c` is a legacy alias for all players (`@a`). Neither
+/// is vanilla Bedrock nor PocketMine vanilla, but both appear in forks and
+/// are kept as aliases rather than silently failing.
+fn is_selector(query: &str) -> bool {
+    query.starts_with('@')
+}
+
+/// Parses `distance=` values: `5`, `..5`, `5..`, `1..5`.
+fn parse_distance_range(value: &str) -> Option<(Option<f64>, Option<f64>)> {
+    let value = value.trim();
+    if let Some((min, max)) = value.split_once("..") {
+        let min = min.trim();
+        let max = max.trim();
+        let min_value = if min.is_empty() {
+            None
+        } else {
+            Some(min.parse::<f64>().ok()?)
+        };
+        let max_value = if max.is_empty() {
+            None
+        } else {
+            Some(max.parse::<f64>().ok()?)
+        };
+        if min_value.is_none() && max_value.is_none() {
+            return None;
+        }
+        Some((min_value, max_value))
+    } else {
+        let single = value.parse::<f64>().ok()?;
+        Some((None, Some(single)))
+    }
+}
+
+/// Parses a `@` selector. Returns `None` for an unknown selector letter or
+/// a malformed `[...]` block, which callers report as
+/// `commands.generic.player.notFound`.
+fn parse_selector(
+    query: &str,
+    source_position: (f64, f64, f64),
+) -> Option<(SelectorKind, SelectorArgs)> {
+    if !query.starts_with('@') || query.len() < 2 {
+        return None;
+    }
+    let letter = (query.as_bytes()[1] as char).to_ascii_lowercase();
+    let kind = match letter {
+        's' => SelectorKind::Self_,
+        'p' | 'n' => SelectorKind::Nearest,
+        'a' | 'c' => SelectorKind::AllPlayers,
+        'e' => SelectorKind::AllEntities,
+        'r' => SelectorKind::Random,
+        _ => return None,
+    };
+    let rest = query[2..].trim();
+    if rest.is_empty() {
+        return Some((kind, SelectorArgs::default()));
+    }
+    if !rest.starts_with('[') || !rest.ends_with(']') {
+        return None;
+    }
+    let inner = &rest[1..rest.len() - 1];
+    let mut args = SelectorArgs::default();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        match key.as_str() {
+            "x" => args.x = parse_coordinate(value, source_position.0),
+            "y" => args.y = parse_coordinate(value, source_position.1),
+            "z" => args.z = parse_coordinate(value, source_position.2),
+            "distance" => {
+                if let Some((min, max)) = parse_distance_range(value) {
+                    args.distance_min = min;
+                    args.distance_max = max;
+                }
+            }
+            "limit" => {
+                if let Ok(value) = value.parse::<i64>() {
+                    args.limit = Some(if value < 0 { 0 } else { value as usize });
+                }
+            }
+            "sort" => {
+                args.sort = match value.to_lowercase().as_str() {
+                    "nearest" => Some(SelectorSort::Nearest),
+                    "furthest" => Some(SelectorSort::Furthest),
+                    "arbitrary" => Some(SelectorSort::Arbitrary),
+                    "random" => Some(SelectorSort::Random),
+                    _ => None,
+                };
+            }
+            "name" => args.name = Some(value.to_string()),
+            "type" => args.type_ = Some(value.to_string()),
+            "gamemode" => args.gamemode = parse_gamemode(value),
+            _ => {}
+        }
+    }
+    Some((kind, args))
+}
+
+fn selector_distance(position: (f64, f64, f64), origin: (f64, f64, f64)) -> f64 {
+    let dx = position.0 - origin.0;
+    let dy = position.1 - origin.1;
+    let dz = position.2 - origin.2;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Small xorshift generator so `@r` / `sort=random` do not need a rand
+/// dependency. Mixed with wall time and a counter, so consecutive calls do
+/// not repeat the same pick within a tick.
+fn next_pseudo_random() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x853c49e6748fea9b);
+    let count = COUNTER.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = count ^ nanos ^ count.wrapping_shl(6) ^ count.wrapping_shr(2);
+    if state == 0 {
+        state = 0x9e3779b97f4a7c15;
+    }
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    state.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+fn shuffle_vec<T>(values: &mut Vec<T>) {
+    if values.len() <= 1 {
+        return;
+    }
+    for index in (1..values.len()).rev() {
+        let swap_with = (next_pseudo_random() % (index as u64 + 1)) as usize;
+        values.swap(index, swap_with);
+    }
+}
+
+/// Resolves a parsed `@` selector against the online snapshot.
+///
+/// `@e` returns the online players as entities: the Bedrock runtime has no
+/// non-player entity list yet, so mobs/items are not included (documented
+/// in the module docs). `type=player` is a no-op filter; any other `type`
+/// matches nothing.
+fn resolve_selector_targets<'a>(
+    source: &CommandSource,
+    players: &'a [OnlinePlayer],
+    kind: SelectorKind,
+    args: &SelectorArgs,
+) -> Vec<&'a OnlinePlayer> {
+    let origin = (
+        args.x.unwrap_or(source.position.0),
+        args.y.unwrap_or(source.position.1),
+        args.z.unwrap_or(source.position.2),
+    );
+    let mut pool: Vec<&OnlinePlayer> = match kind {
+        SelectorKind::Self_ => players
+            .iter()
+            .filter(|player| player.name.eq_ignore_ascii_case(&source.name))
+            .collect(),
+        _ => players.iter().collect(),
+    };
+    if let Some(name_filter) = &args.name {
+        pool.retain(|player| player.name.eq_ignore_ascii_case(name_filter));
+    }
+    if let Some(type_filter) = &args.type_ {
+        let lowered = type_filter.to_lowercase();
+        if lowered != "player" && lowered != "players" {
+            return Vec::new();
+        }
+    }
+    if let Some(gamemode) = args.gamemode {
+        pool.retain(|player| player.gamemode == gamemode);
+    }
+    if args.distance_min.is_some() || args.distance_max.is_some() {
+        pool.retain(|player| {
+            let distance = selector_distance(player.position, origin);
+            let min_ok = args.distance_min.map(|min| distance >= min).unwrap_or(true);
+            let max_ok = args.distance_max.map(|max| distance <= max).unwrap_or(true);
+            min_ok && max_ok
+        });
+    }
+    let effective_sort = args.sort.unwrap_or(match kind {
+        SelectorKind::Nearest => SelectorSort::Nearest,
+        SelectorKind::Random => SelectorSort::Random,
+        SelectorKind::Self_ | SelectorKind::AllPlayers | SelectorKind::AllEntities => {
+            SelectorSort::Arbitrary
+        }
+    });
+    match effective_sort {
+        SelectorSort::Nearest => pool.sort_by(|first, second| {
+            selector_distance(first.position, origin)
+                .partial_cmp(&selector_distance(second.position, origin))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SelectorSort::Furthest => pool.sort_by(|first, second| {
+            selector_distance(second.position, origin)
+                .partial_cmp(&selector_distance(first.position, origin))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SelectorSort::Arbitrary => {}
+        SelectorSort::Random => shuffle_vec(&mut pool),
+    }
+    let limit = args.limit.unwrap_or(match kind {
+        SelectorKind::Nearest | SelectorKind::Random | SelectorKind::Self_ => 1,
+        SelectorKind::AllPlayers | SelectorKind::AllEntities => usize::MAX,
+    });
+    if limit == 0 {
+        return Vec::new();
+    }
+    pool.truncate(limit);
+    if matches!(kind, SelectorKind::AllEntities) {
+        tracing::warn!(
+            "Selector @e: no non-player entities in the Bedrock runtime, returning {} player(s) as entities (type filters other than player match nothing)",
+            pool.len()
+        );
+    }
+    pool
+}
+
+/// `VanillaCommand::fetchPermittedPlayerTarget` extended with `@` selectors.
+///
+/// - `@s` (or no argument) resolves to the sender.
+/// - `@p`/`@n` nearest player to the sender (0,0,0 for the console unless
+///   `x`/`y`/`z` override it), `@a`/`@c` all players, `@e` all entities
+///   (players only for now, see [`resolve_selector_targets`]), `@r` random.
+/// - `[...]` arguments: `distance=min..max`, `name=`, `type=`, `x`/`y`/`z`,
+///   `limit=`, `sort=nearest|furthest|arbitrary|random`, `gamemode=`.
+///   Unknown keys are ignored.
+///
+/// Permission rule for multiple targets: everyone who is the sender needs
+/// `self_allowed`, anyone else needs `other_allowed`.
+fn fetch_permitted_player_targets<'a>(
     source: &CommandSource,
     players: &'a [OnlinePlayer],
     target: Option<&str>,
     command: &str,
     self_allowed: bool,
     other_allowed: bool,
-) -> Result<Option<&'a OnlinePlayer>, CommandOutput> {
-    let player = match target {
-        Some(name) if !name.eq_ignore_ascii_case("@s") => match player_by_prefix(players, name) {
-            Some(player) => player,
-            None => {
-                return Err(error(red(fill_template(lang::PLAYER_NOT_FOUND, &[name]))));
-            }
-        },
-        _ => {
+) -> Result<Vec<&'a OnlinePlayer>, CommandOutput> {
+    let targets: Vec<&OnlinePlayer> = match target {
+        None => {
             if source.is_console {
                 // PocketMine throws InvalidCommandSyntaxException here.
                 return Err(usage(command));
@@ -1341,24 +1925,57 @@ fn fetch_permitted_player_target<'a>(
                 .iter()
                 .find(|player| player.name.eq_ignore_ascii_case(&source.name))
             {
-                Some(player) => player,
+                Some(player) => vec![player],
                 None => {
-                    return Err(error(red(fill_template(
+                    return Err(error(red(fill_named(
                         lang::PLAYER_NOT_FOUND,
-                        &[&source.name],
+                        &[("playerName", &source.name)],
                     ))));
                 }
             }
         }
+        Some(query) if is_selector(query) => {
+            let Some((kind, args)) = parse_selector(query, source.position) else {
+                return Err(error(red(fill_named(
+                    lang::PLAYER_NOT_FOUND,
+                    &[("playerName", query)],
+                ))));
+            };
+            let resolved = resolve_selector_targets(source, players, kind, &args);
+            if resolved.is_empty() {
+                return Err(error(red(fill_named(
+                    lang::PLAYER_NOT_FOUND,
+                    &[("playerName", query)],
+                ))));
+            }
+            resolved
+        }
+        Some(name) => match player_by_prefix(players, name) {
+            Some(player) => vec![player],
+            None => {
+                return Err(error(red(fill_named(
+                    lang::PLAYER_NOT_FOUND,
+                    &[("playerName", name)],
+                ))));
+            }
+        },
     };
 
-    let is_self = player.name.eq_ignore_ascii_case(&source.name);
-    let allowed = if is_self { self_allowed } else { other_allowed };
-    if !allowed {
+    let has_self = targets
+        .iter()
+        .any(|player| player.name.eq_ignore_ascii_case(&source.name));
+    let has_other = targets
+        .iter()
+        .any(|player| !player.name.eq_ignore_ascii_case(&source.name));
+    if has_self && !self_allowed {
         let message = lang::PERMISSION.replace("{%commandName}", command);
         return Err(error(red(message)));
     }
-    Ok(Some(player))
+    if has_other && !other_allowed {
+        let message = lang::PERMISSION.replace("{%commandName}", command);
+        return Err(error(red(message)));
+    }
+    Ok(targets)
 }
 
 /// `/give <player> <item[:damage]> [amount] [tags...]`, ported one to one from
@@ -1370,7 +1987,7 @@ fn give(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
 
     let self_allowed = source.can(crate::permission::COMMAND_GIVE_SELF);
     let other_allowed = source.can(crate::permission::COMMAND_GIVE_OTHER);
-    let target = match fetch_permitted_player_target(
+    let targets = match fetch_permitted_player_targets(
         source,
         players,
         Some(args[0]),
@@ -1378,8 +1995,7 @@ fn give(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
         self_allowed,
         other_allowed,
     ) {
-        Ok(Some(player)) => player.name.clone(),
-        Ok(None) => source.name.clone(),
+        Ok(targets) => targets,
         Err(output) => return output,
     };
 
@@ -1415,20 +2031,24 @@ fn give(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
 
     let display = crate::inventory::item_display_name(network_id).unwrap_or_else(|| args[1].into());
     let label = format!("{} ({})", display, args[1]);
-    let message = fill_template(lang::GIVE_SUCCESS, &[&label, &count.to_string(), &target]);
-
-    CommandOutput {
-        feedback: vec![message.clone()],
-        actions: vec![CommandAction::Give {
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for player in targets {
+        let target = player.name.clone();
+        let message = fill_template(lang::GIVE_SUCCESS, &[&label, &count.to_string(), &target]);
+        feedback.push(message.clone());
+        actions.push(CommandAction::Give {
             target,
             network_id,
             meta,
             count,
-            nbt,
+            nbt: nbt.clone(),
             message,
             notify: source.name.clone(),
-        }],
+        });
     }
+
+    CommandOutput { feedback, actions }
 }
 
 /// `/clear [player] [item] [maxCount]`, ported one to one from
@@ -1439,7 +2059,7 @@ fn clear(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
     }
 
     // `clear.self` is granted to everyone, `clear.other` to operators.
-    let target = match fetch_permitted_player_target(
+    let targets = match fetch_permitted_player_targets(
         source,
         players,
         args.first().copied(),
@@ -1447,8 +2067,7 @@ fn clear(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
         source.can(crate::permission::COMMAND_CLEAR_SELF),
         source.can(crate::permission::COMMAND_CLEAR_OTHER),
     ) {
-        Ok(Some(player)) => player.name.clone(),
-        Ok(None) => source.name.clone(),
+        Ok(targets) => targets,
         Err(output) => return output,
     };
 
@@ -1467,14 +2086,18 @@ fn clear(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
 
     // The amount removed is only known once the inventory is touched, so the
     // result line is produced by the session manager.
-    CommandOutput {
-        feedback: Vec::new(),
-        actions: vec![CommandAction::ClearInventory {
-            target,
+    let actions = targets
+        .iter()
+        .map(|player| CommandAction::ClearInventory {
+            target: player.name.clone(),
             item,
             max_count: max_count as i32,
             notify: source.name.clone(),
-        }],
+        })
+        .collect();
+    CommandOutput {
+        feedback: Vec::new(),
+        actions,
     }
 }
 
@@ -1486,7 +2109,7 @@ fn kill(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
     }
 
     // `kill.self` is granted to everyone, `kill.other` to operators.
-    let target = match fetch_permitted_player_target(
+    let targets = match fetch_permitted_player_targets(
         source,
         players,
         args.first().copied(),
@@ -1494,22 +2117,25 @@ fn kill(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
         source.can(crate::permission::COMMAND_KILL_SELF),
         source.can(crate::permission::COMMAND_KILL_OTHER),
     ) {
-        Ok(Some(player)) => player.name.clone(),
-        Ok(None) => source.name.clone(),
+        Ok(targets) => targets,
         Err(output) => return output,
     };
 
-    let message = fill_template(lang::KILL_SUCCESSFUL, &[&target]);
-    let broadcast = !target.eq_ignore_ascii_case(&source.name);
-    CommandOutput {
-        feedback: vec![message.clone()],
-        actions: vec![CommandAction::Kill {
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for player in targets {
+        let target = player.name.clone();
+        let message = fill_template(lang::KILL_SUCCESSFUL, &[&target]);
+        let broadcast = !target.eq_ignore_ascii_case(&source.name);
+        feedback.push(message.clone());
+        actions.push(CommandAction::Kill {
             target,
             message,
             broadcast,
             notify: source.name.clone(),
-        }],
+        });
     }
+    CommandOutput { feedback, actions }
 }
 
 fn time(source: &CommandSource, args: &[&str]) -> CommandOutput {
@@ -1542,6 +2168,32 @@ fn time(source: &CommandSource, args: &[&str]) -> CommandOutput {
                     fill_template(lang::TIME_ADDED, &[&ticks.to_string()]),
                     CommandAction::AddTime(ticks),
                 )
+            }
+        }
+        Some("start") => {
+            if !source.can(crate::permission::COMMAND_TIME_START) {
+                return permission_for("time");
+            }
+            CommandOutput {
+                feedback: vec![lang::TIME_RESTARTED.to_string()],
+                actions: vec![CommandAction::SetTimeRunning {
+                    running: true,
+                    message: lang::TIME_RESTARTED.to_string(),
+                    notify: source.name.clone(),
+                }],
+            }
+        }
+        Some("stop") => {
+            if !source.can(crate::permission::COMMAND_TIME_STOP) {
+                return permission_for("time");
+            }
+            CommandOutput {
+                feedback: vec![lang::TIME_STOPPED.to_string()],
+                actions: vec![CommandAction::SetTimeRunning {
+                    running: false,
+                    message: lang::TIME_STOPPED.to_string(),
+                    notify: source.name.clone(),
+                }],
             }
         }
         Some("query") | None => {
@@ -1582,7 +2234,7 @@ fn weather(source: &CommandSource, args: &[&str]) -> CommandOutput {
     };
 
     action(
-        format!("§aClima cambiado a §f{}§a.", state.name_es()),
+        format!("§aWeather changed to §f{}§a.", state.name_en()),
         CommandAction::SetWeather {
             state,
             duration_ticks,
@@ -1596,14 +2248,14 @@ fn set_op(args: &[&str], op: bool) -> CommandOutput {
     };
     let name = name.trim();
     if name.is_empty() || name.eq_ignore_ascii_case("CONSOLE") {
-        return error("§cNombre de jugador no válido.");
+        return error("§cInvalid player name.");
     }
 
     action(
         if op {
-            format!("§a{} ahora es operador.", name)
+            format!("§a{} is now an operator.", name)
         } else {
-            format!("§a{} ya no es operador.", name)
+            format!("§a{} is no longer an operator.", name)
         },
         CommandAction::SetOp {
             target: name.to_string(),
@@ -1612,19 +2264,561 @@ fn set_op(args: &[&str], op: bool) -> CommandOutput {
     )
 }
 
-fn version() -> CommandOutput {
-    // `VersionCommand` prints the software, its version and the MCPE version.
+/// `/version [plugin]`, ported from `pocketmine\command\defaults\VersionCommand`.
+/// `about` is its PM alias. With an argument it describes matching plugins;
+/// without metadata (only names are in `CommandSource`) it reports the name
+/// and unknown version — full description/website/authors need a richer
+/// `PluginDescription` surface (see `plugins` source).
+fn version(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if args.is_empty() {
+        // `VersionCommand` prints the software, its version and the MCPE version.
+        return CommandOutput {
+            feedback: vec![
+                lang::VERSION_SOFTWARE_NAME.replace("{%serverSoftwareName}", "Axolotl-PM"),
+                lang::VERSION_SOFTWARE_VERSION
+                    .replace("{%serverSoftwareVersion}", "5.51.2-dev")
+                    .replace("{%serverGitHash}", "unknown"),
+                lang::VERSION_MINECRAFT
+                    .replace("{%minecraftVersion}", "1.26.60")
+                    .replace("{%minecraftProtocolVersion}", "2225"),
+            ],
+            actions: Vec::new(),
+        };
+    }
+    let query = args.join(" ");
+    let needle = query.to_lowercase();
+    let mut lines = Vec::new();
+    let mut found = false;
+    // Exact match wins; otherwise substring (PM `stripos`).
+    let exact = source
+        .plugins
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(&query));
+    if let Some(name) = exact {
+        lines.push(
+            lang::VERSION_PLUGIN_HEADER
+                .replace("{%pluginName}", name)
+                .replace("{%version}", "unknown"),
+        );
+        return CommandOutput { feedback: lines, actions: Vec::new() };
+    }
+    for name in &source.plugins {
+        if name.to_lowercase().contains(&needle) {
+            lines.push(
+                lang::VERSION_PLUGIN_HEADER
+                    .replace("{%pluginName}", name)
+                    .replace("{%version}", "unknown"),
+            );
+            found = true;
+        }
+    }
+    if !found {
+        return feedback(lang::VERSION_NO_SUCH_PLUGIN.to_string());
+    }
+    CommandOutput { feedback: lines, actions: Vec::new() }
+}
+
+/// `/effect`, ported from `pocketmine\command\defaults\EffectCommand`.
+/// Effect ids are treated as opaque strings (the Rust port has no
+/// `StringToEffectParser` registry yet — see the divergence note in
+/// `player_context`/session). Any non-empty id is accepted; removal paths
+/// (`clear`, duration `0`) mirror PM keys but the session currently always
+/// reports success because it cannot verify the active set.
+fn effect(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.len() < 2 {
+        return usage("effect");
+    }
+    let targets = match fetch_permitted_player_targets(
+        source,
+        players,
+        Some(args[0]),
+        "effect",
+        source.can(crate::permission::COMMAND_EFFECT_SELF),
+        source.can(crate::permission::COMMAND_EFFECT_OTHER),
+    ) {
+        Ok(targets) => targets,
+        Err(output) => return output,
+    };
+
+    if args[1].eq_ignore_ascii_case("clear") {
+        let mut feedback = Vec::new();
+        let mut actions = Vec::new();
+        for player in &targets {
+            let target = player.name.clone();
+            let message = fill_template(lang::EFFECT_SUCCESS_REMOVED_ALL, &[&target]);
+            feedback.push(message.clone());
+            actions.push(CommandAction::ApplyEffect {
+                target,
+                effect: String::new(),
+                duration_secs: None,
+                amplifier: 0,
+                particles: true,
+                remove: true,
+                message,
+                notify: source.name.clone(),
+            });
+        }
+        return CommandOutput { feedback, actions };
+    }
+
+    let effect_name = args[1].to_string();
+    let mut duration_secs: Option<i32> = None;
+    let mut infinite = false;
+    if args.len() >= 3 {
+        if args[2].eq_ignore_ascii_case("infinite") {
+            infinite = true;
+        } else {
+            match bounded_int(args[2], 0, (i32::MAX / 20) as i64) {
+                Ok(seconds) => {
+                    duration_secs = Some(seconds as i32);
+                    if seconds == 0 {
+                        let mut feedback = Vec::new();
+                        let mut actions = Vec::new();
+                        for player in &targets {
+                            let target = player.name.clone();
+                            let message = fill_template(
+                                lang::EFFECT_SUCCESS_REMOVED,
+                                &[&effect_name, &target],
+                            );
+                            feedback.push(message.clone());
+                            actions.push(CommandAction::ApplyEffect {
+                                target,
+                                effect: effect_name.clone(),
+                                duration_secs: Some(0),
+                                amplifier: 0,
+                                particles: true,
+                                remove: true,
+                                message,
+                                notify: source.name.clone(),
+                            });
+                        }
+                        return CommandOutput { feedback, actions };
+                    }
+                }
+                Err(BoundedIntError::Syntax) => return usage("effect"),
+                Err(BoundedIntError::TooBig) => {
+                    return error(red(fill_template(
+                        lang::NUM_TOO_BIG,
+                        &[args[2], &(i32::MAX / 20).to_string()],
+                    )));
+                }
+                Err(BoundedIntError::TooSmall) => {
+                    return error(red(fill_template(
+                        lang::NUM_TOO_SMALL,
+                        &[args[2], "0"],
+                    )));
+                }
+            }
+        }
+    }
+    if infinite {
+        duration_secs = None;
+    }
+
+    let amplifier = match args.get(3) {
+        Some(value) => match bounded_int(value, 0, 255) {
+            Ok(amp) => amp as i32,
+            Err(BoundedIntError::Syntax) => return usage("effect"),
+            Err(BoundedIntError::TooBig) => {
+                return error(red(fill_template(lang::NUM_TOO_BIG, &[value, "255"])));
+            }
+            Err(BoundedIntError::TooSmall) => {
+                return error(red(fill_template(lang::NUM_TOO_SMALL, &[value, "0"])));
+            }
+        },
+        None => 0,
+    };
+
+    let particles = match args.get(4) {
+        Some(v) => {
+            let lower = v.to_lowercase();
+            !(lower == "on" || lower == "true" || lower == "t" || lower == "1")
+        }
+        None => true,
+    };
+
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for player in &targets {
+        let target = player.name.clone();
+        let message = if infinite {
+            fill_template(
+                lang::EFFECT_SUCCESS_INFINITE,
+                &[&effect_name, &amplifier.to_string(), &target],
+            )
+        } else {
+            let secs = duration_secs.unwrap_or(0).to_string();
+            fill_template(
+                lang::EFFECT_SUCCESS,
+                &[&effect_name, &amplifier.to_string(), &target, &secs],
+            )
+        };
+        feedback.push(message.clone());
+        actions.push(CommandAction::ApplyEffect {
+            target,
+            effect: effect_name.clone(),
+            duration_secs,
+            amplifier,
+            particles,
+            remove: false,
+            message,
+            notify: source.name.clone(),
+        });
+    }
+    CommandOutput { feedback, actions }
+}
+
+/// `/enchant`, ported from `pocketmine\command\defaults\EnchantCommand`.
+/// The held-item check and enchantment registry live in the session (which
+/// owns the inventory); here we only resolve the target and bounds.
+fn enchant(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.len() < 2 {
+        return usage("enchant");
+    }
+    let targets = match fetch_permitted_player_targets(
+        source,
+        players,
+        Some(args[0]),
+        "enchant",
+        source.can(crate::permission::COMMAND_ENCHANT_SELF),
+        source.can(crate::permission::COMMAND_ENCHANT_OTHER),
+    ) {
+        Ok(targets) => targets,
+        Err(output) => return output,
+    };
+    let enchantment = args[1].to_string();
+    let level = match args.get(2) {
+        Some(value) => match bounded_int(value, 1, 255) {
+            Ok(level) => level as i32,
+            Err(BoundedIntError::Syntax) => return usage("enchant"),
+            Err(BoundedIntError::TooBig) => {
+                return error(red(fill_template(lang::NUM_TOO_BIG, &[value, "255"])));
+            }
+            Err(BoundedIntError::TooSmall) => {
+                return error(red(fill_template(lang::NUM_TOO_SMALL, &[value, "1"])));
+            }
+        },
+        None => 1,
+    };
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for player in &targets {
+        let target = player.name.clone();
+        let message = fill_template(lang::ENCHANT_SUCCESS, &[&target]);
+        feedback.push(message.clone());
+        actions.push(CommandAction::Enchant {
+            target,
+            enchantment: enchantment.clone(),
+            level,
+            message,
+            notify: source.name.clone(),
+        });
+    }
+    CommandOutput { feedback, actions }
+}
+
+/// `/xp <xp[L]> [player]`, ported from `pocketmine\command\defaults\XpCommand`.
+/// `getInteger` clamps instead of erroring, so out-of-range input is clamped
+/// to the int32 / level bounds; negative xp fails with the vanilla key.
+fn xp(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.is_empty() {
+        return usage("xp");
+    }
+    let targets = match fetch_permitted_player_targets(
+        source,
+        players,
+        args.get(1).copied(),
+        "xp",
+        source.can(crate::permission::COMMAND_XP_SELF),
+        source.can(crate::permission::COMMAND_XP_OTHER),
+    ) {
+        Ok(targets) => targets,
+        Err(output) => return output,
+    };
+    let raw = args[0];
+    let is_levels = raw.ends_with('L') || raw.ends_with('l');
+    if is_levels {
+        let number_part = &raw[..raw.len() - 1];
+        let amount = php_int_cast(number_part).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        let mut feedback = Vec::new();
+        let mut actions = Vec::new();
+        for player in &targets {
+            let target = player.name.clone();
+            let message = if amount >= 0 {
+                fill_template(lang::XP_SUCCESS_LEVELS, &[&amount.to_string(), &target])
+            } else {
+                fill_template(
+                    lang::XP_SUCCESS_NEGATIVE_LEVELS,
+                    &[&amount.unsigned_abs().to_string(), &target],
+                )
+            };
+            feedback.push(message.clone());
+            actions.push(CommandAction::AddXp {
+                target,
+                amount,
+                is_levels: true,
+                message,
+                notify: source.name.clone(),
+            });
+        }
+        CommandOutput { feedback, actions }
+    } else {
+        let amount = php_int_cast(raw).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        if amount < 0 {
+            return feedback(lang::XP_FAILURE_WIDTHDRAW.to_string());
+        }
+        let mut feedback = Vec::new();
+        let mut actions = Vec::new();
+        for player in &targets {
+            let target = player.name.clone();
+            let message = fill_template(lang::XP_SUCCESS, &[&amount.to_string(), &target]);
+            feedback.push(message.clone());
+            actions.push(CommandAction::AddXp {
+                target,
+                amount,
+                is_levels: false,
+                message,
+                notify: source.name.clone(),
+            });
+        }
+        CommandOutput { feedback, actions }
+    }
+}
+
+/// Particles recognised by `ParticleCommand::getParticle`. Unknown names hit
+/// `commands.particle.notFound` (red). `Type` ids are informational only
+/// until the session can emit `LevelEvent` packets.
+pub const KNOWN_PARTICLES: &[&str] = &[
+    "explode", "hugeexplosion", "hugeexplosionseed", "bubble", "splash", "wake", "water",
+    "crit", "smoke", "spell", "instantspell", "dripwater", "driplava", "townaura", "spore",
+    "portal", "flame", "lava", "reddust", "snowballpoof", "slime", "itembreak", "terrain",
+    "heart", "ink", "droplet", "enchantmenttable", "happyvillager", "angryvillager",
+    "forcefield", "mobflame", "iconcrack", "blockcrack", "blockdust", "sonicexplosion",
+];
+
+/// `/particle`, ported from `pocketmine\command\defaults\ParticleCommand`.
+fn particle(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.len() < 7 {
+        return usage("particle");
+    }
+    let name_lower = args[0].to_lowercase();
+    if !KNOWN_PARTICLES.contains(&name_lower.as_str()) {
+        return error(red(fill_template(lang::PARTICLE_NOT_FOUND, &[&name_lower])));
+    }
+    // Player coordinates are relative (`~`); console uses absolute values and
+    // the default world.
+    let base = if source.is_console {
+        source.world_spawn
+    } else {
+        source.position
+    };
+    let (Some(x), Some(y), Some(z)) = (
+        parse_coordinate(args[1], base.0),
+        parse_coordinate(args[2], base.1),
+        parse_coordinate(args[3], base.2),
+    ) else {
+        return usage("particle");
+    };
+    let delta = |value: &str| -> Option<f64> {
+        value.parse::<f64>().ok().filter(|v| v.is_finite())
+    };
+    let (Some(dx), Some(dy), Some(dz)) = (delta(args[4]), delta(args[5]), delta(args[6])) else {
+        return usage("particle");
+    };
+    let count = match args.get(7) {
+        Some(value) => php_int_cast(value).max(1) as i32,
+        None => 1,
+    };
+    let data = args.get(8).map(|s| s.to_string());
+    let message = fill_template(lang::PARTICLE_SUCCESS, &[&name_lower, &count.to_string()]);
+    let _ = players;
     CommandOutput {
-        feedback: vec![
-            lang::VERSION_SOFTWARE_NAME.replace("{%serverSoftwareName}", "PocketMine-Rust"),
-            lang::VERSION_SOFTWARE_VERSION
-                .replace("{%serverSoftwareVersion}", concat!("v", env!("CARGO_PKG_VERSION")))
-                .replace("{%serverGitHash}", "unknown"),
-            lang::VERSION_MINECRAFT
-                .replace("{%minecraftVersion}", "1.26.60")
-                .replace("{%minecraftProtocolVersion}", "2225"),
-        ],
-        actions: Vec::new(),
+        feedback: vec![message.clone()],
+        actions: vec![CommandAction::SpawnParticle {
+            name: name_lower,
+            position: (x, y, z),
+            delta: (dx, dy, dz),
+            count,
+            data,
+            message,
+        }],
+    }
+}
+
+/// `/status`, ported from `pocketmine\command\defaults\StatusCommand`.
+///
+/// PM reads uptime, TPS, bandwidth, threads and memory plus per-world
+/// chunk/entity counts. This port has only the TPS sampler (`tps`: 1m/5m/15m)
+/// in `CommandSource`, so uptime, memory, threads and networking are reported
+/// as `0` until `SessionManager` wires them in (see the divergence note in
+/// `status()`). The layout, keys and gold prefix still match PM so new
+/// wiring drops in without changing output shape.
+fn status(source: &CommandSource, players: &[OnlinePlayer]) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_STATUS) {
+        return permission_for("status");
+    }
+    // PM: `current TPS` = instantaneous, `average TPS` = tick average.
+    // Ours: 1m window as current, 15m window as average (both capped at 20
+    // by `TickMetrics`).
+    let current = source.tps.0;
+    let average = source.tps.2;
+    let color_for = |tps: f64| -> &'static str {
+        if tps < 12.0 {
+            "§c"
+        } else if tps < 17.0 {
+            "§6"
+        } else {
+            "§a"
+        }
+    };
+    // PM shows the tick load percent next to the TPS; the sampler does not
+    // track it yet, so derive `load = 100 - tps*5` bounded to 0..=100.
+    let stat = |tps: f64| -> String {
+        let load = (100.0 - tps * 5.0).clamp(0.0, 100.0);
+        fill_named(
+            lang::STATUS_TPS_STAT,
+            &[
+                ("ticksPerSecond", &format!("{:.2}", tps)),
+                ("loadPercent", &format!("{:.0}", load)),
+            ],
+        )
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!("§e--------- §r{}§e ---------", lang::STATUS_HEADER));
+    // Uptime: no start time in `CommandSource` yet — report 0s (see doc).
+    let uptime = fill_named(lang::STATUS_UPTIME_SECONDS, &[("seconds", "0")]);
+    lines.push(format!("§6{}", fill_named(lang::STATUS_UPTIME, &[("uptime", &uptime)])));
+    lines.push(format!(
+        "§6{}",
+        fill_named(
+            lang::STATUS_TPS_CURRENT,
+            &[("info", &format!("{}{}", color_for(current), stat(current)))]
+        )
+    ));
+    lines.push(format!(
+        "§6{}",
+        fill_named(
+            lang::STATUS_TPS_AVERAGE,
+            &[("info", &format!("{}{}", color_for(average), stat(average)))]
+        )
+    ));
+    let bandwidth = |_: f64| -> String {
+        fill_named(lang::STATUS_NETWORK_STAT, &[("kbps", "0")])
+    };
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_NETWORK_UPLOAD, &[("info", &format!("§c{}", bandwidth(0.0)))])
+    ));
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_NETWORK_DOWNLOAD, &[("info", &format!("§c{}", bandwidth(0.0)))])
+    ));
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_THREADS, &[("count", "0")])
+    ));
+    let memory = |_: u64| -> String {
+        fill_named(lang::STATUS_MEMORY_STAT, &[("megabytes", "0.00")])
+    };
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_MEMORY_MAIN, &[("info", &format!("§c{}", memory(0)))])
+    ));
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_MEMORY_TOTAL, &[("info", &format!("§c{}", memory(0)))])
+    ));
+    lines.push(format!(
+        "§6{}",
+        fill_named(lang::STATUS_MEMORY_VIRTUAL, &[("info", &format!("§c{}", memory(0)))])
+    ));
+    // Single-world stub: chunk/entity counts need world-manager wiring.
+    let time_stat = fill_named(lang::STATUS_WORLD_TIME_STAT, &[("milliseconds", "0.00")]);
+    lines.push(format!(
+        "§6{}",
+        fill_named(
+            lang::STATUS_WORLD,
+            &[
+                ("worldName", "\"world\""),
+                ("loadedChunks", "0"),
+                ("tickingChunks", "0"),
+                ("entities", &players.len().to_string()),
+                ("timeStat", &time_stat),
+            ]
+        )
+    ));
+    CommandOutput { feedback: lines, actions: Vec::new() }
+}
+
+/// `/timings`, ported from `pocketmine\command\defaults\TimingsCommand`.
+/// Modes: `on|off|reset|report|merged|paste`. Report/paste upload needs the
+/// timings HTTP service (unavailable); `report`/`merged` report the local
+/// stub path instead.
+fn timings(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_TIMINGS) {
+        return permission_for("timings");
+    }
+    let Some(mode) = args.first().map(|arg| arg.to_lowercase()) else {
+        return usage("timings");
+    };
+    if args.len() != 1 {
+        return usage("timings");
+    }
+    // No timings handler exists in Rust yet — every mode is a logged no-op
+    // with the PM message, so operators get honest feedback instead of a
+    // fake report.
+    let (feedback_line, action_message) = match mode.as_str() {
+        "on" => (lang::TIMINGS_ENABLE.to_string(), lang::TIMINGS_ENABLE.to_string()),
+        "off" => (lang::TIMINGS_DISABLE.to_string(), lang::TIMINGS_DISABLE.to_string()),
+        "reset" => (lang::TIMINGS_RESET.to_string(), lang::TIMINGS_RESET.to_string()),
+        "report" | "merged" => {
+            (fill_template(lang::TIMINGS_WRITE, &["timings-timings.txt"]), fill_template(lang::TIMINGS_WRITE, &["timings-timings.txt"]))
+        }
+        "paste" => (lang::TIMINGS_PASTE_ERROR.to_string(), lang::TIMINGS_PASTE_ERROR.to_string()),
+        _ => return usage("timings"),
+    };
+    CommandOutput {
+        feedback: vec![feedback_line],
+        actions: vec![CommandAction::Timings {
+            mode,
+            message: action_message,
+            notify: source.name.clone(),
+        }],
+    }
+}
+
+/// `/gc`, ported from `pocketmine\command\defaults\GarbageCollectorCommand`.
+/// The session reports counts after unloading; the command only fires the
+/// request (counts are session-produced, like `/clear`).
+fn gc(source: &CommandSource) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_GC) {
+        return permission_for("gc");
+    }
+    CommandOutput {
+        feedback: vec![lang::GC_HEADER.to_string()],
+        actions: vec![CommandAction::GarbageCollect {
+            notify: source.name.clone(),
+        }],
+    }
+}
+
+/// `/dumpmemory [path]`, ported from
+/// `pocketmine\command\defaults\DumpMemoryCommand`. PM dumps with
+/// `memory_get_usage` + `MemoryManager::dumpServerMemory`; here the session
+/// writes a text snapshot (TODO: native heap dump).
+fn dumpmemory(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_DUMPMEMORY) {
+        return permission_for("dumpmemory");
+    }
+    if args.len() > 1 {
+        return usage("dumpmemory");
+    }
+    CommandOutput {
+        feedback: Vec::new(),
+        actions: vec![CommandAction::DumpMemory {
+            path: args.first().map(|s| s.to_string()),
+        }],
     }
 }
 
@@ -1659,17 +2853,20 @@ fn action(message: impl Into<String>, action: CommandAction) -> CommandOutput {
 
 fn usage(name: &str) -> CommandOutput {
     match find_command(name) {
-        Some(info) => error(format!("§cUso: {}", info.usage)),
-        None => error("§cUso incorrecto."),
+        Some(info) => error(format!("§cUsage: {}", info.usage)),
+        None => error("§cIncorrect usage."),
     }
 }
 
 fn permission_error() -> CommandOutput {
-    error("§cNo tienes permiso para usar este comando.")
+    error("§cYou don't have permission to use this command.")
 }
 
 fn player_not_found(name: &str) -> CommandOutput {
-    error(format!("§cJugador no encontrado: §f{}§c.", name))
+    error(red(fill_named(
+        lang::PLAYER_NOT_FOUND,
+        &[("playerName", name)],
+    )))
 }
 
 fn parse_gamemode(value: &str) -> Option<i32> {
@@ -1728,31 +2925,29 @@ fn parse_position(tokens: &[&str], origin: (f64, f64, f64)) -> Option<(f64, f64,
     ))
 }
 
-/// Resolves a player by exact name, then by unique prefix. `@s`/`@p` select the
-/// sender.
+/// Resolves a player by exact name, then by unique prefix. Selectors (`@s`,
+/// `@p`, `@a`, `@e`, `@r`, `@n`, `@c` with optional `[...]`) resolve through
+/// [`resolve_selector_targets`] and return the first match (already sorted
+/// and limited). For multiple targets see [`resolve_players`].
 fn resolve_player<'a>(
+    source: &CommandSource,
     players: &'a [OnlinePlayer],
     query: &str,
-    source_name: &str,
 ) -> Option<&'a OnlinePlayer> {
-    if query.eq_ignore_ascii_case("@s") || query.eq_ignore_ascii_case("@p") {
-        return players
-            .iter()
-            .find(|player| player.name.eq_ignore_ascii_case(source_name))
-            .or_else(|| players.first());
+    if is_selector(query) {
+        let (kind, args) = parse_selector(query, source.position)?;
+        return resolve_selector_targets(source, players, kind, &args).into_iter().next();
     }
-
-    let query = query.to_lowercase();
+    let query_lower = query.to_lowercase();
     if let Some(exact) = players
         .iter()
-        .find(|player| player.name.to_lowercase() == query)
+        .find(|player| player.name.to_lowercase() == query_lower)
     {
         return Some(exact);
     }
-
     let matches: Vec<&OnlinePlayer> = players
         .iter()
-        .filter(|player| player.name.to_lowercase().starts_with(&query))
+        .filter(|player| player.name.to_lowercase().starts_with(&query_lower))
         .collect();
     if matches.len() == 1 {
         matches.first().copied()
@@ -1761,17 +2956,37 @@ fn resolve_player<'a>(
     }
 }
 
+/// Resolves a query to every matching player (selector-aware). Non-selector
+/// names follow [`resolve_player`]'s unique-prefix rule: ambiguous prefixes
+/// resolve to no players.
+fn resolve_players<'a>(
+    source: &CommandSource,
+    players: &'a [OnlinePlayer],
+    query: &str,
+) -> Vec<&'a OnlinePlayer> {
+    if is_selector(query) {
+        let Some((kind, args)) = parse_selector(query, source.position) else {
+            return Vec::new();
+        };
+        return resolve_selector_targets(source, players, kind, &args);
+    }
+    match resolve_player(source, players, query) {
+        Some(player) => vec![player],
+        None => Vec::new(),
+    }
+}
+
 fn permission_for(command: &str) -> CommandOutput {
     error(red(lang::PERMISSION.replace("{%commandName}", command)))
 }
 
-/// `GameMode::getTranslatableName()` values from PocketMine's Spanish locale.
+/// `GameMode::getTranslatableName()` values from PocketMine's English locale.
 pub(crate) fn gamemode_translatable(gamemode: i32) -> &'static str {
     match gamemode {
-        1 => "Modo Creativo",
-        2 => "Modo Aventura",
-        3 => "Modo Espectador",
-        _ => "Modo Supervivencia",
+        1 => "Creative Mode",
+        2 => "Adventure Mode",
+        3 => "Spectator Mode",
+        _ => "Survival Mode",
     }
 }
 
@@ -1802,7 +3017,7 @@ fn format_coord(value: f64) -> String {
 /// `/spawnpoint [player] [<x> <y> <z>]`, ported from
 /// `pocketmine\command\defaults\SpawnPointCommand`.
 fn spawnpoint(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
-    let target = match fetch_permitted_player_target(
+    let targets = match fetch_permitted_player_targets(
         source,
         players,
         args.first().copied(),
@@ -1810,8 +3025,7 @@ fn spawnpoint(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -
         source.can(crate::permission::COMMAND_SPAWNPOINT_SELF),
         source.can(crate::permission::COMMAND_SPAWNPOINT_OTHER),
     ) {
-        Ok(Some(player)) => player.name.clone(),
-        Ok(None) => source.name.clone(),
+        Ok(targets) => targets,
         Err(output) => return output,
     };
 
@@ -1845,19 +3059,23 @@ fn spawnpoint(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -
         return usage("spawnpoint");
     };
 
-    let message = fill_template(
-        lang::SPAWNPOINT_SUCCESS,
-        &[&target, &format_coord(x), &format_coord(y), &format_coord(z)],
-    );
-    CommandOutput {
-        feedback: vec![message.clone()],
-        actions: vec![CommandAction::SetSpawnPoint {
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for player in targets {
+        let target = player.name.clone();
+        let message = fill_template(
+            lang::SPAWNPOINT_SUCCESS,
+            &[&target, &format_coord(x), &format_coord(y), &format_coord(z)],
+        );
+        feedback.push(message.clone());
+        actions.push(CommandAction::SetSpawnPoint {
             target,
             position: (x, y, z),
             message,
             notify: source.name.clone(),
-        }],
+        });
     }
+    CommandOutput { feedback, actions }
 }
 
 /// `/title <player> <clear|reset|title|subtitle|actionbar|times> ...`, ported
@@ -1867,7 +3085,7 @@ fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
         return usage("title");
     }
 
-    let target = match fetch_permitted_player_target(
+    let targets = match fetch_permitted_player_targets(
         source,
         players,
         Some(args[0]),
@@ -1875,8 +3093,7 @@ fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
         source.can(crate::permission::COMMAND_TITLE_SELF),
         source.can(crate::permission::COMMAND_TITLE_OTHER),
     ) {
-        Ok(Some(player)) => player.name.clone(),
-        Ok(None) => source.name.clone(),
+        Ok(targets) => targets,
         Err(output) => return output,
     };
 
@@ -1932,9 +3149,16 @@ fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
         _ => return usage("title"),
     };
 
+    let actions = targets
+        .iter()
+        .map(|player| CommandAction::SendTitle {
+            target: player.name.clone(),
+            action: action.clone(),
+        })
+        .collect();
     CommandOutput {
         feedback: vec![lang::TITLE_SUCCESS.to_string()],
-        actions: vec![CommandAction::SendTitle { target, action }],
+        actions,
     }
 }
 
@@ -2051,7 +3275,7 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "seed" => Some(&[COMMAND_SEED]),
         "op" => Some(&[COMMAND_OP_GIVE]),
         "deop" => Some(&[COMMAND_OP_TAKE]),
-        "version" | "ver" => Some(&[COMMAND_VERSION]),
+        "version" | "ver" | "about" => Some(&[COMMAND_VERSION]),
         "ban" => Some(&[COMMAND_BAN_PLAYER]),
         "ban-ip" => Some(&[COMMAND_BAN_IP]),
         "banlist" => Some(&[COMMAND_BAN_LIST]),
@@ -2063,6 +3287,14 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "save-on" => Some(&[COMMAND_SAVE_ENABLE]),
         "save-off" => Some(&[COMMAND_SAVE_DISABLE]),
         "tps" => Some(&[COMMAND_TPS]),
+        "status" => Some(&[COMMAND_STATUS]),
+        "effect" => Some(&[COMMAND_EFFECT_SELF, COMMAND_EFFECT_OTHER]),
+        "enchant" => Some(&[COMMAND_ENCHANT_SELF, COMMAND_ENCHANT_OTHER]),
+        "xp" => Some(&[COMMAND_XP_SELF, COMMAND_XP_OTHER]),
+        "particle" => Some(&[COMMAND_PARTICLE]),
+        "timings" => Some(&[COMMAND_TIMINGS]),
+        "gc" => Some(&[COMMAND_GC]),
+        "dumpmemory" => Some(&[COMMAND_DUMPMEMORY]),
         _ => None,
     }
 }
@@ -2560,11 +3792,15 @@ mod tests {
         let source = player_source("Steve", (10.0, 64.0, -5.0));
         let output = handle_command("/tp Nobody", &source, &players()).expect("tp is native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("Jugador no encontrado"));
+        assert!(output.feedback[0].contains("Cannot find a player"));
+        // The named placeholder must be filled with the real name, not left
+        // literal in the output.
+        assert!(output.feedback[0].contains("Nobody"));
+        assert!(!output.feedback[0].contains("{%playerName}"));
 
         let output = handle_command("/tp", &source, &players()).expect("tp is native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("Uso:"));
+        assert!(output.feedback[0].contains("Usage:"));
     }
 
     #[test]
@@ -2574,7 +3810,7 @@ mod tests {
         source.allow_cheats = false;
         let output = handle_command("/tp 1 2 3", &source, &players()).expect("tp is native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("permiso"));
+        assert!(output.feedback[0].contains("permission"));
     }
 
     fn gamemode_success_self(mode: i32) -> String {
@@ -2634,7 +3870,7 @@ mod tests {
         assert!(output.actions.is_empty());
         assert_eq!(
             output.feedback,
-            vec!["¡Error al cambiar el modo de juego de Alex!".to_string()]
+            vec!["Game mode change for Alex failed!".to_string()]
         );
     }
 
@@ -2702,12 +3938,12 @@ mod tests {
         let output = handle_command("/msg Alex ven aqui", &source, &players()).expect("native");
         assert_eq!(
             output.feedback,
-            vec!["§7Le susurras a Alex: ven aqui".to_string()]
+            vec!["§7You whisper to Alex: ven aqui".to_string()]
         );
         match &output.actions[0] {
             CommandAction::Message { target, message } => {
                 assert_eq!(target, "Alex");
-                assert_eq!(message, "§7Steve te susurra: ven aqui");
+                assert_eq!(message, "§7Steve whispers to you: ven aqui");
             }
             other => panic!("expected a private message, got {:?}", other),
         }
@@ -2724,7 +3960,7 @@ mod tests {
         let output = handle_command("/version", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "Este servidor está ejecutando PocketMine-Rust"
+            "This server is running Axolotl-PM"
         );
         assert!(output.feedback[1].contains("git hash"));
         assert!(output.feedback[2].contains("1.26.60"));
@@ -2761,7 +3997,7 @@ mod tests {
         let output = handle_command("/give Alex stone 1 {\"oops\":", &source, &players())
             .expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].starts_with("Error al analizar la etiqueta de datos: "));
+        assert!(output.feedback[0].starts_with("Data tag parsing failed: "));
     }
 
     #[test]
@@ -2777,13 +4013,13 @@ mod tests {
                 meta: 0,
                 count: 64,
                 nbt: Vec::new(),
-                message: "Dado Stone (stone) * 64 a Alex".to_string(),
+                message: "Given Stone (stone) * 64 to Alex".to_string(),
                 notify: "Steve".to_string(),
             }]
         );
         assert_eq!(
             output.feedback,
-            vec!["Dado Stone (stone) * 64 a Alex".to_string()]
+            vec!["Given Stone (stone) * 64 to Alex".to_string()]
         );
 
         // Legacy numeric ids and damage values are accepted.
@@ -2796,7 +4032,7 @@ mod tests {
                 meta: 2,
                 count: 3,
                 nbt: Vec::new(),
-                message: "Dado Stone (1:2) * 3 a Alex".to_string(),
+                message: "Given Stone (1:2) * 3 to Alex".to_string(),
                 notify: "Steve".to_string(),
             }]
         );
@@ -2805,27 +4041,27 @@ mod tests {
         assert!(output.actions.is_empty());
         assert_eq!(
             output.feedback[0],
-            "§cNo existe tal objeto con el nombre not_an_item"
+            "§cThere is no such item with name not_an_item"
         );
 
         let output = handle_command("/give Alex stone 0", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
         assert_eq!(
             output.feedback[0],
-            "§cEl número que ha introducido (0) es demasiado pequeño, debe ser como mínimo 1"
+            "§cThe number you have entered (0) is too small, it must be at least 1"
         );
 
         let output = handle_command("/give Alex stone 40000", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "§cEl número que ha introducido (40000) es demasiado grande, debe ser como mucho 32767"
+            "§cThe number you have entered (40000) is too big, it must be at most 32767"
         );
 
         let output = handle_command("/give Alex stone abc", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
         assert_eq!(
             output.feedback[0],
-            "§cUso: /give <jugador> <objeto[:extra]> [cantidad] [etiquetas...]"
+            "§cUsage: /give <player> <item[:damage]> [amount] [tags...]"
         );
     }
 
@@ -2873,19 +4109,19 @@ mod tests {
             output.actions,
             vec![CommandAction::Kill {
                 target: "Steve".to_string(),
-                message: "Steve Murió".to_string(),
+                message: "Killed Steve".to_string(),
                 broadcast: false,
                 notify: "Steve".to_string(),
             }]
         );
-        assert_eq!(output.feedback, vec!["Steve Murió".to_string()]);
+        assert_eq!(output.feedback, vec!["Killed Steve".to_string()]);
 
         let output = handle_command("/kill Alex", &source, &players()).expect("native");
         assert_eq!(
             output.actions,
             vec![CommandAction::Kill {
                 target: "Alex".to_string(),
-                message: "Alex Murió".to_string(),
+                message: "Killed Alex".to_string(),
                 broadcast: true,
                 notify: "Steve".to_string(),
             }]
@@ -2903,7 +4139,7 @@ mod tests {
         assert!(output.actions.is_empty());
         assert_eq!(
             output.feedback[0],
-            "§cNo tienes permiso para ejecutar el comando: give"
+            "§cYou don't have permission to use the command: give"
         );
 
         // Clearing yourself is granted to everyone, clearing others is not.
@@ -2911,14 +4147,14 @@ mod tests {
         assert_eq!(output.actions.len(), 1);
         let output = handle_command("/clear Alex", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("permiso"));
+        assert!(output.feedback[0].contains("permission"));
 
         // Killing yourself is granted to everyone, killing others is not.
         let output = handle_command("/kill", &source, &players()).expect("native");
         assert_eq!(output.actions.len(), 1);
         let output = handle_command("/kill Alex", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("permiso"));
+        assert!(output.feedback[0].contains("permission"));
     }
 
     #[test]
@@ -2931,7 +4167,7 @@ mod tests {
             vec![CommandAction::SetSpawnPoint {
                 target: "Steve".to_string(),
                 position: (10.0, 64.0, -6.0),
-                message: "Punto de aparición de Steve establecido en (10, 64, -6)".to_string(),
+                message: "Set Steve's spawn point to (10, 64, -6)".to_string(),
                 notify: "Steve".to_string(),
             }]
         );
@@ -2955,31 +4191,31 @@ mod tests {
 
         let output = handle_command("/spawnpoint Alex 0 70", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("Uso:"));
+        assert!(output.feedback[0].contains("Usage:"));
 
         let output =
             handle_command("/defaultgamemode creative", &source, &players()).expect("native");
         assert_eq!(output.actions, vec![CommandAction::SetDefaultGamemode(1)]);
         assert_eq!(
             output.feedback[0],
-            "El modo de juego por defecto del mundo es ahora Modo Creativo"
+            "The world's default game mode is now Creative Mode"
         );
 
         let output =
             handle_command("/defaultgamemode nope", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert_eq!(output.feedback[0], "Modo de juego desconocido \"nope\"");
+        assert_eq!(output.feedback[0], "Unknown game mode \"nope\"");
 
         let output = handle_command("/difficulty hard", &source, &players()).expect("native");
         assert_eq!(output.actions.len(), 1);
-        assert_eq!(output.feedback[0], "Cambiada la dificultad del juego a 3");
+        assert_eq!(output.feedback[0], "Set game difficulty to 3");
 
         let output = handle_command("/difficulty 7", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("Uso:"));
+        assert!(output.feedback[0].contains("Usage:"));
 
         let output = handle_command("/seed", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Semilla: 12345678");
+        assert_eq!(output.feedback[0], "Seed: 12345678");
     }
 
     #[test]
@@ -2992,60 +4228,60 @@ mod tests {
         source.access = Some(access);
 
         let output = handle_command("/banlist", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Hay un total de 1 jugadores baneados:");
+        assert_eq!(output.feedback[0], "There are 1 total banned players:");
         assert_eq!(output.feedback[1], "alex");
 
         let output = handle_command("/banlist ips", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Hay 1 IPs bloqueadas:");
+        assert_eq!(output.feedback[0], "There are 1 total banned IP addresses:");
         assert_eq!(output.feedback[1], "10.0.0.9");
 
         let output = handle_command("/banlist nope", &source, &players()).expect("native");
         assert!(output.actions.is_empty());
-        assert!(output.feedback[0].contains("Uso:"));
+        assert!(output.feedback[0].contains("Usage:"));
 
         let output = handle_command("/pardon-ip nope", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Has ingresado una dirección IP no válida");
+        assert_eq!(output.feedback[0], "You have entered an invalid IP address");
         assert!(output.actions.is_empty());
 
         let output = handle_command("/whitelist list", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "Hay 1 (de cada 1 vistos) jugadores en la lista blanca:"
+            "There are 1 (out of 1 seen) whitelisted players:"
         );
 
         let output =
             handle_command("/whitelist add Herobrine", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Se ha añadido a Herobrine a la lista blanca");
+        assert_eq!(output.feedback[0], "Added Herobrine to the whitelist");
         assert!(matches!(
             &output.actions[0],
             CommandAction::AddWhitelist { name, .. } if name == "Herobrine"
         ));
 
         let output = handle_command("/whitelist add", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Uso: /whitelist add <jugador>");
+        assert_eq!(output.feedback[0], "Usage: /whitelist add <player>");
 
         let output = handle_command("/ban Alex", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Jugador Alex baneado");
+        assert_eq!(output.feedback[0], "Banned player Alex");
         assert!(matches!(
             &output.actions[0],
             CommandAction::BanName { reason, .. } if reason.is_empty()
         ));
 
         let output = handle_command("/ban-ip 10.1.1.1 spam", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "IP 10.1.1.1 bloqueada");
+        assert_eq!(output.feedback[0], "Banned IP address 10.1.1.1");
 
         let output = handle_command("/ban-ip nobody", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "Has ingresado una dirección IP inválida o el jugador no está en línea"
+            "You have entered an invalid IP address or a player that is not online"
         );
 
         let output = handle_command("/stop", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Deteniendo el servidor");
+        assert_eq!(output.feedback[0], "Stopping the server");
         assert_eq!(
             output.actions,
             vec![CommandAction::StopServer {
-                message: "Deteniendo el servidor".to_string(),
+                message: "Stopping the server".to_string(),
                 notify: "Steve".to_string(),
             }]
         );
@@ -3069,7 +4305,7 @@ mod tests {
         );
 
         let output = handle_command("/save-all", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Guardando datos del servidor...");
+        assert_eq!(output.feedback[0], "Saving server data...");
         assert!(matches!(
             &output.actions[0],
             CommandAction::SaveAll { .. }
@@ -3078,7 +4314,7 @@ mod tests {
         let output = handle_command("/save-off", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "El autoguardado del mundo ha sido desactivado"
+            "Turned off world auto-saving"
         );
         assert!(matches!(
             &output.actions[0],
@@ -3123,18 +4359,18 @@ mod tests {
         let output = handle_command("/seed", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "§cNo tienes permiso para ejecutar el comando: seed"
+            "§cYou don't have permission to use the command: seed"
         );
         assert!(output.actions.is_empty());
 
         // Everyone may check the online players.
         let output = handle_command("/list", &source, &players()).expect("native");
-        assert!(!output.feedback[0].contains("permiso"));
+        assert!(!output.feedback[0].contains("permission"));
 
         // Granting the node through an attachment allows the command.
         permissions.set_permission("Guest", crate::permission::COMMAND_SEED, true);
         let output = handle_command("/seed", &source, &players()).expect("native");
-        assert_eq!(output.feedback[0], "Semilla: 12345678");
+        assert_eq!(output.feedback[0], "Seed: 12345678");
 
         // ...and denying it on an operator blocks it too.
         let mut admin = player_source("Admin", (0.0, 64.0, 0.0));
@@ -3143,7 +4379,7 @@ mod tests {
         let output = handle_command("/seed", &admin, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            "§cNo tienes permiso para ejecutar el comando: seed"
+            "§cYou don't have permission to use the command: seed"
         );
     }
 
@@ -3156,7 +4392,7 @@ mod tests {
         source.permissions = Some(std::sync::Arc::clone(&permissions));
 
         fn denied(output: &CommandOutput) -> bool {
-            output.feedback.iter().any(|line| line.contains("permiso"))
+            output.feedback.iter().any(|line| line.contains("permission"))
         }
 
         // `clear.self` is granted to everyone, `clear.other` only to operators.
@@ -3198,12 +4434,12 @@ mod tests {
         // `setPermissions([self, other])`: only `.other` already runs the command.
         permissions.set_permission("Guest", crate::permission::COMMAND_GAMEMODE_OTHER, true);
         let output = handle_command("/gms Alex", &source, &players()).expect("native");
-        assert!(!output.feedback.iter().any(|line| line.contains("permiso")));
+        assert!(!output.feedback.iter().any(|line| line.contains("permission")));
         assert_eq!(output.actions.len(), 1);
 
         // ...but changing the own mode still needs `.self`.
         let output = handle_command("/gms", &source, &players()).expect("native");
-        assert!(output.feedback.iter().any(|line| line.contains("permiso")));
+        assert!(output.feedback.iter().any(|line| line.contains("permission")));
         assert!(output.actions.is_empty());
 
         // And the opposite direction: `.self` alone cannot touch another player.
@@ -3213,10 +4449,10 @@ mod tests {
         other.permissions = Some(std::sync::Arc::clone(&permissions));
         permissions.set_permission("Guest2", crate::permission::COMMAND_GAMEMODE_SELF, true);
         let output = handle_command("/gms", &other, &players()).expect("native");
-        assert!(!output.feedback.iter().any(|line| line.contains("permiso")));
+        assert!(!output.feedback.iter().any(|line| line.contains("permission")));
         assert_eq!(output.actions.len(), 1);
         let output = handle_command("/gms Alex", &other, &players()).expect("native");
-        assert!(output.feedback.iter().any(|line| line.contains("permiso")));
+        assert!(output.feedback.iter().any(|line| line.contains("permission")));
         assert!(output.actions.is_empty());
     }
 
@@ -3228,7 +4464,7 @@ mod tests {
         let pages = COMMANDS.len().div_ceil(PLAYER_SCREEN_LINE_HEIGHT);
         assert_eq!(
             output.feedback[0],
-            format!("--- Mostrando página de ayuda 1 de {pages} (/help [página]) ---")
+            format!("--- Showing help page 1 of {pages} (/help [page]) ---")
         );
         assert_eq!(output.feedback.len(), 1 + PLAYER_SCREEN_LINE_HEIGHT);
         assert!(output.feedback[1].starts_with("§2/ban: §r"));
@@ -3237,7 +4473,7 @@ mod tests {
         let output = handle_command("/help 99", &source, &players()).expect("native");
         assert_eq!(
             output.feedback[0],
-            format!("--- Mostrando página de ayuda {pages} de {pages} (/help [página]) ---")
+            format!("--- Showing help page {pages} of {pages} (/help [page]) ---")
         );
 
         // The console reports PHP_INT_MAX lines, so it lists everything.
@@ -3255,10 +4491,10 @@ mod tests {
         assert_eq!(
             output.feedback,
             vec![
-                "§e--------- §rAyuda: /tp§e ---------".to_string(),
-                format!("§6Descripción: §r{}", info.description),
-                format!("§6Uso: §r{}", info.usage),
-                "§6Alias: §rteleport".to_string(),
+                "§e--------- §rHelp: /tp§e ---------".to_string(),
+                format!("§6Description: §r{}", info.description),
+                format!("§6Usage: §r{}", info.usage),
+                "§6Aliases: §rteleport".to_string(),
             ]
         );
 
@@ -3266,8 +4502,7 @@ mod tests {
         assert_eq!(
             output.feedback,
             vec![concat!(
-                "§cComando desconocido: nope. Utilice /help para obtener una lista de ",
-                "comandos disponibles."
+                "§cUnknown command: nope. Use /help for a list of available commands."
             )]
         );
     }
@@ -3283,14 +4518,13 @@ mod tests {
         assert_eq!(
             output.feedback,
             vec![concat!(
-                "§cComando desconocido: op. Utilice /help para obtener una lista de ",
-                "comandos disponibles."
+                "§cUnknown command: op. Use /help for a list of available commands."
             )]
         );
 
         let output = handle_command("/help help", &guest, &players()).expect("native");
-        assert_eq!(output.feedback[0], "§e--------- §rAyuda: /help§e ---------");
-        assert_eq!(output.feedback[3], "§6Alias: §r?");
+        assert_eq!(output.feedback[0], "§e--------- §rHelp: /help§e ---------");
+        assert_eq!(output.feedback[3], "§6Aliases: §r?");
     }
 
     #[test]
@@ -3301,7 +4535,7 @@ mod tests {
         assert_eq!(
             output.feedback,
             vec![
-                "Hay 2/1000 jugadores en línea:".to_string(),
+                "There are 2/1000 players online:".to_string(),
                 "Alex, Steve".to_string()
             ]
         );
@@ -3309,7 +4543,7 @@ mod tests {
         let output = handle_command("/list", &source, &[]).expect("native");
         assert_eq!(
             output.feedback,
-            vec!["Hay 0/1000 jugadores en línea:".to_string(), String::new()]
+            vec!["There are 0/1000 players online:".to_string(), String::new()]
         );
     }
 
@@ -3366,7 +4600,7 @@ mod tests {
         assert_eq!(output.feedback, vec![lang::TITLE_SUCCESS.to_string()]);
 
         let usage_line =
-            "§cUso: /title <jugador> <clear|reset|title|subtitle|actionbar|times> ...";
+            "§cUsage: /title <player> <clear|reset|title|subtitle|actionbar|times> ...";
         for input in [
             "/title Alex",
             "/title Alex actionbar",
@@ -3421,7 +4655,7 @@ mod tests {
         let output = handle_command("/transferserver", &source, &players()).expect("native");
         assert_eq!(
             output.feedback,
-            vec!["§cUso: /transferserver <servidor> [puerto]".to_string()]
+            vec!["§cUsage: /transferserver <server> [port]".to_string()]
         );
         assert!(output.actions.is_empty());
 
@@ -3429,7 +4663,7 @@ mod tests {
         let output = handle_command("/transferserver host", &console, &players()).expect("native");
         assert_eq!(
             output.feedback,
-            vec!["§cEsta sintaxis de comando solo puede ser usada como jugador".to_string()]
+            vec!["§cThis command syntax can only be used as a player".to_string()]
         );
         assert!(output.actions.is_empty());
     }
@@ -3460,6 +4694,318 @@ mod tests {
         assert_eq!(output.actions.len(), 1);
 
         let output = handle_command("tp", &console, &players()).expect("native");
-        assert!(output.feedback[0].contains("Uso:"));
+        assert!(output.feedback[0].contains("Usage:"));
+    }
+
+    #[test]
+    fn new_pocketmine_commands_produce_actions() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        // /effect <player> <effect> [secs] [amp] [hide]
+        let output = handle_command("/effect Alex speed 30 1", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::ApplyEffect { duration_secs: Some(30), amplifier: 1, .. }
+        ));
+        let output = handle_command("/effect Alex clear", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::ApplyEffect { remove: true, .. }
+        ));
+        let output = handle_command("/effect Alex speed infinite 2", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::ApplyEffect { duration_secs: None, .. }
+        ));
+        let output = handle_command("/effect Alex speed", &source, &players()).expect("native");
+        assert!(!output.actions.is_empty());
+
+        // /enchant
+        let output = handle_command("/enchant Alex sharpness 5", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Enchant { level: 5, .. }
+        ));
+
+        // /xp <amount[L]> [player]
+        let output = handle_command("/xp 100 Alex", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::AddXp { amount: 100, is_levels: false, .. }
+        ));
+        let output = handle_command("/xp 5L Alex", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::AddXp { amount: 5, is_levels: true, .. }
+        ));
+        let output = handle_command("/xp -5 Alex", &source, &players()).expect("native");
+        assert!(output.actions.is_empty());
+        assert_eq!(output.feedback[0], lang::XP_FAILURE_WIDTHDRAW);
+
+        // /particle <name> <x> <y> <z> <xd> <yd> <zd> [count] [data]
+        let output = handle_command("/particle flame 0 64 0 1 1 1 3", &source, &players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::SpawnParticle { count: 3, .. }
+        ));
+        let output = handle_command("/particle nope 0 64 0 1 1 1", &source, &players()).expect("native");
+        assert!(output.actions.is_empty());
+        assert!(output.feedback[0].contains(lang::PARTICLE_NOT_FOUND.split('{').next().unwrap()));
+
+        // /status (PM format) and /tps (Paper format) both work
+        let output = handle_command("/status", &source, &players()).expect("native");
+        assert!(output.feedback[0].contains(lang::STATUS_HEADER));
+        assert!(output.feedback.iter().any(|line| line.contains(lang::STATUS_TPS_CURRENT.split(':').next().unwrap())));
+        let output = handle_command("/tps", &source, &players()).expect("native");
+        assert!(output.feedback[0].contains("TPS from last 1m"));
+
+        // /timings <on|off|reset|report|paste>
+        for mode in ["on", "off", "reset", "report", "paste"] {
+            let output = handle_command(&format!("/timings {mode}"), &source, &players()).expect("native");
+            assert_eq!(output.actions.len(), 1, "{mode}");
+        }
+        let output = handle_command("/timings nope", &source, &players()).expect("native");
+        assert!(output.actions.is_empty());
+
+        // /gc and /dumpmemory
+        let output = handle_command("/gc", &source, &players()).expect("native");
+        assert_eq!(output.feedback, vec![lang::GC_HEADER.to_string()]);
+        assert!(matches!(&output.actions[0], CommandAction::GarbageCollect { .. }));
+        let output = handle_command("/dumpmemory dumps/x.txt", &source, &players()).expect("native");
+        assert!(matches!(&output.actions[0], CommandAction::DumpMemory { path: Some(_) }));
+
+        // /time start|stop
+        let output = handle_command("/time start", &source, &players()).expect("native");
+        assert!(matches!(&output.actions[0], CommandAction::SetTimeRunning { running: true, .. }));
+        let output = handle_command("/time stop", &source, &players()).expect("native");
+        assert!(matches!(&output.actions[0], CommandAction::SetTimeRunning { running: false, .. }));
+
+        // /version <plugin> and /about alias
+        let mut with_plugins = player_source("Steve", (0.0, 64.0, 0.0));
+        with_plugins.plugins = vec!["TestKit".to_string()];
+        let output = handle_command("/version TestKit", &with_plugins, &players()).expect("native");
+        assert!(output.feedback[0].contains("TestKit"));
+        let output = handle_command("/about", &source, &players()).expect("native");
+        assert!(output.feedback[0].contains("Axolotl-PM"));
+        let output = handle_command("/version NoSuchPlugin", &source, &players()).expect("native");
+        assert_eq!(output.feedback[0], lang::VERSION_NO_SUCH_PLUGIN);
+    }
+
+    fn three_players() -> Vec<OnlinePlayer> {
+        let mut list = players();
+        list.push(OnlinePlayer {
+            name: "Zombie".to_string(),
+            position: (2.0, 64.0, 2.0),
+            gamemode: 0,
+        });
+        list
+    }
+
+    #[test]
+    fn selector_s_targets_the_sender() {
+        let source = player_source("Steve", (10.0, 64.0, -5.0));
+        let output = handle_command("/give @s stone", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 1);
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Steve"
+        ));
+    }
+
+    #[test]
+    fn selector_p_picks_the_nearest_player() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        // Zombie at (2,64,2) is ~2.8 away, Steve at (10,64,-5) ~11 away,
+        // Alex at (-20,70,8.5) far. Nearest to (0,64,0) is Zombie.
+        let output = handle_command("/give @p stone", &source, &three_players()).expect("native");
+        assert_eq!(output.actions.len(), 1);
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Zombie"
+        ));
+        // @n is a documented alias of @p.
+        let output = handle_command("/give @n stone", &source, &three_players()).expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Zombie"
+        ));
+    }
+
+    #[test]
+    fn selector_p_honours_an_origin_override() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        // Nearest to Alex (-20,70,8.5) is Alex itself.
+        let output = handle_command("/give @p[x=-20,y=70,z=8.5] stone", &source, &players())
+            .expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Alex"
+        ));
+    }
+
+    #[test]
+    fn selector_a_and_e_expand_to_every_player() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        let output = handle_command("/give @a stone", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        assert_eq!(output.feedback.len(), 2);
+        let targets: Vec<String> = output
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                CommandAction::Give { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec!["Steve".to_string(), "Alex".to_string()]);
+
+        // @e currently returns players as entities (no non-player entities).
+        let output = handle_command("/kill @e", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        assert_eq!(output.feedback.len(), 2);
+    }
+
+    #[test]
+    fn selector_r_picks_one_online_player() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        let output = handle_command("/give @r stone", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 1);
+        match &output.actions[0] {
+            CommandAction::Give { target, .. } => {
+                assert!(target == "Steve" || target == "Alex", "got {target}");
+            }
+            other => panic!("expected /give, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selector_arguments_filter_sort_and_limit() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        // distance=..6 keeps Zombie (~2.8) only.
+        let output = handle_command("/give @a[distance=..6] stone", &source, &three_players())
+            .expect("native");
+        assert_eq!(output.actions.len(), 1);
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Zombie"
+        ));
+        // distance range with spaces after commas still merges.
+        let output =
+            handle_command("/give @a[distance=1..50, limit=2] stone", &source, &three_players())
+                .expect("native");
+        assert_eq!(output.actions.len(), 2);
+        // name= filters to a single player.
+        let output = handle_command("/give @a[name=Alex] stone", &source, &players())
+            .expect("native");
+        assert_eq!(output.actions.len(), 1);
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Alex"
+        ));
+        // sort=furthest from (0,64,0) puts Alex (-20,70,8.5) first.
+        let output =
+            handle_command("/give @a[sort=furthest,limit=1] stone", &source, &players())
+                .expect("native");
+        assert!(matches!(
+            &output.actions[0],
+            CommandAction::Give { target, .. } if target == "Alex"
+        ));
+        // @e[type=player] is a no-op; other types match nothing.
+        let output = handle_command("/give @e[type=player] stone", &source, &players())
+            .expect("native");
+        assert_eq!(output.actions.len(), 2);
+        let output = handle_command("/give @e[type=zombie] stone", &source, &players())
+            .expect("native");
+        assert!(output.actions.is_empty());
+        assert!(output.feedback[0].contains("Cannot find a player"));
+    }
+
+    #[test]
+    fn selector_permission_needs_other_for_any_other_target() {
+        let mut guest = player_source("Guest", (0.0, 64.0, 0.0));
+        guest.is_op = false;
+        guest.allow_cheats = false;
+        guest.permissions = Some(std::sync::Arc::new(crate::permission::PermissionManager::new()));
+        let players = vec![
+            OnlinePlayer {
+                name: "Guest".to_string(),
+                position: (0.0, 64.0, 0.0),
+                gamemode: 0,
+            },
+            OnlinePlayer {
+                name: "Alex".to_string(),
+                position: (5.0, 64.0, 5.0),
+                gamemode: 0,
+            },
+        ];
+        // @s only touches self, so the `.self` grant is enough.
+        let output = handle_command("/clear @s", &guest, &players).expect("native");
+        assert_eq!(output.actions.len(), 1);
+        // @a includes Alex, which needs `.other` and is denied.
+        let output = handle_command("/clear @a", &guest, &players).expect("native");
+        assert!(output.actions.is_empty());
+        assert!(output.feedback[0].contains("permission"));
+    }
+
+    #[test]
+    fn selector_tp_teleports_every_match() {
+        let source = player_source("Steve", (10.0, 64.0, -5.0));
+        let output = handle_command("/tp @a Alex", &source, &players()).expect("native");
+        // Both players teleport to Alex's position.
+        assert_eq!(output.actions.len(), 2);
+        assert_eq!(output.feedback.len(), 2);
+        for action in &output.actions {
+            match action {
+                CommandAction::Teleport { position, .. } => {
+                    assert_eq!(*position, (-20.0, 70.0, 8.5))
+                }
+                other => panic!("expected teleport, got {other:?}"),
+            }
+        }
+        // Coord form with @a: every target gets the absolute position.
+        let output = handle_command("/tp @a 0 80 0", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        for action in &output.actions {
+            match action {
+                CommandAction::Teleport { position, .. } => assert_eq!(*position, (0.0, 80.0, 0.0)),
+                other => panic!("expected teleport, got {other:?}"),
+            }
+        }
+        // @p as destination picks the nearest player (to the sender).
+        let near_source = player_source("Steve", (0.0, 64.0, 0.0));
+        let output = handle_command("/tp Alex @p", &near_source, &three_players()).expect("native");
+        assert_eq!(output.actions.len(), 1);
+        match &output.actions[0] {
+            CommandAction::Teleport { position, .. } => assert_eq!(*position, (2.0, 64.0, 2.0)),
+            other => panic!("expected teleport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selector_gamemode_xp_effect_and_title_expand() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        // Spectator avoids the already-in-mode failure (Alex is creative).
+        let output = handle_command("/gamemode spectator @a", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        let output = handle_command("/xp 100 @a", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        let output = handle_command("/effect @a speed 30", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        assert_eq!(output.feedback.len(), 2);
+        let output =
+            handle_command("/title @a title Hola mundo", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        let output = handle_command("/spawnpoint @a 0 70 0", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+        let output = handle_command("/spawn @a", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+    }
+
+    #[test]
+    fn selector_only_players_match() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+        let output = handle_command("/give @z stone", &source, &players()).expect("native");
+        assert!(output.actions.is_empty());
+        assert!(output.feedback[0].contains("Cannot find a player"));
     }
 }

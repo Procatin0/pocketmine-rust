@@ -18,7 +18,7 @@ pub use error::PluginError;
 pub use event::{Event, EventDispatcher, EventPriority, RegisteredListener};
 pub use events::*;
 pub use host::PluginHost;
-pub use manager::{CommandOutcome, PluginManager};
+pub use manager::{CommandOutcome, LoadResult, PluginEnableOrder, PluginManager};
 pub use plugin::Plugin;
 pub use runtime::{
     DiscoveredPluginManifest, IpcResponse, NativePluginWrapper, PhpPlugin, PhpWorker, PluginSource,
@@ -78,6 +78,8 @@ permissions:
             depend: vec![],
             softdepend: vec![],
             load_before: vec![],
+            src_namespace_prefix: String::new(),
+            load: None,
             commands: Default::default(),
             permissions: Default::default(),
         };
@@ -94,6 +96,8 @@ permissions:
             depend: vec!["CoreLib".to_string()],
             softdepend: vec![],
             load_before: vec![],
+            src_namespace_prefix: String::new(),
+            load: None,
             commands: Default::default(),
             permissions: Default::default(),
         };
@@ -110,6 +114,8 @@ permissions:
             depend: vec!["EconomyAPI".to_string()],
             softdepend: vec![],
             load_before: vec![],
+            src_namespace_prefix: String::new(),
+            load: None,
             commands: Default::default(),
             permissions: Default::default(),
         };
@@ -139,6 +145,8 @@ permissions:
             depend: vec!["PluginB".to_string()],
             softdepend: vec![],
             load_before: vec![],
+            src_namespace_prefix: String::new(),
+            load: None,
             commands: Default::default(),
             permissions: Default::default(),
         };
@@ -155,6 +163,8 @@ permissions:
             depend: vec!["PluginA".to_string()],
             softdepend: vec![],
             load_before: vec![],
+            src_namespace_prefix: String::new(),
+            load: None,
             commands: Default::default(),
             permissions: Default::default(),
         };

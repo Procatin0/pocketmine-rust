@@ -1,16 +1,28 @@
-//! Spanish translation catalogue copied from PocketMine-MP's `spa.ini`.
+//! English translation catalogue from Axolotl-PM's `eng.ini`.
 //!
-//! Commands keep their messages as constants so the parsing stays pure, but this
-//! module makes the exact locale available at runtime and lets the tests prove
-//! that every constant still matches what PocketMine ships. That comparison is
-//! the parity rule of the port: "the same behaviour, only the language
-//! translated".
+//! The server runs with `language "eng"` (`ServerProperties::LANGUAGE`,
+//! default `"eng"`; `pocketmine.yml` may force another locale later, but the
+//! embedded fallback is always English). All log lines that carry a
+//! `pocketmine.*` translation go through [`Translator::fill`] instead of
+//! hard-coded English, exactly like `Server.php` does via
+//! `Language::translate(KnownTranslationFactory::...)`.
+//!
+//! Command messages in [`crate::command::lang`] mirror the same `eng.ini`
+//! catalogue, so parity tests compare them against the English locale. The
+//! Spanish locale (`spa.ini`, copied from `axolotl-pm`) is kept as reference;
+//! main runtime/user-visible strings use English via
+//! [`Translator::english`] / [`Translator::embedded`].
 
 use std::collections::BTreeMap;
 
-/// `resources/spa.ini`, copied from `axolotl-pm`. The reference clone lives in
-/// `target/` and is not versioned, so the locale is embedded to keep the parity
-/// test reproducible.
+/// `resources/eng.ini`, copied byte-for-byte from
+/// `target/axolotl-pm/resources/translations/eng.ini`. The reference clone
+/// lives in `target/` and is not versioned, so the locale is embedded to keep
+/// the parity test reproducible.
+pub const ENG_INI: &str = include_str!("../resources/eng.ini");
+
+/// `resources/spa.ini`, copied from `axolotl-pm`. Kept for command-message
+/// parity tests only; the runtime language is English (`eng`).
 pub const SPA_INI: &str = include_str!("../resources/spa.ini");
 
 /// PocketMine's `BaseLang` for a `.ini` locale.
@@ -36,10 +48,24 @@ impl Translator {
         Self { entries }
     }
 
-    /// The embedded Spanish locale.
-    pub fn embedded() -> &'static Self {
+    /// The embedded English locale (`eng`), the default server language.
+    pub fn english() -> &'static Self {
+        static TRANSLATOR: std::sync::OnceLock<Translator> = std::sync::OnceLock::new();
+        TRANSLATOR.get_or_init(|| Translator::parse(ENG_INI))
+    }
+
+    /// The embedded Spanish locale (`spa`), for parity tests.
+    pub fn spanish() -> &'static Self {
         static TRANSLATOR: std::sync::OnceLock<Translator> = std::sync::OnceLock::new();
         TRANSLATOR.get_or_init(|| Translator::parse(SPA_INI))
+    }
+
+    /// The embedded locale used at runtime: English (`eng`).
+    ///
+    /// Kept as the historical entry point so existing callers keep working;
+    /// new code should prefer [`Translator::english`].
+    pub fn embedded() -> &'static Self {
+        Self::english()
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -54,6 +80,12 @@ impl Translator {
     /// `BaseLang::translate()` with named `{%name}` parameters.
     pub fn fill_named(&self, key: &str, args: &[(&str, &str)]) -> Option<String> {
         self.get(key).map(|template| fill_named(template, args))
+    }
+
+    /// Translates like `Language::translate()` with positional args, falling
+    /// back to the key itself when missing (PM `get()` returns the key).
+    pub fn translate(&self, key: &str, args: &[&str]) -> String {
+        self.fill(key, args).unwrap_or_else(|| key.to_string())
     }
 
     pub fn len(&self) -> usize {
@@ -89,10 +121,11 @@ mod tests {
     use crate::command::lang;
 
     /// Every message the port hard-codes must still equal the shipped locale.
-    /// Grows as more commands move off ad-hoc strings.
+    /// Grows as more commands move off ad-hoc strings. Compared against the
+    /// English catalogue because [`crate::command::lang`] mirrors `eng.ini`.
     #[test]
     fn constants_match_the_shipped_locale() {
-        let translator = Translator::embedded();
+        let translator = Translator::english();
         for (key, constant) in [
             ("chat.type.admin", lang::CHAT_ADMIN),
             ("chat.type.announcement", lang::CHAT_ANNOUNCEMENT),
@@ -155,11 +188,11 @@ mod tests {
     }
 
     #[test]
-    fn fills_positional_and_named_placeholders() {
-        let translator = Translator::embedded();
+    fn fills_spanish_positional_and_named_placeholders() {
+        let translator = Translator::english();
         assert_eq!(
             translator.fill("commands.players.list", &["2", "1000"]).as_deref(),
-            Some("Hay 2/1000 jugadores en línea:")
+            Some("There are 2/1000 players online:")
         );
         assert_eq!(
             translator
@@ -168,19 +201,106 @@ mod tests {
                     &[("commandName", "nope"), ("helpCommand", "/help")],
                 )
                 .as_deref(),
-            Some(concat!(
-                "Comando desconocido: nope. Utilice /help para obtener una lista de ",
-                "comandos disponibles."
-            ))
+            Some("Unknown command: nope. Use /help for a list of available commands.")
         );
     }
 
     #[test]
-    fn parses_the_shipped_locale() {
-        let translator = Translator::embedded();
-        assert!(translator.len() > 300, "only {} entries", translator.len());
-        assert!(translator.get("chat.type.admin").is_some());
-        assert!(translator.get("missing.key").is_none());
-        assert!(translator.fill("missing.key", &[]).is_none());
+    fn english_catalogue_has_server_log_keys() {
+        let translator = Translator::english();
+        // Keys used by the Server.php parity sequence in main.rs.
+        for key in [
+            "language.selected",
+            "pocketmine.server.start",
+            "pocketmine.server.auth.enabled",
+            "pocketmine.server.auth.disabled",
+            "pocketmine.server.authWarning",
+            "pocketmine.server.authProperty.disabled",
+            "pocketmine.server.info",
+            "pocketmine.server.license",
+            "pocketmine.server.defaultGameMode",
+            "pocketmine.server.startFinished",
+            "pocketmine.server.forcingShutdown",
+            "pocketmine.server.networkStart",
+            "pocketmine.server.query.running",
+            "pocketmine.server.transport.unknown",
+            "pocketmine.server.transport.unavailable",
+            "pocketmine.server.transport.noneConfigured",
+            "pocketmine.server.raknet.deprecated",
+            "pocketmine.server.nethernet.builtinSignalingDisabled",
+            "pocketmine.server.nethernet.identityKeySaveFailed",
+            "pocketmine.server.nethernet.tls.disabled",
+            "pocketmine.server.nethernet.tls.enabled",
+            "pocketmine.server.nethernet.udpMuxWithoutPortRange",
+            "pocketmine.plugin.load",
+            "pocketmine.plugin.enable",
+            "pocketmine.plugin.disable",
+            "pocketmine.plugin.loadError",
+            "pocketmine.plugin.enableError",
+            "pocketmine.plugin.someLoadErrors",
+            "pocketmine.plugin.someEnableErrors",
+            "pocketmine.level.preparing",
+            "pocketmine.level.unloading",
+            "pocketmine.network.session.open",
+            "pocketmine.network.session.close",
+            "pocketmine.network.session.playerName",
+            "pocketmine.server.devBuild.warning1",
+            "pocketmine.server.devBuild.warning2",
+            "pocketmine.server.devBuild.warning3",
+            "pocketmine.server.url.discord",
+            "pocketmine.server.url.docs",
+            "pocketmine.server.url.sourceCode",
+            "pocketmine.server.url.freePlugins",
+            "pocketmine.server.url.donations",
+            "pocketmine.server.url.translations",
+            "pocketmine.server.url.bugReporting",
+        ] {
+            assert!(translator.get(key).is_some(), "missing key {key}");
+        }
+        assert_eq!(
+            translator
+                .fill("pocketmine.server.start", &["1.26.60"])
+                .as_deref(),
+            Some("Starting Minecraft: Bedrock Edition server version 1.26.60")
+        );
+        assert_eq!(
+            translator
+                .fill("language.selected", &["English", "eng"])
+                .as_deref(),
+            Some("Selected English (eng) as the base language")
+        );
+        assert_eq!(
+            translator
+                .fill("pocketmine.server.info", &["Axolotl-PM", "5.51.2-dev"])
+                .as_deref(),
+            Some("This server is running Axolotl-PM version 5.51.2-dev")
+        );
+        assert_eq!(
+            translator
+                .fill_named(
+                    "pocketmine.network.session.close",
+                    &[("reason", "Server closed")],
+                )
+                .as_deref(),
+            Some("Session closed: Server closed")
+        );
+        assert_eq!(
+            translator.fill("commands.players.list", &["2", "1000"]).as_deref(),
+            Some("There are 2/1000 players online:")
+        );
+    }
+
+    #[test]
+    fn parses_the_shipped_locales() {
+        let english = Translator::english();
+        assert!(english.len() > 300, "only {} entries", english.len());
+        assert!(english.get("chat.type.admin").is_some());
+        assert_eq!(english.get("language.name"), Some("English"));
+        assert!(english.get("missing.key").is_none());
+        assert!(english.fill("missing.key", &[]).is_none());
+
+        let spanish = Translator::spanish();
+        assert!(spanish.len() > 300, "only {} entries", spanish.len());
+        assert!(spanish.get("chat.type.admin").is_some());
     }
 }

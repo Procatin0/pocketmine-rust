@@ -364,6 +364,30 @@ impl PlayerInventory {
     pub fn contents(&self) -> Vec<ItemStack> {
         self.slots.clone()
     }
+
+    /// Item currently held in hand (hotbar slot), as sent in AddPlayerPacket.
+    pub fn held_item(&self) -> ItemStack {
+        self.slots
+            .get(self.selected_hotbar_slot as usize)
+            .cloned()
+            .unwrap_or_else(ItemStack::empty)
+    }
+
+    /// Every modelled player window as (window id, slots), in the order
+    /// vanilla syncs them: main inventory, armor, offhand and cursor.
+    pub fn windows(&self) -> Vec<(u32, Vec<ItemStack>)> {
+        vec![
+            (WINDOW_ID_INVENTORY, self.slots.clone()),
+            (WINDOW_ID_ARMOR, self.armor.clone()),
+            (WINDOW_ID_OFFHAND, self.offhand.clone()),
+            (WINDOW_ID_CURSOR, self.cursor.clone()),
+        ]
+    }
+
+    /// Offhand item, as broadcast when another player spawns the holder.
+    pub fn offhand_item(&self) -> ItemStack {
+        self.offhand.first().cloned().unwrap_or_else(ItemStack::empty)
+    }
 }
 
 /// Compares the fields the server validates on a transaction action (PocketMine
