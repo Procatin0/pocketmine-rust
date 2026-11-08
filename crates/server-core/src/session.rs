@@ -509,11 +509,15 @@ impl PlayerSession {
     pub fn teleport(&mut self, x: f64, y: f64, z: f64, yaw: Option<f32>, pitch: Option<f32>) {
         let y = y.clamp(WORLD_MIN_Y as f64, WORLD_MAX_Y as f64);
         self.position = Vector3f::new(x as f32, y as f32, z as f32);
+        // Canonical Bedrock range (see `java_sync`): yaw folds to
+        // `[0, 360)` and pitch to `(-180, 180]`, matching the values
+        // a Java (virtual) player publishes in the registry — the PHP
+        // bridge does the inverse `+180` dance in `syncTeleport`.
         if let Some(yaw) = yaw {
-            self.yaw = yaw;
+            self.yaw = crate::java_sync::normalize_bedrock_yaw(yaw);
         }
         if let Some(pitch) = pitch {
-            self.pitch = pitch;
+            self.pitch = crate::java_sync::bedrock_pitch_to_java(pitch);
         }
         if self.gamemode != 1 {
             self.is_flying = false;
@@ -2493,6 +2497,8 @@ impl SessionManager {
                     y,
                     z,
                     world,
+                    yaw,
+                    pitch,
                 } => {
                     let Some(id) = self.session_id_for(target_player) else {
                         continue;
@@ -2507,7 +2513,17 @@ impl SessionManager {
                                 ));
                             }
                         }
-                        session.teleport(*x, *y, *z, None, None);
+                        // A portado de `syncTeleport`: el yaw/pitch
+                        // Bedrock que trae la acción se conserva
+                        // (normalizado en `teleport()`); sin ellos el
+                        // jugador quedaba con la rotación anterior.
+                        session.teleport(
+                            *x,
+                            *y,
+                            *z,
+                            yaw.map(|v| v as f32),
+                            pitch.map(|v| v as f32),
+                        );
                         registry_upsert(&self.registry, session);
                     }
                 }

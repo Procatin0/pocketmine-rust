@@ -29,6 +29,14 @@ pub enum PluginAction {
         z: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         world: Option<String>,
+        /// Bedrock-canonical yaw/pitch (the values `Player::teleport`
+        /// stores on the PHP copy). Absent on the plain
+        /// `teleport(x, y, z)` form; the Java bridge strips yaw/pitch
+        /// when neither is provided.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yaw: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pitch: Option<f64>,
     },
     #[serde(rename = "set_block")]
     SetBlock {
