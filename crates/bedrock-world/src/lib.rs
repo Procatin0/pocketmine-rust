@@ -3,6 +3,7 @@
 pub mod block_id;
 pub mod chunk;
 pub mod generator;
+pub mod java_chunk;
 pub mod network;
 pub mod paletted_block_array;
 pub mod subchunk;
