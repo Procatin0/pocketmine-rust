@@ -16,9 +16,22 @@ use crate::world_state::WorldState;
 #[derive(Default)]
 pub struct PlayerRegistry {
     players: RwLock<HashMap<String, PlayerContext>>,
+    /// Pending chat lines per player, keyed by lowercase name.
+    ///
+    /// Bedrock players receive their lines as packets from the session
+    /// manager; virtual players (Java bridge) have no session, so their
+    /// lines wait here until drained directly with [`PlayerRegistry::take_messages`].
+    /// This is the Rust side of PHP's `deliverPluginMessages()`: instead of an
+    /// IPC `player.take_messages` host call, the owning code reads the inbox
+    /// directly (no IPC).
+    inboxes: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl PlayerRegistry {
+    /// Maximum queued chat lines per player; oldest lines are dropped past
+    /// this so a player that never drains cannot grow an inbox without
+    /// bound.
+    const INBOX_CAP: usize = 128;
     pub fn new() -> Self {
         Self::default()
     }
@@ -30,7 +43,47 @@ impl PlayerRegistry {
     }
 
     pub fn remove(&self, name: &str) {
-        self.players.write().remove(&name.to_lowercase());
+        let key = name.to_lowercase();
+        self.players.write().remove(&key);
+        self.inboxes.write().remove(&key);
+    }
+
+    /// Removes the entry only if it is a virtual (Java bridge) player.
+    ///
+    /// Used so a stale Java disconnect cannot delete a live Bedrock entry
+    /// that took the name meanwhile.
+    pub fn remove_if_virtual(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        let is_virtual = self
+            .players
+            .read()
+            .get(&key)
+            .map(|p| p.is_virtual)
+            .unwrap_or(false);
+        if is_virtual {
+            self.players.write().remove(&key);
+            self.inboxes.write().remove(&key);
+        }
+        is_virtual
+    }
+
+    /// Removes the entry only if it is owned by a Bedrock session.
+    ///
+    /// Used by `finalize_session` so a Bedrock disconnect cannot delete
+    /// a live virtual player that took the name.
+    pub fn remove_if_bedrock(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        let is_bedrock = self
+            .players
+            .read()
+            .get(&key)
+            .map(|p| !p.is_virtual)
+            .unwrap_or(false);
+        if is_bedrock {
+            self.players.write().remove(&key);
+            self.inboxes.write().remove(&key);
+        }
+        is_bedrock
     }
 
     pub fn get(&self, name: &str) -> Option<PlayerContext> {
@@ -43,6 +96,25 @@ impl PlayerRegistry {
 
     pub fn all(&self) -> Vec<PlayerContext> {
         self.players.read().values().cloned().collect()
+    }
+
+    /// Queues a chat line for a player (see the `inboxes` field).
+    pub fn push_message(&self, name: &str, message: impl Into<String>) {
+        let mut inboxes = self.inboxes.write();
+        let queue = inboxes.entry(name.to_lowercase()).or_default();
+        queue.push(message.into());
+        if queue.len() > Self::INBOX_CAP {
+            queue.remove(0);
+        }
+    }
+
+    /// Drains and returns every queued chat line for the player, oldest
+    /// first. Returns an empty list when nothing is pending.
+    pub fn take_messages(&self, name: &str) -> Vec<String> {
+        self.inboxes
+            .write()
+            .remove(&name.to_lowercase())
+            .unwrap_or_default()
     }
 }
 

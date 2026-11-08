@@ -1,6 +1,7 @@
 //! PocketMine-Rust Server Core: Session and Player Management
 
 pub mod access;
+pub mod chat;
 pub mod command;
 pub mod config;
 pub mod identity;

@@ -22,6 +22,7 @@ $runtimeFiles = [
     'item.php',
     'world.php',
     'player.php',
+    'chat.php',
     'core.php',
     'event.php',
     'plugin.php',

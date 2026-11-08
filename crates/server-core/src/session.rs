@@ -423,6 +423,7 @@ impl PlayerSession {
             health: self.health,
             max_health: self.max_health,
             is_op: self.is_op(),
+            is_virtual: false,
         }
     }
 
@@ -1879,6 +1880,17 @@ impl SessionManager {
         }
     }
 
+    /// `allow-cheats` gate for chat/command sources built outside a session
+    /// (Java virtual players).
+    pub fn allow_cheats(&self) -> bool {
+        *self.allow_cheats.read()
+    }
+
+    /// `max-players` reported by `/list` for sources built outside a session.
+    pub fn max_players(&self) -> i32 {
+        self.max_players.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn plugin_manager(&self) -> Option<Arc<PluginManager>> {
         self.plugins.read().clone()
     }
@@ -2009,21 +2021,47 @@ impl SessionManager {
         crate::config::set_server_property(&dir, key, value);
     }
 
+    /// Delivers a text line to one player: a Bedrock session gets its packet,
+    /// a virtual Java player (no session) gets the line in its registry inbox
+    /// (`PlayerRegistry::push_message`), drained directly without IPC.
+    fn push_inbox_text(&self, name: &str, message: &str) -> bool {
+        if self.registry.get(name).is_some() {
+            self.registry.push_message(name, message.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
     fn queue_packet(&self, name: &str, packet: OutgoingPacket) {
-        let Some(id) = self.session_id_for(name) else {
-            return;
-        };
-        if let Some(session) = self.sessions.write().get_mut(&id) {
-            session.pending_outgoing.push(packet);
+        if let Some(id) = self.session_id_for(name) {
+            if let Some(session) = self.sessions.write().get_mut(&id) {
+                session.pending_outgoing.push(packet);
+                return;
+            }
+        }
+        // No Bedrock session: virtual Java players read Text packets from
+        // the inbox. Gamemode/teleport UI packets are registry-driven
+        // (see `apply_command_actions`), not inbox lines.
+        if let OutgoingPacket::Text(text) = &packet {
+            let _ = self.push_inbox_text(name, &text.message);
         }
     }
 
     pub fn broadcast_text(&self, message: &str) {
         let packet = OutgoingPacket::Text(TextPacket::raw(message));
-        let mut map = self.sessions.write();
-        for session in map.values_mut() {
-            if session.joined {
-                session.pending_outgoing.push(packet.clone());
+        {
+            let mut map = self.sessions.write();
+            for session in map.values_mut() {
+                if session.joined {
+                    session.pending_outgoing.push(packet.clone());
+                }
+            }
+        }
+        // Virtual Java players receive the same line through the inbox.
+        for player in self.registry.all() {
+            if player.is_virtual {
+                self.registry.push_message(&player.name, message.to_string());
             }
         }
     }
@@ -2039,6 +2077,14 @@ impl SessionManager {
 
     fn queue_targeted(&self, target: &str, packet: OutgoingPacket) {
         if target.eq_ignore_ascii_case("@all") || target.eq_ignore_ascii_case("@a") {
+            // `@a` also covers virtual Java players.
+            if let OutgoingPacket::Text(text) = &packet {
+                for player in self.registry.all() {
+                    if player.is_virtual {
+                        self.registry.push_message(&player.name, text.message.clone());
+                    }
+                }
+            }
             self.queue_all(packet);
             return;
         }
@@ -2494,21 +2540,23 @@ impl SessionManager {
                     z,
                     world,
                 } => {
-                    let Some(id) = self.session_id_for(target_player) else {
-                        continue;
-                    };
-                    let mut map = self.sessions.write();
-                    if let Some(session) = map.get_mut(&id) {
-                        if let Some(world) = world {
-                            if !world.is_empty() {
-                                session.world = Arc::new(WorldState::new(
-                                    world.clone(),
-                                    Arc::clone(&session.generator),
-                                ));
+                    if let Some(id) = self.session_id_for(target_player) {
+                        let mut map = self.sessions.write();
+                        if let Some(session) = map.get_mut(&id) {
+                            if let Some(world) = world {
+                                if !world.is_empty() {
+                                    session.world = Arc::new(WorldState::new(
+                                        world.clone(),
+                                        Arc::clone(&session.generator),
+                                    ));
+                                }
                             }
+                            session.teleport(*x, *y, *z, None, None);
+                            registry_upsert(&self.registry, session);
                         }
-                        session.teleport(*x, *y, *z, None, None);
-                        registry_upsert(&self.registry, session);
+                    } else if let Some(mut player) = self.registry.get(target_player) {
+                        player.apply_position(*x, *y, *z, player.yaw, player.pitch);
+                        self.registry.upsert(player);
                     }
                 }
                 PluginAction::SetBlock {
@@ -2645,17 +2693,19 @@ impl SessionManager {
                     gamemode,
                 } => {
                     let gamemode = *gamemode as i32;
-                    let Some(id) = self.session_id_for(target_player) else {
-                        continue;
-                    };
-                    let mut map = self.sessions.write();
-                    if let Some(session) = map.get_mut(&id) {
-                        session.gamemode = gamemode;
-                        session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
-                            SetPlayerGameTypePacket::new(gamemode),
-                        ));
-                        let abilities = session.create_update_abilities_packet();
-                        session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
+                    if let Some(id) = self.session_id_for(target_player) {
+                        let mut map = self.sessions.write();
+                        if let Some(session) = map.get_mut(&id) {
+                            session.gamemode = gamemode;
+                            session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
+                                SetPlayerGameTypePacket::new(gamemode),
+                            ));
+                            let abilities = session.create_update_abilities_packet();
+                            session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
+                        }
+                    } else if let Some(mut player) = self.registry.get(target_player) {
+                        player.gamemode = gamemode.max(0) as u32;
+                        self.registry.upsert(player);
                     }
                 }
             }
@@ -2694,9 +2744,12 @@ impl SessionManager {
     }
 
     /// Authoritative list of players in the world, taken from the live
-    /// sessions (the plugin registry may lag behind or not exist at all).
+    /// sessions plus virtual Java players in the registry (the plugin
+    /// registry may lag behind sessions, so session names win; virtual
+    /// entries fill the gap so `/list` counts Java players too).
     fn online_players_snapshot(&self) -> Vec<OnlinePlayer> {
-        self.sessions
+        let mut players: Vec<OnlinePlayer> = self
+            .sessions
             .read()
             .values()
             .filter(|session| session.joined)
@@ -2709,7 +2762,26 @@ impl SessionManager {
                 ),
                 gamemode: session.gamemode,
             })
-            .collect()
+            .collect();
+        for player in self.registry.all() {
+            if players
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(&player.name))
+            {
+                continue;
+            }
+            players.push(OnlinePlayer {
+                name: player.name.clone(),
+                position: (player.x, player.y, player.z),
+                gamemode: player.gamemode as i32,
+            });
+        }
+        players
+    }
+
+    /// Public snapshot of online players (used by the Java chat router).
+    pub fn online_players_snapshot_public(&self) -> Vec<OnlinePlayer> {
+        self.online_players_snapshot()
     }
 
     /// Applies the side effects of native commands against the live sessions.
@@ -2722,24 +2794,29 @@ impl SessionManager {
                     message,
                     notify,
                 } => {
-                    let Some(session_id) = self.session_id_for(target) else {
-                        continue;
-                    };
-                    {
+                    if let Some(session_id) = self.session_id_for(target) {
                         let mut map = self.sessions.write();
-                        let Some(session) = map.get_mut(&session_id) else {
-                            continue;
-                        };
-                        session.gamemode = *gamemode;
-                        if *gamemode != 1 {
-                            session.is_flying = false;
+                        if let Some(session) = map.get_mut(&session_id) {
+                            session.gamemode = *gamemode;
+                            if *gamemode != 1 {
+                                session.is_flying = false;
+                            }
+                            session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
+                                SetPlayerGameTypePacket::new(*gamemode),
+                            ));
+                            let abilities = session.create_update_abilities_packet();
+                            session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
+                            registry_upsert(&self.registry, session);
                         }
-                        session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
-                            SetPlayerGameTypePacket::new(*gamemode),
-                        ));
-                        let abilities = session.create_update_abilities_packet();
-                        session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
-                        registry_upsert(&self.registry, session);
+                    } else if let Some(mut player) = self.registry.get(target) {
+                        // Virtual Java player: mutate the registry snapshot
+                        // directly so `syncGamemode` (and tests) see the new
+                        // mode without a rejoin. The Java client applies the
+                        // UI packet when it polls the registry.
+                        player.gamemode = (*gamemode).max(0) as u32;
+                        self.registry.upsert(player);
+                    } else {
+                        continue;
                     }
                     // Paper broadcasts verified command changes to operators and
                     // tells the affected player; PocketMine only messages the
@@ -3190,6 +3267,8 @@ impl SessionManager {
     }
 
     /// Moves an online player and streams the chunks around the destination.
+    /// Virtual Java players are moved in the registry snapshot instead (no
+    /// chunks: the Java client teleports when it polls the registry).
     fn teleport_player(
         &self,
         name: &str,
@@ -3199,16 +3278,27 @@ impl SessionManager {
         yaw: Option<f32>,
         pitch: Option<f32>,
     ) -> bool {
-        let Some(session_id) = self.session_id_for(name) else {
+        if let Some(session_id) = self.session_id_for(name) {
+            let mut map = self.sessions.write();
+            if let Some(session) = map.get_mut(&session_id) {
+                session.teleport(x, y, z, yaw, pitch);
+                registry_upsert(&self.registry, session);
+                return true;
+            }
             return false;
-        };
-        let mut map = self.sessions.write();
-        let Some(session) = map.get_mut(&session_id) else {
-            return false;
-        };
-        session.teleport(x, y, z, yaw, pitch);
-        registry_upsert(&self.registry, session);
-        true
+        }
+        if let Some(mut player) = self.registry.get(name) {
+            player.apply_position(
+                x,
+                y,
+                z,
+                yaw.map(|value| value as f64).unwrap_or(player.yaw),
+                pitch.map(|value| value as f64).unwrap_or(player.pitch),
+            );
+            self.registry.upsert(player);
+            return true;
+        }
+        false
     }
 
     fn broadcast_time(&self, time: i32) {

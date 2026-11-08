@@ -570,7 +570,11 @@ pub fn handle_command(
     let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
     let mut parts = without_slash.split_whitespace();
     let name = parts.next()?.to_lowercase();
-    let args: Vec<&str> = parts.collect();
+    let raw_args: Vec<&str> = parts.collect();
+    // Selector `[...]` args may contain spaces (`@a[name=Alex, limit=2]`);
+    // rejoin them like `CommandMap::dispatch` does.
+    let merged = merge_selector_tokens(&raw_args);
+    let args: Vec<&str> = merged.iter().map(String::as_str).collect();
 
     // PocketMine checks the command's permissions before running it. Commands
     // registered with `setPermissions([self, other])` accept *any* of the set
@@ -782,7 +786,7 @@ fn teleport(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> 
             if source.is_console {
                 return usage("tp");
             }
-            let Some(destination) = resolve_player(players, args[0], &source.name) else {
+            let Some(destination) = resolve_player(source, players, args[0]) else {
                 return player_not_found(args[0]);
             };
             teleport_output(
@@ -794,57 +798,154 @@ fn teleport(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> 
                 None,
             )
         }
-        // /tp <objetivo> <jugador>
+        // /tp <objetivo> <jugador>: objetivos `@a`/`@p`/`@e`/`@r`
+        // teleportan a cada uno a la posición del destino.
         2 => {
-            let Some(target) = resolve_player(players, args[0], &source.name) else {
+            let targets = resolve_players(source, players, args[0]);
+            if targets.is_empty() {
                 return player_not_found(args[0]);
-            };
-            let Some(destination) = resolve_player(players, args[1], &source.name) else {
+            }
+            let Some(destination) = resolve_player(source, players, args[1]) else {
                 return player_not_found(args[1]);
             };
-            teleport_output(
-                source,
-                &target.name,
-                destination.position,
-                Some(&destination.name),
-                None,
-                None,
-            )
+            let target_names: Vec<String> =
+                targets.iter().map(|player| player.name.clone()).collect();
+            if let Some(denied) = teleport_permission_error(source, &target_names) {
+                return denied;
+            }
+            let mut feedback = Vec::new();
+            let mut actions = Vec::new();
+            for target in targets {
+                feedback.push(teleport_feedback(
+                    source,
+                    &target.name,
+                    destination.position,
+                    Some(&destination.name),
+                    None,
+                    None,
+                ));
+                actions.push(CommandAction::Teleport {
+                    target: target.name.clone(),
+                    position: destination.position,
+                    yaw: None,
+                    pitch: None,
+                });
+            }
+            CommandOutput { feedback, actions }
         }
         // /tp <x> <y> <z> and /tp <objetivo> <x> <y> <z>
         // /tp <x> <y> <z> <yaw> <pitch> and /tp <objetivo> <x> <y> <z> <yaw> <pitch>
         3 | 4 | 5 | 6 => {
-            let (target_name, origin, coord_start) = if args.len() == 3 || args.len() == 5 {
-                if source.is_console {
-                    return usage("tp");
-                }
-                (source.name.clone(), source.position, 0)
-            } else {
-                let Some(target) = resolve_player(players, args[0], &source.name) else {
-                    return player_not_found(args[0]);
+            // `len == 3 || len == 5` is the sender teleporting themselves.
+            // Otherwise the first arg is the (possibly `@a`/`@e`/...) target.
+            let (targets, coord_start): (Vec<(String, (f64, f64, f64))>, usize) =
+                if args.len() == 3 || args.len() == 5 {
+                    if source.is_console {
+                        return usage("tp");
+                    }
+                    (vec![(source.name.clone(), source.position)], 0)
+                } else {
+                    let resolved = resolve_players(source, players, args[0]);
+                    if resolved.is_empty() {
+                        return player_not_found(args[0]);
+                    }
+                    (
+                        resolved
+                            .iter()
+                            .map(|player| (player.name.clone(), player.position))
+                            .collect(),
+                        1,
+                    )
                 };
-                (target.name.clone(), target.position, 1)
-            };
 
-            let coord_count = if args.len() == 3 || args.len() == 4 { 3 } else { 3 };
-            let coordinates = &args[coord_start..coord_start + coord_count];
-            let Some(position) = parse_position(coordinates, origin) else {
-                return usage("tp");
-            };
+            let target_names: Vec<String> =
+                targets.iter().map(|(name, _)| name.clone()).collect();
+            if let Some(denied) = teleport_permission_error(source, &target_names) {
+                return denied;
+            }
 
             let (yaw, pitch) = if args.len() == 5 || args.len() == 6 {
-                let yaw_idx = coord_start + 3;
-                let pitch_idx = coord_start + 4;
-                let yaw_val = args[yaw_idx].parse::<f32>().ok();
-                let pitch_val = args[pitch_idx].parse::<f32>().ok();
-                (yaw_val, pitch_val)
+                let yaw_value = args[coord_start + 3].parse::<f32>().ok();
+                let pitch_value = args[coord_start + 4].parse::<f32>().ok();
+                (yaw_value, pitch_value)
             } else {
                 (None, None)
             };
+            let coordinates = &args[coord_start..coord_start + 3];
 
-            teleport_output(source, &target_name, position, None, yaw, pitch)
+            let mut feedback = Vec::new();
+            let mut actions = Vec::new();
+            for (target, origin) in &targets {
+                let Some(position) = parse_position(coordinates, *origin) else {
+                    return usage("tp");
+                };
+                feedback.push(teleport_feedback(source, target, position, None, yaw, pitch));
+                actions.push(CommandAction::Teleport {
+                    target: target.clone(),
+                    position,
+                    yaw,
+                    pitch,
+                });
+            }
+            CommandOutput { feedback, actions }
         }
         _ => usage("tp"),
+    }
+}
+
+fn teleport_permission_error(
+    source: &CommandSource,
+    target_names: &[String],
+) -> Option<CommandOutput> {
+    let has_self = target_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&source.name));
+    let has_other = target_names
+        .iter()
+        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+    if (has_self && !source.can(crate::permission::COMMAND_TELEPORT_SELF))
+        || (has_other && !source.can(crate::permission::COMMAND_TELEPORT_OTHER))
+    {
+        Some(permission_for("tp"))
+    } else {
+        None
+    }
+}
+
+fn teleport_feedback(
+    source: &CommandSource,
+    target: &str,
+    position: (f64, f64, f64),
+    destination_name: Option<&str>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
+) -> String {
+    let (x, y, z) = position;
+    if target.eq_ignore_ascii_case(&source.name) {
+        match destination_name {
+            Some(name) => format!("§aTeletransportado a §f{}.", name),
+            None => match (yaw, pitch) {
+                (Some(yaw), Some(pitch)) => format!(
+                    "§aTeletransportado a §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
+                    x, y, z, yaw, pitch
+                ),
+                _ => format!("§aTeletransportado a §f{:.1}, {:.1}, {:.1}§a.", x, y, z),
+            },
+        }
+    } else {
+        match destination_name {
+            Some(name) => format!("§aTeletransportando a §f{} §aa §f{}.", target, name),
+            None => match (yaw, pitch) {
+                (Some(yaw), Some(pitch)) => format!(
+                    "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
+                    target, x, y, z, yaw, pitch
+                ),
+                _ => format!(
+                    "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1}§a.",
+                    target, x, y, z
+                ),
+            },
+        }
     }
 }
 
@@ -856,46 +957,11 @@ fn teleport_output(
     yaw: Option<f32>,
     pitch: Option<f32>,
 ) -> CommandOutput {
-    // `fetchPermittedPlayerTarget`: `.self` for the sender, `.other` otherwise.
-    let node = if target.eq_ignore_ascii_case(&source.name) {
-        crate::permission::COMMAND_TELEPORT_SELF
-    } else {
-        crate::permission::COMMAND_TELEPORT_OTHER
-    };
-    if !source.can(node) {
-        return permission_for("tp");
+    let target_names = vec![target.to_string()];
+    if let Some(denied) = teleport_permission_error(source, &target_names) {
+        return denied;
     }
-    let (x, y, z) = position;
-    let feedback = if target.eq_ignore_ascii_case(&source.name) {
-        match destination_name {
-            Some(name) => format!("§aTeletransportado a §f{}.", name),
-            None => {
-                match (yaw, pitch) {
-                    (Some(yaw), Some(pitch)) => format!(
-                        "§aTeletransportado a §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
-                        x, y, z, yaw, pitch
-                    ),
-                    _ => format!("§aTeletransportado a §f{:.1}, {:.1}, {:.1}§a.", x, y, z),
-                }
-            }
-        }
-    } else {
-        match destination_name {
-            Some(name) => format!("§aTeletransportando a §f{} §aa §f{}.", target, name),
-            None => {
-                match (yaw, pitch) {
-                    (Some(yaw), Some(pitch)) => format!(
-                        "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1} (§f{}° yaw, {}° pitch§a).",
-                        target, x, y, z, yaw, pitch
-                    ),
-                    _ => format!(
-                        "§aTeletransportando a §f{} §aa §f{:.1}, {:.1}, {:.1}§a.",
-                        target, x, y, z
-                    ),
-                }
-            }
-        }
-    };
+    let feedback = teleport_feedback(source, target, position, destination_name, yaw, pitch);
 
     action(
         feedback,
@@ -914,87 +980,112 @@ fn change_gamemode(
     gamemode: i32,
     target_arg: Option<&str>,
 ) -> CommandOutput {
-    let target = match target_arg {
-        Some(name) => match resolve_player(players, name, &source.name) {
-            Some(player) => player.name.clone(),
-            None => return player_not_found(name),
-        },
+    // Selector-aware target list (`@a`, `@p`, `@e`, `@r`, ...). Silently
+    // resolves through `resolve_players` then applies the same self/other
+    // split as the single-target path.
+    let targets: Vec<String> = match target_arg {
+        Some(query) => {
+            let resolved = resolve_players(source, players, query);
+            if resolved.is_empty() {
+                return player_not_found(query);
+            }
+            resolved.iter().map(|player| player.name.clone()).collect()
+        }
         None => {
             if source.is_console {
                 return error("§cDebes especificar un jugador.");
             }
-            source.name.clone()
+            vec![source.name.clone()]
         }
     };
 
-    // PocketMine reports a failure when the target already has that mode.
-    let current = players
+    // `fetchPermittedPlayerTarget` permission split over the whole set: any
+    // `other` target needs `.other`, any self target needs `.self`.
+    let has_self = targets
         .iter()
-        .find(|player| player.name.eq_ignore_ascii_case(&target))
-        .map(|player| player.gamemode);
-    if current == Some(gamemode) {
-        return feedback(lang::GAMEMODE_FAILURE.replace("{%playerName}", &target));
-    }
-
-    // `fetchPermittedPlayerTarget`: `.self` for the sender, `.other` otherwise.
-    let node = if target.eq_ignore_ascii_case(&source.name) {
-        crate::permission::COMMAND_GAMEMODE_SELF
-    } else {
-        crate::permission::COMMAND_GAMEMODE_OTHER
-    };
-    if !source.can(node) {
+        .any(|name| name.eq_ignore_ascii_case(&source.name));
+    let has_other = targets
+        .iter()
+        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+    if (has_self && !source.can(crate::permission::COMMAND_GAMEMODE_SELF))
+        || (has_other && !source.can(crate::permission::COMMAND_GAMEMODE_OTHER))
+    {
         return permission_for("gamemode");
     }
 
     let mode_name = gamemode_translatable(gamemode);
-    let feedback = if target.eq_ignore_ascii_case(&source.name) {
-        fill_template(lang::GAMEMODE_SUCCESS_SELF, &[mode_name])
-    } else {
-        fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &target])
-    };
-
-    let message = feedback.clone();
-    action(
-        feedback,
-        CommandAction::SetGamemode {
+    let mut feedback_lines = Vec::new();
+    let mut actions = Vec::new();
+    for target in targets {
+        // PocketMine reports a failure when the target already has that mode.
+        let current = players
+            .iter()
+            .find(|player| player.name.eq_ignore_ascii_case(&target))
+            .map(|player| player.gamemode);
+        if current == Some(gamemode) {
+            feedback_lines.push(lang::GAMEMODE_FAILURE.replace("{%playerName}", &target));
+            continue;
+        }
+        let success = if target.eq_ignore_ascii_case(&source.name) {
+            fill_template(lang::GAMEMODE_SUCCESS_SELF, &[mode_name])
+        } else {
+            fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &target])
+        };
+        let message = success.clone();
+        feedback_lines.push(success);
+        actions.push(CommandAction::SetGamemode {
             target,
             gamemode,
             message,
             notify: source.name.clone(),
-        },
-    )
+        });
+    }
+    if actions.is_empty() && feedback_lines.is_empty() {
+        return feedback(lang::GAMEMODE_FAILURE.to_string());
+    }
+    CommandOutput {
+        feedback: feedback_lines,
+        actions,
+    }
 }
 
 fn spawn(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
-    let target = match args.first() {
-        Some(name) => {
+    let targets: Vec<String> = match args.first() {
+        Some(query) => {
             if !source.can_use_privileged() {
                 return permission_error();
             }
-            match resolve_player(players, name, &source.name) {
-                Some(player) => player.name.clone(),
-                None => return player_not_found(name),
+            let resolved = resolve_players(source, players, query);
+            if resolved.is_empty() {
+                return player_not_found(query);
             }
+            resolved
+                .iter()
+                .map(|player| player.name.clone())
+                .collect()
         }
         None => {
             if source.is_console {
                 return error("§cDebes especificar un jugador.");
             }
-            source.name.clone()
+            vec![source.name.clone()]
         }
     };
 
-    action(
-        format!(
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for target in targets {
+        feedback.push(format!(
             "§a{} al punto de aparición del mundo.",
             if target.eq_ignore_ascii_case(&source.name) {
                 "Teletransportado"
             } else {
                 "Jugador teletransportado"
             }
-        ),
-        CommandAction::TeleportToSpawn { target },
-    )
+        ));
+        actions.push(CommandAction::TeleportToSpawn { target });
+    }
+    CommandOutput { feedback, actions }
 }
 
 fn set_world_spawn(source: &CommandSource, args: &[&str]) -> CommandOutput {
@@ -1070,7 +1161,7 @@ fn whisper(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> C
         return usage("msg");
     }
 
-    let Some(target) = resolve_player(players, args[0], &source.name) else {
+    let Some(target) = resolve_player(source, players, args[0]) else {
         return player_not_found(args[0]);
     };
     if target.name.eq_ignore_ascii_case(&source.name) {
@@ -1115,7 +1206,7 @@ fn kick(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
     let Some(name) = args.first() else {
         return usage("kick");
     };
-    let Some(target) = resolve_player(players, name, &source.name) else {
+    let Some(target) = resolve_player(source, players, name) else {
         return player_not_found(name);
     };
 
@@ -1300,6 +1391,7 @@ fn php_int_cast(input: &str) -> i64 {
 
 /// `Server::getPlayerByPrefix`: an exact name wins, otherwise the first
 /// case-insensitive prefix match.
+#[allow(dead_code)]
 fn player_by_prefix<'a>(players: &'a [OnlinePlayer], name: &str) -> Option<&'a OnlinePlayer> {
     let needle = name.to_lowercase();
     let mut prefixed: Option<&OnlinePlayer> = None;
@@ -1317,6 +1409,9 @@ fn player_by_prefix<'a>(players: &'a [OnlinePlayer], name: &str) -> Option<&'a O
 
 /// `VanillaCommand::fetchPermittedPlayerTarget`: `@s` (or no argument) resolves
 /// to the sender, and the self/other permission split is done by the caller.
+/// `@` selectors (other than `@s`) resolve through
+/// [`resolve_selector_targets`] and return the first match; for every match
+/// use [`resolve_players`] directly.
 fn fetch_permitted_player_target<'a>(
     source: &CommandSource,
     players: &'a [OnlinePlayer],
@@ -1326,7 +1421,7 @@ fn fetch_permitted_player_target<'a>(
     other_allowed: bool,
 ) -> Result<Option<&'a OnlinePlayer>, CommandOutput> {
     let player = match target {
-        Some(name) if !name.eq_ignore_ascii_case("@s") => match player_by_prefix(players, name) {
+        Some(name) if !name.eq_ignore_ascii_case("@s") => match resolve_player(source, players, name) {
             Some(player) => player,
             None => {
                 return Err(error(red(fill_template(lang::PLAYER_NOT_FOUND, &[name]))));
@@ -1728,36 +1823,346 @@ fn parse_position(tokens: &[&str], origin: (f64, f64, f64)) -> Option<(f64, f64,
     ))
 }
 
-/// Resolves a player by exact name, then by unique prefix. `@s`/`@p` select the
-/// sender.
+/// Merges whitespace-split tokens that belong to a single selector `[...]`.
+/// `handle_command` splits on whitespace for the command name/args, so a
+/// selector written `@a[distance=1..5, name=Steve]` would split at the space
+/// after the comma. This joins tokens until brackets balance again.
+/// It also keeps JSON/NBT bracket pairs together; both callers rejoin with
+/// spaces anyway (`/give` tags, `/title` text), so merging is safe there.
+fn merge_selector_tokens(raw: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buffer: Option<String> = None;
+    let mut depth: i32 = 0;
+    for token in raw {
+        let delta = token.matches('[').count() as i32 - token.matches(']').count() as i32;
+        match &mut buffer {
+            None => {
+                depth = delta;
+                if depth <= 0 {
+                    out.push((*token).to_string());
+                } else {
+                    buffer = Some((*token).to_string());
+                }
+            }
+            Some(current) => {
+                current.push(' ');
+                current.push_str(token);
+                depth += delta;
+                if depth <= 0 {
+                    out.push(buffer.take().expect("buffer present"));
+                    depth = 0;
+                }
+            }
+        }
+    }
+    if let Some(current) = buffer {
+        out.push(current);
+    }
+    out
+}
+
+/// Sort order for selector results (`sort=nearest|furthest|arbitrary|random`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorSort {
+    Nearest,
+    Furthest,
+    Arbitrary,
+    Random,
+}
+
+/// Parsed `[...]` arguments shared by every `@` selector.
+#[derive(Debug, Clone, Default)]
+struct SelectorArgs {
+    x: Option<f64>,
+    y: Option<f64>,
+    z: Option<f64>,
+    distance_min: Option<f64>,
+    distance_max: Option<f64>,
+    limit: Option<usize>,
+    sort: Option<SelectorSort>,
+    name: Option<String>,
+    type_: Option<String>,
+    gamemode: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorKind {
+    Self_,
+    Nearest,
+    AllPlayers,
+    AllEntities,
+    Random,
+}
+
+/// `@s`, `@p`, `@a`, `@e`, `@r` plus the `@n`/`@c` aliases. `@n` is nearest
+/// (alias of `@p`); `@c` is a legacy alias for all players (`@a`). Neither
+/// is vanilla Bedrock nor PocketMine vanilla, but both appear in forks and
+/// are kept as aliases rather than silently failing.
+fn is_selector(query: &str) -> bool {
+    query.starts_with('@')
+}
+
+/// Parses `distance=` values: `5`, `..5`, `5..`, `1..5`.
+fn parse_distance_range(value: &str) -> Option<(Option<f64>, Option<f64>)> {
+    let value = value.trim();
+    if let Some((min, max)) = value.split_once("..") {
+        let min = min.trim();
+        let max = max.trim();
+        let min_value = if min.is_empty() {
+            None
+        } else {
+            Some(min.parse::<f64>().ok()?)
+        };
+        let max_value = if max.is_empty() {
+            None
+        } else {
+            Some(max.parse::<f64>().ok()?)
+        };
+        if min_value.is_none() && max_value.is_none() {
+            return None;
+        }
+        Some((min_value, max_value))
+    } else {
+        let single = value.parse::<f64>().ok()?;
+        Some((None, Some(single)))
+    }
+}
+
+/// Parses a `@` selector. Returns `None` for an unknown selector letter or
+/// a malformed `[...]` block, which callers report as
+/// `commands.generic.player.notFound`.
+fn parse_selector(
+    query: &str,
+    source_position: (f64, f64, f64),
+) -> Option<(SelectorKind, SelectorArgs)> {
+    if !query.starts_with('@') || query.len() < 2 {
+        return None;
+    }
+    let letter = (query.as_bytes()[1] as char).to_ascii_lowercase();
+    let kind = match letter {
+        's' => SelectorKind::Self_,
+        'p' | 'n' => SelectorKind::Nearest,
+        'a' | 'c' => SelectorKind::AllPlayers,
+        'e' => SelectorKind::AllEntities,
+        'r' => SelectorKind::Random,
+        _ => return None,
+    };
+    let rest = query[2..].trim();
+    if rest.is_empty() {
+        return Some((kind, SelectorArgs::default()));
+    }
+    if !rest.starts_with('[') || !rest.ends_with(']') {
+        return None;
+    }
+    let inner = &rest[1..rest.len() - 1];
+    let mut args = SelectorArgs::default();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        match key.as_str() {
+            "x" => args.x = parse_coordinate(value, source_position.0),
+            "y" => args.y = parse_coordinate(value, source_position.1),
+            "z" => args.z = parse_coordinate(value, source_position.2),
+            "distance" => {
+                if let Some((min, max)) = parse_distance_range(value) {
+                    args.distance_min = min;
+                    args.distance_max = max;
+                }
+            }
+            "limit" => {
+                if let Ok(value) = value.parse::<i64>() {
+                    args.limit = Some(if value < 0 { 0 } else { value as usize });
+                }
+            }
+            "sort" => {
+                args.sort = match value.to_lowercase().as_str() {
+                    "nearest" => Some(SelectorSort::Nearest),
+                    "furthest" => Some(SelectorSort::Furthest),
+                    "arbitrary" => Some(SelectorSort::Arbitrary),
+                    "random" => Some(SelectorSort::Random),
+                    _ => None,
+                };
+            }
+            "name" => args.name = Some(value.to_string()),
+            "type" => args.type_ = Some(value.to_string()),
+            "gamemode" => args.gamemode = parse_gamemode(value),
+            _ => {}
+        }
+    }
+    Some((kind, args))
+}
+
+fn selector_distance(position: (f64, f64, f64), origin: (f64, f64, f64)) -> f64 {
+    let dx = position.0 - origin.0;
+    let dy = position.1 - origin.1;
+    let dz = position.2 - origin.2;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Small xorshift generator so `@r` / `sort=random` do not need a rand
+/// dependency. Mixed with wall time and a counter, so consecutive calls do
+/// not repeat the same pick within a tick.
+fn next_pseudo_random() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x853c49e6748fea9b);
+    let count = COUNTER.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = count ^ nanos ^ count.wrapping_shl(6) ^ count.wrapping_shr(2);
+    if state == 0 {
+        state = 0x9e3779b97f4a7c15;
+    }
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    state.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+fn shuffle_vec<T>(values: &mut Vec<T>) {
+    if values.len() <= 1 {
+        return;
+    }
+    for index in (1..values.len()).rev() {
+        let swap_with = (next_pseudo_random() % (index as u64 + 1)) as usize;
+        values.swap(index, swap_with);
+    }
+}
+
+/// Resolves a parsed `@` selector against the online snapshot.
+///
+/// `@e` returns the online players as entities: the Bedrock runtime has no
+/// non-player entity list yet, so mobs/items are not included (documented
+/// in the module docs). `type=player` is a no-op filter; any other `type`
+/// matches nothing.
+fn resolve_selector_targets<'a>(
+    source: &CommandSource,
+    players: &'a [OnlinePlayer],
+    kind: SelectorKind,
+    args: &SelectorArgs,
+) -> Vec<&'a OnlinePlayer> {
+    let origin = (
+        args.x.unwrap_or(source.position.0),
+        args.y.unwrap_or(source.position.1),
+        args.z.unwrap_or(source.position.2),
+    );
+    let mut pool: Vec<&OnlinePlayer> = match kind {
+        SelectorKind::Self_ => players
+            .iter()
+            .filter(|player| player.name.eq_ignore_ascii_case(&source.name))
+            .collect(),
+        _ => players.iter().collect(),
+    };
+    if let Some(name_filter) = &args.name {
+        pool.retain(|player| player.name.eq_ignore_ascii_case(name_filter));
+    }
+    if let Some(type_filter) = &args.type_ {
+        let lowered = type_filter.to_lowercase();
+        if lowered != "player" && lowered != "players" {
+            return Vec::new();
+        }
+    }
+    if let Some(gamemode) = args.gamemode {
+        pool.retain(|player| player.gamemode == gamemode);
+    }
+    if args.distance_min.is_some() || args.distance_max.is_some() {
+        pool.retain(|player| {
+            let distance = selector_distance(player.position, origin);
+            let min_ok = args.distance_min.map(|min| distance >= min).unwrap_or(true);
+            let max_ok = args.distance_max.map(|max| distance <= max).unwrap_or(true);
+            min_ok && max_ok
+        });
+    }
+    let effective_sort = args.sort.unwrap_or(match kind {
+        SelectorKind::Nearest => SelectorSort::Nearest,
+        SelectorKind::Random => SelectorSort::Random,
+        SelectorKind::Self_ | SelectorKind::AllPlayers | SelectorKind::AllEntities => {
+            SelectorSort::Arbitrary
+        }
+    });
+    match effective_sort {
+        SelectorSort::Nearest => pool.sort_by(|first, second| {
+            selector_distance(first.position, origin)
+                .partial_cmp(&selector_distance(second.position, origin))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SelectorSort::Furthest => pool.sort_by(|first, second| {
+            selector_distance(second.position, origin)
+                .partial_cmp(&selector_distance(first.position, origin))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SelectorSort::Arbitrary => {}
+        SelectorSort::Random => shuffle_vec(&mut pool),
+    }
+    let limit = args.limit.unwrap_or(match kind {
+        SelectorKind::Nearest | SelectorKind::Random | SelectorKind::Self_ => 1,
+        SelectorKind::AllPlayers | SelectorKind::AllEntities => usize::MAX,
+    });
+    if limit == 0 {
+        return Vec::new();
+    }
+    pool.truncate(limit);
+    pool
+}
+
+/// Resolves a player by exact name, then by unique prefix. Selectors (`@s`,
+/// `@p`, `@a`, `@e`, `@r`, `@n`, `@c` with optional `[...]`) resolve through
+/// [`resolve_selector_targets`] and return the first match (already sorted
+/// and limited). For multiple targets see [`resolve_players`].
 fn resolve_player<'a>(
+    source: &CommandSource,
     players: &'a [OnlinePlayer],
     query: &str,
-    source_name: &str,
 ) -> Option<&'a OnlinePlayer> {
-    if query.eq_ignore_ascii_case("@s") || query.eq_ignore_ascii_case("@p") {
-        return players
-            .iter()
-            .find(|player| player.name.eq_ignore_ascii_case(source_name))
-            .or_else(|| players.first());
+    if is_selector(query) {
+        let (kind, args) = parse_selector(query, source.position)?;
+        return resolve_selector_targets(source, players, kind, &args)
+            .into_iter()
+            .next();
     }
-
-    let query = query.to_lowercase();
+    let query_lower = query.to_lowercase();
     if let Some(exact) = players
         .iter()
-        .find(|player| player.name.to_lowercase() == query)
+        .find(|player| player.name.to_lowercase() == query_lower)
     {
         return Some(exact);
     }
-
     let matches: Vec<&OnlinePlayer> = players
         .iter()
-        .filter(|player| player.name.to_lowercase().starts_with(&query))
+        .filter(|player| player.name.to_lowercase().starts_with(&query_lower))
         .collect();
     if matches.len() == 1 {
         matches.first().copied()
     } else {
         None
+    }
+}
+
+/// Resolves a query to every matching player (selector-aware). Non-selector
+/// names follow [`resolve_player`]'s unique-prefix rule: ambiguous prefixes
+/// resolve to no players.
+fn resolve_players<'a>(
+    source: &CommandSource,
+    players: &'a [OnlinePlayer],
+    query: &str,
+) -> Vec<&'a OnlinePlayer> {
+    if is_selector(query) {
+        let Some((kind, args)) = parse_selector(query, source.position) else {
+            return Vec::new();
+        };
+        return resolve_selector_targets(source, players, kind, &args);
+    }
+    match resolve_player(source, players, query) {
+        Some(player) => vec![player],
+        None => Vec::new(),
     }
 }
 

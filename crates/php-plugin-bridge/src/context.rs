@@ -133,6 +133,14 @@ pub struct PlayerContext {
     pub max_health: f32,
     #[serde(default)]
     pub is_op: bool,
+    /// True for virtual players registered by the Java bridge (`player.register`).
+    ///
+    /// Virtual players have no Bedrock session: their chat lines wait in the
+    /// registry inbox (`PlayerRegistry::push_message` / `take_messages`) and
+    /// their position/gamemode updates mutate the registry snapshot directly.
+    /// Bedrock sessions produce contexts with `is_virtual = false`.
+    #[serde(default)]
+    pub is_virtual: bool,
 }
 
 impl PlayerContext {
@@ -155,6 +163,7 @@ impl PlayerContext {
             health: 20.0,
             max_health: 20.0,
             is_op: false,
+            is_virtual: false,
         }
     }
 
@@ -173,6 +182,16 @@ impl PlayerContext {
             player.display_name = player.name.clone();
         }
         Some(player)
+    }
+
+    /// Applies a new authoritative position (e.g. a `/tp` result or a
+    /// `player.update_position` heartbeat for virtual Java players).
+    pub fn apply_position(&mut self, x: f64, y: f64, z: f64, yaw: f64, pitch: f64) {
+        self.x = x;
+        self.y = y;
+        self.z = z;
+        self.yaw = yaw;
+        self.pitch = pitch;
     }
 }
 
@@ -216,6 +235,7 @@ mod tests {
             health: 20.0,
             max_health: 20.0,
             is_op: true,
+            is_virtual: false,
         };
 
         let value = player.to_json();

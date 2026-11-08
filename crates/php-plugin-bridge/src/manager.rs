@@ -682,7 +682,8 @@ fn split_command_line(command_line: &str) -> Option<(String, Vec<String>)> {
     if command.is_empty() {
         return None;
     }
-    Some((command, parts.map(str::to_string).collect()))
+    let raw_args: Vec<String> = parts.map(str::to_string).collect();
+    Some((command, crate::command::merge_selector_tokens(&raw_args)))
 }
 
 fn sender_to_json(sender: &CommandSender) -> serde_json::Value {
