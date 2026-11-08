@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::context::PluginAction;
 use crate::description::PluginDescription;
@@ -20,6 +20,10 @@ use crate::runtime::bootstrap;
 
 const PING_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound waiting for the PHP worker thread (and its child process) to
+/// exit during shutdown. After this, the child is force-killed and shutdown
+/// proceeds — PM `forceShutdown` must never hang on a wedged thread.
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Manifest returned by PHP's `discover_plugins` action.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +81,15 @@ struct WorkerHandle {
     host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
     runtime_dir: Arc<Mutex<Option<PathBuf>>>,
     worker_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Set when the server shutdown sequence has started. Once set, no new
+    /// PHP process is ever spawned: requests against a dead worker fail fast
+    /// instead of restarting an empty runtime mid-shutdown (which showed up
+    /// as a second `[PHP/RUNTIME] Runtime ready` line during `disablePlugins`
+    /// and silently skipped the remaining plugins' `onDisable`).
+    shutdown: Arc<AtomicBool>,
+    /// PID of the current PHP child, kept so a wedged worker can be
+    /// force-killed instead of blocking shutdown forever.
+    child_pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl WorkerHandle {
@@ -90,6 +103,14 @@ impl WorkerHandle {
     }
 
     fn start_sync(&self) -> Result<bool, PluginError> {
+        // Once shutdown starts the runtime is never restarted. This also
+        // keeps the tick loop (which keeps calling `tick_sync` until the
+        // runtime drops) from respawning a fresh, empty PHP worker while
+        // plugins are being disabled.
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+
         if self.is_available() && self.tx.lock().is_some() {
             return Ok(true);
         }
@@ -103,6 +124,14 @@ impl WorkerHandle {
 
         *tx_guard = None;
         self.available.store(false, Ordering::SeqCst);
+
+        // Never leave a stale PHP process behind: a previous worker that
+        // timed out may still be alive (its thread is blocked reading a
+        // wedged stdout). Kill it before spawning its replacement.
+        if let Some(pid) = self.child_pid.lock().take() {
+            debug!("Stopping stale PHP worker process (pid {pid}) before restart");
+            kill_process(pid);
+        }
 
         let runtime_dir = bootstrap::default_runtime_dir();
         let bootstrap_path = bootstrap::write_runtime(&runtime_dir)?;
@@ -149,6 +178,7 @@ impl WorkerHandle {
 
         let (sender, receiver) = mpsc::channel::<WorkerRequest>();
         let host = Arc::clone(&self.host);
+        *self.child_pid.lock() = Some(child.id());
         let join_handle = match std::thread::Builder::new()
             .name("php-plugin-worker".to_string())
             .spawn(move || run_worker(child, stdin, stdout, receiver, host))
@@ -185,7 +215,7 @@ impl WorkerHandle {
 
         match reply_rx.recv_timeout(PING_TIMEOUT) {
             Ok(Ok(response)) if response.status == "ok" => {
-                info!("PHP plugin runtime worker started successfully");
+                debug!("PHP plugin runtime worker started successfully");
                 Ok(true)
             }
             Ok(Ok(response)) => {
@@ -266,6 +296,10 @@ pub struct PhpWorker {
     runtime_dir: Arc<Mutex<Option<PathBuf>>>,
     /// Join handle for the PHP worker thread, kept so shutdown can wait for it.
     worker_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// See `WorkerHandle::shutdown`.
+    shutdown: Arc<AtomicBool>,
+    /// See `WorkerHandle::child_pid`.
+    child_pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl Default for PhpWorker {
@@ -282,6 +316,8 @@ impl PhpWorker {
             host: Arc::new(RwLock::new(None)),
             runtime_dir: Arc::new(Mutex::new(None)),
             worker_thread: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            child_pid: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -292,6 +328,8 @@ impl PhpWorker {
             host: Arc::clone(&self.host),
             runtime_dir: Arc::clone(&self.runtime_dir),
             worker_thread: Arc::clone(&self.worker_thread),
+            shutdown: Arc::clone(&self.shutdown),
+            child_pid: Arc::clone(&self.child_pid),
         }
     }
 
@@ -390,12 +428,30 @@ impl PhpWorker {
         Ok(response.actions)
     }
 
+    /// Flags the worker as shutting down WITHOUT stopping it: from now on no
+    /// new PHP process is spawned (dead-worker requests fail fast), but
+    /// in-flight requests keep working. The shutdown sequence in `main.rs`
+    /// calls this before `disable_plugins()` so a plugin that kills the
+    /// worker cannot trigger a mid-shutdown restart of an empty runtime.
+    pub fn begin_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::begin_shutdown`] has been called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     /// Asks the PHP worker to exit and waits for the worker thread to finish.
     ///
     /// Sends a `shutdown` request to the worker, then joins the worker thread
-    /// so the PHP subprocess has time to exit cleanly. If the worker thread
-    /// has already been joined or was never started, this is a no-op.
+    /// so the PHP subprocess has time to exit cleanly. The wait is bounded:
+    /// if the thread does not finish within [`WORKER_SHUTDOWN_TIMEOUT`] the
+    /// PHP child is force-killed and the function returns anyway — shutdown
+    /// must never hang forever on a wedged worker (PM `forceShutdown` parity:
+    /// after this the server exits).
     pub fn shutdown_sync(&self) {
+        self.begin_shutdown();
         self.available.store(false, Ordering::SeqCst);
 
         // Send the shutdown request so the worker loop breaks.
@@ -408,17 +464,70 @@ impl PhpWorker {
             });
         }
 
-        // Wait for the worker thread to finish so the PHP process exits cleanly.
+        // Wait (bounded) for the worker thread, force-killing the PHP child
+        // when the worker does not exit in time.
         if let Some(handle) = self.worker_thread.lock().take() {
-            if let Err(error) = handle.join() {
-                warn!("PHP worker thread panicked during shutdown: {:?}", error);
+            join_with_timeout(
+                handle,
+                WORKER_SHUTDOWN_TIMEOUT,
+                Arc::clone(&self.child_pid),
+            );
+        }
+
+        // Final cleanup: reap/kill the PHP child if it is still around.
+        if let Some(pid) = self.child_pid.lock().take() {
+            kill_process(pid);
+        }
+    }
+}
+
+/// Joins `handle` waiting at most `timeout`, then kills the PHP child (via
+/// `child_pid`) so a wedged worker thread — e.g. blocked reading a hung
+/// stdout — unblocks and can be reaped by its detached joiner.
+fn join_with_timeout(
+    handle: std::thread::JoinHandle<()>,
+    timeout: Duration,
+    child_pid: Arc<Mutex<Option<u32>>>,
+) {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("php-plugin-worker-join".to_string())
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        })
+        .ok();
+
+    match done_rx.recv_timeout(timeout) {
+        Ok(()) => {}
+        Err(_) => {
+            warn!(
+                "PHP worker thread did not exit within {:?}; force-killing the PHP process",
+                timeout
+            );
+            if let Some(pid) = child_pid.lock().take() {
+                debug!("Force-killing PHP worker process (pid {pid})");
+                kill_process(pid);
             }
         }
     }
 }
 
+/// Best-effort force-kill of a PHP worker process by PID.
+fn kill_process(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
 impl Drop for PhpWorker {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
         self.available.store(false, Ordering::SeqCst);
         if let Some(sender) = self.tx.lock().take() {
             let (reply, _receiver) = mpsc::sync_channel(1);
@@ -439,7 +548,6 @@ fn run_worker(
     host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    let mut clean_shutdown = false;
 
     while let Ok(request) = receiver.recv() {
         let mut payload = Map::new();
@@ -471,7 +579,6 @@ fn run_worker(
                 status: "ok".to_string(),
                 ..IpcResponse::default()
             }));
-            clean_shutdown = true;
             break;
         }
 
@@ -484,11 +591,21 @@ fn run_worker(
         }
     }
 
-    // Closing stdin lets a well-behaved PHP loop exit on EOF.
+    // Closing stdin lets a well-behaved PHP loop exit on EOF. The wait for
+    // the child is bounded so a wedged worker cannot hang shutdown forever;
+    // after `WORKER_SHUTDOWN_TIMEOUT` the child is force-killed.
     drop(stdin);
-    if !clean_shutdown {
-        if let Ok(None) = child.try_wait() {
-            let _ = child.kill();
+    let deadline = std::time::Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
         }
     }
     let _ = child.wait();
@@ -630,6 +747,11 @@ impl PluginSource {
 
     /// Directory used as `plugin_dir` in `load_plugin` (a `phar://` URI for
     /// archives).
+    ///
+    /// URI parity with PHP: PHP builds `phar://<realpath of the .phar>` (see
+    /// `PharPluginLoader` in `php/plugin.php` and `readPharEntry()` in
+    /// `php/ipc.php`); Rust does the same here with
+    /// [`normalize_phar_path`], so both sides address identical entries.
     pub fn root(&self) -> String {
         match self {
             Self::Dir(path) => path.to_string_lossy().to_string(),
@@ -640,16 +762,27 @@ impl PluginSource {
         }
     }
 
+    /// `src/` directory inside the plugin (PM `"<phar>/src"` for archives,
+    /// `"<plugin dir>/src"` otherwise). The PHP autoloader resolves classes
+    /// below this root via `phar://` URIs.
+    pub fn src_root(&self) -> String {
+        format!("{}/src", self.root().trim_end_matches('/'))
+    }
+
     /// Absolute path of the plugin's main class file.
     pub fn main_file(&self, main_class: &str) -> String {
         let relative = main_class
             .trim()
             .trim_start_matches(|character| character == '\\' || character == '/')
             .replace('\\', "/");
-        format!("{}/src/{}.php", self.root().trim_end_matches('/'), relative)
+        format!("{}/{}.php", self.src_root(), relative)
     }
 }
 
+/// Normalizes a `.phar` path to the filesystem path PHP's `realpath()`
+/// returns: strips an optional `phar://` prefix, makes relative paths
+/// absolute against the current directory, and canonicalizes when the file
+/// exists (resolves symlinks and `.` / `..` segments).
 fn normalize_phar_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     let stripped = raw
@@ -658,13 +791,18 @@ fn normalize_phar_path(path: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| path.to_path_buf());
 
-    if stripped.is_absolute() {
+    let absolute = if stripped.is_absolute() {
         stripped
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(&stripped))
             .unwrap_or(stripped)
-    }
+    };
+
+    // Canonicalize mirrors PHP `realpath()`: Windows paths become absolute
+    // drive-letter paths and symlinks resolve, so `PluginSource::Phar`
+    // addresses the same archive PHP opens via `phar://`.
+    std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 /// A PHP-based PocketMine plugin managed via the IPC bridge.
@@ -763,7 +901,7 @@ impl Plugin for PhpPlugin {
 
         std::fs::create_dir_all(&data_folder)?;
 
-        info!(
+        debug!(
             "Loading PHP plugin '{}' (main: {}, source: {})",
             self.name(),
             main_class,
@@ -806,7 +944,7 @@ impl Plugin for PhpPlugin {
     }
 
     async fn on_enable(&mut self) -> Result<(), PluginError> {
-        info!("Enabling PHP plugin '{}'", self.name());
+        debug!("Enabling PHP plugin '{}'", self.name());
         let response = self
             .worker
             .send_command("enable_plugin", json!({ "name": self.name() }))
@@ -827,7 +965,7 @@ impl Plugin for PhpPlugin {
     }
 
     async fn on_disable(&mut self) -> Result<(), PluginError> {
-        info!("Disabling PHP plugin '{}'", self.name());
+        debug!("Disabling PHP plugin '{}'", self.name());
         let result = self
             .worker
             .send_command("disable_plugin", json!({ "name": self.name() }))
@@ -856,6 +994,30 @@ mod tests {
         assert!(source
             .main_file("Acme\\Foo\\Main")
             .ends_with("Foo.phar/src/Acme/Foo/Main.php"));
+        assert!(source.src_root().ends_with("Foo.phar/src"));
+    }
+
+    #[test]
+    fn phar_source_detects_extension_case_insensitively() {
+        let source = PluginSource::from_path("plugins/Bar.PHAR");
+        assert!(source.is_phar());
+        // An already-prefixed URI must not gain a second `phar://` prefix.
+        let prefixed = PluginSource::phar("phar://plugins/Bar.phar");
+        assert_eq!(prefixed.root().matches("phar://").count(), 1);
+    }
+
+    #[test]
+    fn phar_src_root_matches_php_addpath() {
+        // PM `PharPluginLoader::loadPlugin()` registers `"$file/src"` with the
+        // class loader; Rust must address the same location.
+        let source = PluginSource::from_path("plugins/MyPlugin.phar");
+        let src = source.src_root();
+        assert!(src.starts_with("phar://"));
+        assert!(src.ends_with("MyPlugin.phar/src"));
+        assert_eq!(
+            source.main_file("MyPlugin\\Main"),
+            format!("{src}/MyPlugin/Main.php")
+        );
     }
 
     #[test]

@@ -4,8 +4,27 @@ declare(strict_types=1);
 
 namespace pocketmine\item {
 
+    /**
+     * Item mínimo del puente.
+     *
+     * Cobertura A3 (documentada):
+     * - `customName` (NBT `display.Name`) ya existía; se mantiene.
+     * - Encantamientos (`Enchantments`) y NBT compuesto (`CompoundTag`) son
+     *   stubs: se guardan en arrays locales y se serializan en
+     *   `toArray()`/`fromArray()`, pero nunca llegan a la red (no hay
+     *   `ItemSerializer`/`EnchantmentManager` en el core).
+     * - Durability (`Damage`/`MaxDurability`) es solo un entero local por
+     *   id conocido; sin `Item` por tipo (espada, pico...) todos valen 0
+     *   salvo `isDamaged()` derivado de `damage > 0`.
+     */
     class Item
     {
+        /** @var array<int,int> enchantment id => level (stub) */
+        private array $enchantments = [];
+        /** @var array<string,mixed> NBT stub (p. ej. can_place_on, lore) */
+        private array $nbt = [];
+        private int $damage = 0;
+
         public function __construct(
             private int $id = 0,
             private int $meta = 0,
@@ -94,14 +113,131 @@ namespace pocketmine\item {
             return null;
         }
 
+        // ---- NBT stub (CompoundTag sin serializador de red) ----
+
+        public function getNBT(): array
+        {
+            return $this->nbt;
+        }
+
+        public function setNBT(array $tags): static
+        {
+            $this->nbt = $tags;
+            return $this;
+        }
+
+        public function getCompoundTag(): ?array
+        {
+            return $this->nbt === [] ? null : $this->nbt;
+        }
+
+        public function setCompoundTag(?array $tag = null): void
+        {
+            $this->nbt = $tag ?? [];
+        }
+
+        public function getLore(): array
+        {
+            $lore = $this->nbt['display']['lore'] ?? [];
+            return is_array($lore) ? array_values($lore) : [];
+        }
+
+        public function setLore(array $lore): void
+        {
+            if (!isset($this->nbt['display']) || !is_array($this->nbt['display'])) {
+                $this->nbt['display'] = [];
+            }
+            $this->nbt['display']['lore'] = array_values($lore);
+        }
+
+        // ---- Encantamientos stub (id => level) ----
+
+        /** @return array<int,int> */
+        public function getEnchantments(): array
+        {
+            return $this->enchantments;
+        }
+
+        public function addEnchantment(int $enchantmentId, int $level = 1): void
+        {
+            $this->enchantments[$enchantmentId] = max(1, $level);
+        }
+
+        public function removeEnchantment(int $enchantmentId): void
+        {
+            unset($this->enchantments[$enchantmentId]);
+        }
+
+        public function clearEnchantments(): void
+        {
+            $this->enchantments = [];
+        }
+
+        public function hasEnchantments(): bool
+        {
+            return $this->enchantments !== [];
+        }
+
+        public function getEnchantmentLevel(int $enchantmentId): int
+        {
+            return $this->enchantments[$enchantmentId] ?? 0;
+        }
+
+        // ---- Durability stub ----
+
+        public function getDamage(): int
+        {
+            return $this->damage;
+        }
+
+        public function setDamage(int $damage): void
+        {
+            $this->damage = max(0, $damage);
+        }
+
+        public function getMaxDurability(): int
+        {
+            // Sin clases de item por tipo: solo se devuelve un techo
+            // genérico documentado. 0 = no dañable.
+            return 0;
+        }
+
+        public function getDurability(): int
+        {
+            $max = $this->getMaxDurability();
+            return $max === 0 ? 0 : max(0, $max - $this->damage);
+        }
+
+        public function isDamaged(): bool
+        {
+            return $this->damage > 0;
+        }
+
+        public function repair(): void
+        {
+            $this->damage = 0;
+        }
+
         public static function fromArray(array $data): Item
         {
-            return new Item(
+            $item = new Item(
                 (int)($data['id'] ?? 0),
                 (int)($data['meta'] ?? 0),
                 (int)($data['count'] ?? 1),
                 isset($data['custom_name']) ? (string)$data['custom_name'] : null
             );
+            if (isset($data['nbt']) && is_array($data['nbt'])) {
+                $item->nbt = $data['nbt'];
+            }
+            if (isset($data['enchantments']) && is_array($data['enchantments'])) {
+                foreach ($data['enchantments'] as $id => $level) {
+                    $item->enchantments[(int)$id] = (int)$level;
+                }
+            }
+            if (isset($data['damage'])) {
+                $item->damage = (int)$data['damage'];
+            }
+            return $item;
         }
 
         public function toArray(): array
@@ -109,6 +245,15 @@ namespace pocketmine\item {
             $out = ['id' => $this->id, 'meta' => $this->meta, 'count' => $this->count];
             if ($this->customName !== null) {
                 $out['custom_name'] = $this->customName;
+            }
+            if ($this->nbt !== []) {
+                $out['nbt'] = $this->nbt;
+            }
+            if ($this->enchantments !== []) {
+                $out['enchantments'] = $this->enchantments;
+            }
+            if ($this->damage !== 0) {
+                $out['damage'] = $this->damage;
             }
             return $out;
         }
@@ -156,6 +301,40 @@ namespace pocketmine\item {
         public function registerItem(Item $item, bool $override = false): void
         {
             // Items share the block name registry in this bridge.
+        }
+
+        /** Item creative inventory stub (uno por cada bloque conocido). */
+        public static function getCreativeInventory(): array
+        {
+            static $inventory = null;
+            if ($inventory === null) {
+                $inventory = [];
+                foreach (\pocketmine\world\BlockFactory::getBlockIdMap() as $name => $id) {
+                    if ($id === 0) {
+                        continue;
+                    }
+                    $inventory[] = self::get($id, 0, 1);
+                }
+            }
+            return $inventory;
+        }
+
+        public static function clearCreativeItems(): void
+        {
+            // Stub: el inventario se deriva de BlockFactory, nada que limpiar.
+        }
+
+        public static function isRegistered(string $name): bool
+        {
+            return \pocketmine\world\BlockFactory::idFromName($name) !== 0;
+        }
+
+        /** Stub descriptivo: pondrá `isRegistered()` si se registra el item. */
+        public static function getItemTypeId(string $name): string
+        {
+            return \pocketmine\world\BlockFactory::networkNameOf(
+                \pocketmine\world\BlockFactory::idFromName($name)
+            );
         }
     }
 }

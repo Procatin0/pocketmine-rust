@@ -27,8 +27,12 @@ pub mod set_difficulty;
 pub mod set_health;
 pub mod set_title;
 pub mod move_actor_absolute;
+pub mod move_player;
 pub mod remove_actor;
 pub mod transfer;
+pub mod add_player;
+pub mod player_list;
+pub mod set_actor_data;
 
 pub use network_settings::{NetworkSettingsPacket, RequestNetworkSettingsPacket};
 pub use play_status::PlayStatusPacket;
@@ -65,5 +69,15 @@ pub use set_difficulty::SetDifficultyPacket;
 pub use set_health::SetHealthPacket;
 pub use set_title::SetTitlePacket;
 pub use move_actor_absolute::MoveActorAbsolutePacket;
+pub use move_player::{MovePlayerPacket, MovePlayerTeleportData};
 pub use remove_actor::RemoveActorPacket;
 pub use transfer::TransferPacket;
+pub use add_player::{AbilitiesData, AbilitiesLayer, AddPlayerPacket};
+pub use player_list::{
+    PlayerListEntry, PlayerListPacket, SkinData, SkinImage, STEVE_GEOMETRY_DATA,
+    STEVE_GEOMETRY_NAME, STEVE_GEOMETRY_VERSION, STEVE_RESOURCE_PATCH, uuid_from_str,
+    uuid_to_string,
+};
+pub use set_actor_data::{
+    MetadataEntry, MetadataValue, PropertySyncData, SetActorDataPacket,
+};

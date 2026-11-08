@@ -45,7 +45,8 @@ fn kill_sends_death_packets_and_respawn_restores_health() {
     let ids: Vec<u32> = responses.iter().map(|packet| packet.packet_id()).collect();
     assert!(ids.contains(&0x2A), "health is not restored");
     assert!(ids.contains(&0x2D), "READY_TO_SPAWN is missing");
-    assert!(ids.contains(&0x12), "the teleport packet is missing");
+    // 0x13 is MovePlayerPacket; 0x12 is MoveActorAbsolute (other entities).
+    assert!(ids.contains(&0x13), "the teleport packet is missing");
 
     // A second, unsolicited respawn packet is ignored.
     assert!(session.handle_packet(0x2D, &payload).unwrap().is_empty());

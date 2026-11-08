@@ -88,6 +88,44 @@ pub enum PluginAction {
         target_player: String,
         gamemode: u32,
     },
+    // Fase A1 (Server+Player API): `Player::setHealth/setMaxHealth/setXp/
+    // setXpLevel` via `addAction`. `SetHealth` bundles `health` + optional
+    // `max_health` so both PHP setters share one variant; `SetXp` bundles
+    // `xp` (progress 0..1) + optional `level` (xp_level). Tolerant of
+    // partial payloads (optionals default to `None`).
+    #[serde(rename = "set_health")]
+    SetHealth {
+        target_player: String,
+        health: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_health: Option<f32>,
+    },
+    #[serde(rename = "set_xp")]
+    SetXp {
+        target_player: String,
+        xp: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<i32>,
+    },
+    // Fase A1: `Player::hidePlayer/showPlayer` -> `SessionManager::
+    // hide_player/show_player` (`canSee`). `viewer` hides/shows `target`.
+    #[serde(rename = "hide_player")]
+    HidePlayer { viewer: String, target: String },
+    #[serde(rename = "show_player")]
+    ShowPlayer { viewer: String, target: String },
+    // Fase A1: `Player::sendSubTitle` (subtitle only, no title packet).
+    #[serde(rename = "send_subtitle")]
+    SendSubTitle {
+        target_player: String,
+        subtitle: String,
+    },
+    // Fase A1: `Player::sendActionBarMessage` (`SetTitlePacket`
+    // action-bar message, NOT `TextPacket` popup).
+    #[serde(rename = "send_action_bar")]
+    SendActionBar {
+        target_player: String,
+        message: String,
+    },
 }
 
 fn default_socket_addr() -> SocketAddr {
@@ -133,6 +171,12 @@ pub struct PlayerContext {
     pub max_health: f32,
     #[serde(default)]
     pub is_op: bool,
+    /// True when this entry is owned by a virtual (Java bridge) player,
+    /// false when it is owned by a live Bedrock session. Ownership matters
+    /// for removal: quitting one side must not delete the other's entry
+    /// when both scripts share a lowercase name.
+    #[serde(default)]
+    pub is_virtual: bool,
 }
 
 impl PlayerContext {
@@ -155,6 +199,7 @@ impl PlayerContext {
             health: 20.0,
             max_health: 20.0,
             is_op: false,
+            is_virtual: false,
         }
     }
 
@@ -172,6 +217,79 @@ impl PlayerContext {
         if player.display_name.is_empty() {
             player.display_name = player.name.clone();
         }
+        Some(player)
+    }
+
+    /// Updates position/rotation in place (`player.update_position`).
+    pub fn apply_position(&mut self, x: f64, y: f64, z: f64, yaw: f64, pitch: f64) {
+        self.x = x;
+        self.y = y;
+        self.z = z;
+        self.yaw = yaw;
+        self.pitch = pitch;
+    }
+
+    /// Snapshot in the `players/<name>.json` format shared with Bedrock
+    /// sessions (`PlayerSession::save_player_data`).
+    pub fn to_save_json(&self) -> Value {
+        serde_json::json!({
+            "name": self.name,
+            "x": self.x,
+            "y": self.y,
+            "z": self.z,
+            "yaw": self.yaw,
+            "pitch": self.pitch,
+            "gamemode": self.gamemode as i64,
+            "health": self.health as f64,
+            "world": self.world,
+        })
+    }
+
+    /// Restores position/rotation/gamemode/health from a saved JSON object.
+    ///
+    /// Missing fields leave the current values untouched.
+    pub fn apply_save_json(&mut self, value: &Value) {
+        let number = |key: &str| value.get(key).and_then(Value::as_f64);
+        if let (Some(x), Some(y), Some(z)) = (number("x"), number("y"), number("z")) {
+            self.x = x;
+            self.y = y;
+            self.z = z;
+        }
+        if let Some(yaw) = number("yaw") {
+            self.yaw = yaw;
+        }
+        if let Some(pitch) = number("pitch") {
+            self.pitch = pitch;
+        }
+        if let Some(gamemode) = value.get("gamemode").and_then(Value::as_i64) {
+            self.gamemode = gamemode.max(0) as u32;
+        }
+        if let Some(health) = number("health") {
+            self.health = health as f32;
+        }
+        if let Some(world) = value.get("world").and_then(Value::as_str) {
+            if !world.is_empty() {
+                self.world = world.to_string();
+            }
+        }
+    }
+
+    /// Builds a context from a saved JSON object returning `None` when the
+    /// object has no usable position.
+    pub fn from_save_json(name: &str, value: &Value) -> Option<Self> {
+        let (x, y, z) = {
+            let object = value.as_object()?;
+            (
+                object.get("x")?.as_f64()?,
+                object.get("y")?.as_f64()?,
+                object.get("z")?.as_f64()?,
+            )
+        };
+        let mut player = Self::new(name, default_socket_addr());
+        player.x = x;
+        player.y = y;
+        player.z = z;
+        player.apply_save_json(value);
         Some(player)
     }
 }
@@ -216,6 +334,7 @@ mod tests {
             health: 20.0,
             max_health: 20.0,
             is_op: true,
+            is_virtual: false,
         };
 
         let value = player.to_json();

@@ -37,9 +37,37 @@ namespace pocketmine\player {
         public int $xpLevel;
 
         private PlayerInventory $inventory;
+        private PlayerInventory $enderInventory;
+        private PlayerInventory $cursorInventory;
+        private PlayerInventory $craftingGrid;
+        private PlayerInventory $creativeInventory;
         private bool $online = true;
         private array $permissions = [];
         private ?bool $opOverride = null;
+
+        /** Fase A1: `hiddenPlayers` (canSee). Clave: lowercase name. */
+        private array $hiddenPlayers = [];
+        /** Fase A1: locale PM (`en_US` por defecto). */
+        private string $locale = 'en_US';
+        /** Fase A1: flags de movimiento (toggle* locales). */
+        private bool $sprinting = false;
+        private bool $sneaking = false;
+        private bool $sneakPressed = false;
+        private bool $gliding = false;
+        private bool $swimming = false;
+        /** Fase A1: posición de la cama si duerme (`isSleeping`). */
+        private mixed $sleeping = null;
+        /** Fase A1: hambre/aire para `canEat`/`canBreathe` (simplificado). */
+        private float $food = 20.0;
+        private float $saturation = 20.0;
+        private int $air = 300;
+
+        /** `Player::getFirstPlayed()`/`getLastPlayed()` (microtiempo float). */
+        private float $firstPlayed = 0.0;
+        private float $lastPlayed = 0.0;
+        /** ¿Existía `players/<name>.json` antes de esta sesión? */
+        private ?bool $hadSavedData = null;
+        private bool $playedLoaded = false;
 
         public function __construct(array|string $data = ['name' => 'Steve'])
         {
@@ -66,8 +94,29 @@ namespace pocketmine\player {
             $this->maxHealth = (float)($data['max_health'] ?? 20.0);
             $this->flying = (bool)($data['flying'] ?? false);
             $this->xp = (float)($data['xp'] ?? 0.0);
-            $this->xpLevel = (int)($data['xp_level'] ?? 0);
+            $this->xpLevel = (int)($data['xp_level'] ?? $data['xpLevel'] ?? 0);
             $this->online = (bool)($data['online'] ?? true);
+            $this->locale = (string)($data['locale'] ?? 'en_US');
+            $this->sprinting = (bool)($data['sprinting'] ?? false);
+            $this->sneaking = (bool)($data['sneaking'] ?? false);
+            $this->gliding = (bool)($data['gliding'] ?? false);
+            $this->swimming = (bool)($data['swimming'] ?? false);
+            $this->food = (float)($data['food'] ?? 20.0);
+            $this->saturation = (float)($data['saturation'] ?? 20.0);
+            $this->air = (int)($data['air'] ?? 300);
+            $this->firstPlayed = (float)($data['first_played'] ?? $data['firstPlayed'] ?? 0.0);
+            $this->lastPlayed = (float)($data['last_played'] ?? $data['lastPlayed'] ?? 0.0);
+            $hasPlayedBefore = $data['has_played_before'] ?? $data['hasPlayedBefore'] ?? null;
+            if (is_bool($hasPlayedBefore)) {
+                $this->hadSavedData = $hasPlayedBefore;
+                $this->playedLoaded = true;
+            }
+            if ($this->firstPlayed > 0.0 || $this->lastPlayed > 0.0) {
+                $this->playedLoaded = true;
+                if ($this->hadSavedData === null) {
+                    $this->hadSavedData = $this->lastPlayed > $this->firstPlayed + 0.001;
+                }
+            }
 
             if (isset($data['permissions']) && is_array($data['permissions'])) {
                 $this->permissions = $data['permissions'];
@@ -75,8 +124,18 @@ namespace pocketmine\player {
             if (array_key_exists('is_op', $data) || array_key_exists('op', $data)) {
                 $this->opOverride = (bool)($data['is_op'] ?? $data['op']);
             }
+            if (isset($data['hidden_players']) && is_array($data['hidden_players'])) {
+                foreach ($data['hidden_players'] as $name) {
+                    $this->hiddenPlayers[strtolower((string)$name)] = true;
+                }
+            }
 
             $this->inventory = new PlayerInventory($this->name);
+            // Fase A1: stub inventories (ver getters; sync TODO).
+            $this->enderInventory = new PlayerInventory($this->name . '#ender');
+            $this->cursorInventory = new PlayerInventory($this->name . '#cursor');
+            $this->craftingGrid = new PlayerInventory($this->name . '#crafting');
+            $this->creativeInventory = new PlayerInventory($this->name . '#creative');
         }
 
         public function getName(): string
@@ -183,6 +242,14 @@ namespace pocketmine\player {
         public function setHealth(float $health): void
         {
             $this->health = max(0.0, min($this->maxHealth, $health));
+            // Fase A1: `PluginAction::SetHealth` (salud + max). También host
+            // para virtuales (subset sin sesión Bedrock).
+            $this->addAction('set_health', [
+                'target_player' => $this->name,
+                'health' => $this->health,
+                'max_health' => $this->maxHealth,
+            ]);
+            $this->hostUpdateHealthFallback();
         }
 
         public function getMaxHealth(): float
@@ -196,6 +263,12 @@ namespace pocketmine\player {
             if ($this->health > $this->maxHealth) {
                 $this->health = $this->maxHealth;
             }
+            $this->addAction('set_health', [
+                'target_player' => $this->name,
+                'health' => $this->health,
+                'max_health' => $this->maxHealth,
+            ]);
+            $this->hostUpdateHealthFallback();
         }
 
         public function isFlying(): bool
@@ -216,6 +289,15 @@ namespace pocketmine\player {
         public function setXp(float $xp): void
         {
             $this->xp = max(0.0, $xp);
+            // Fase A1: `PluginAction::SetXp` (progress `xp` + `level`).
+            // TODO: picks de PM (`Living::setXp` puntos -> progreso/nivel por
+            // `ExperienceManager`) no existen; aquí `xp` es progreso 0..1 y
+            // `level` el nivel. Conversión puntos->progreso pendiente.
+            $this->addAction('set_xp', [
+                'target_player' => $this->name,
+                'xp' => $this->xp,
+                'level' => $this->xpLevel,
+            ]);
         }
 
         public function getXpLevel(): int
@@ -226,6 +308,11 @@ namespace pocketmine\player {
         public function setXpLevel(int $level): void
         {
             $this->xpLevel = max(0, $level);
+            $this->addAction('set_xp', [
+                'target_player' => $this->name,
+                'xp' => $this->xp,
+                'level' => $this->xpLevel,
+            ]);
         }
 
         public function getInventory(): PlayerInventory
@@ -261,6 +348,84 @@ namespace pocketmine\player {
             return \pocketmine\Server::getInstance()->isOp($this->name);
         }
 
+        /**
+         * PM `Player::hasOpPermission(): bool`. BetterChat (`ChatListener`)
+         * lo usa para el prefijo/sufijo de OP; es un alias de `isOp()`.
+         */
+        public function hasOpPermission(): bool
+        {
+            return $this->isOp();
+        }
+
+        /**
+         * Carga perezosa de `first_played`/`last_played` y de la existencia
+         * de datos guardados (`player.load` / `player.has_data`) vía host.
+         * Sin host, los valores vienen del constructor (0.0 = nunca).
+         */
+        private function loadPlayedTimes(): void
+        {
+            if ($this->playedLoaded) {
+                return;
+            }
+            $this->playedLoaded = true;
+            if (!class_exists(\pocketmine\runtime\Bridge::class) || !\pocketmine\runtime\Bridge::isActive()) {
+                $this->hadSavedData ??= false;
+                return;
+            }
+            try {
+                $loaded = \pocketmine\runtime\Bridge::hostCall('player.load', ['name' => $this->name]);
+            } catch (\Throwable $e) {
+                fwrite(STDERR, '[PHP/PLAYER] player.load failed: ' . $e->getMessage() . PHP_EOL);
+                $loaded = null;
+            }
+            if (!is_array($loaded)) {
+                $this->hadSavedData ??= false;
+                return;
+            }
+            $hasData = ($loaded['has_data'] ?? $loaded['exists'] ?? false) === true;
+            $this->hadSavedData = $hasData || ($this->hadSavedData ?? false);
+            if (!$hasData) {
+                return;
+            }
+            $source = $loaded;
+            if (isset($source['data']) && is_array($source['data'])) {
+                $source = array_merge($source, $source['data']);
+            }
+            $first = (float)($source['first_played'] ?? $source['firstPlayed'] ?? 0.0);
+            $last = (float)($source['last_played'] ?? $source['lastPlayed'] ?? 0.0);
+            if ($first > 0.0) {
+                $this->firstPlayed = $first;
+            }
+            if ($last > 0.0) {
+                $this->lastPlayed = $last;
+            }
+        }
+
+        /** PM `Player::getFirstPlayed(): float` (microtiempo, 0.0 = nunca). */
+        public function getFirstPlayed(): float
+        {
+            $this->loadPlayedTimes();
+            return $this->firstPlayed;
+        }
+
+        /** PM `Player::getLastPlayed(): float` (microtiempo, 0.0 = nunca). */
+        public function getLastPlayed(): float
+        {
+            $this->loadPlayedTimes();
+            return $this->lastPlayed;
+        }
+
+        /**
+         * PM `Player::hasPlayedBefore(): bool` (umbral de 1ms como axolotl):
+         * existían datos guardados antes de esta sesión, o `lastPlayed`
+         * supera a `firstPlayed` en más de 1 milisegundo.
+         */
+        public function hasPlayedBefore(): bool
+        {
+            $this->loadPlayedTimes();
+            return ($this->hadSavedData ?? false) || ($this->lastPlayed > $this->firstPlayed + 0.001);
+        }
+
         public function isPlayer(): bool
         {
             return true;
@@ -281,9 +446,9 @@ namespace pocketmine\player {
             return false;
         }
 
-        public function sendMessage(string $message): void
+        public function sendMessage(string|\pocketmine\lang\Translatable $message): void
         {
-            $this->addAction('send_message', ['target_player' => $this->name, 'message' => $message]);
+            $this->addAction('send_message', ['target_player' => $this->name, 'message' => (string)$message]);
         }
 
         public function sendTip(string $message): void
@@ -308,9 +473,42 @@ namespace pocketmine\player {
             ]);
         }
 
+        /** PM `Player::sendSubTitle(string): void` (solo subtítulo). */
+        public function sendSubTitle(string $subtitle): void
+        {
+            $this->addAction('send_subtitle', [
+                'target_player' => $this->name,
+                'subtitle' => $subtitle,
+            ]);
+        }
+
+        /** PM `Player::sendActionBarMessage(string): void` (NO es popup). */
         public function sendActionBarMessage(string $message): void
         {
-            $this->sendPopup($message);
+            $this->addAction('send_action_bar', [
+                'target_player' => $this->name,
+                'message' => $message,
+            ]);
+        }
+
+        /**
+         * PM `Player::sendToastNotification(string, string): void`.
+         * Stub documentado: sin paquete Toast en bridge/protocolo.
+         * TODO(A1): `ToastNotificationPacket` + queue (maestro Bridge).
+         */
+        public function sendToastNotification(string $title, string $body): void
+        {
+            // No-op stub: no se emite acción (variante inexistente rompería IPC).
+        }
+
+        /**
+         * PM `Player::sendForm(Form): void`. Stub documentado: sin
+         * `ModalForm`/`FormResponse` en bridge/protocol.
+         * TODO(A1): `ModalFormDataPacket` + `Form` (equipo Forms).
+         */
+        public function sendForm(mixed $form): void
+        {
+            // No-op stub: no se emite acción.
         }
 
         public function teleport(mixed $position): bool
@@ -372,6 +570,355 @@ namespace pocketmine\player {
             return [];
         }
 
+        // ----------------------------------------------------------------
+        // Fase A1: paridad Player.php (visibilidad / skin / inventories /
+        // gamemode helpers / toggles / sleep / eat / block-attack stubs).
+        // ----------------------------------------------------------------
+
+        /**
+         * PM `Player::canSee(Player): bool` (`hiddenPlayers` por UUID).
+         * Clave local por nombre (TODO: UUID bytes cuando exista `Uuid` real).
+         */
+        public function canSee(Player $player): bool
+        {
+            if ($player === $this) {
+                return true;
+            }
+            return !isset($this->hiddenPlayers[$player->getLowerCaseName()]);
+        }
+
+        /**
+         * PM `Player::hidePlayer(Player): void` -> `PluginAction::HidePlayer`
+         * -> `SessionManager::hide_player` (despawn + flag). No-op si self.
+         */
+        public function hidePlayer(Player $player): void
+        {
+            if ($player === $this) {
+                return;
+            }
+            $this->hiddenPlayers[$player->getLowerCaseName()] = true;
+            $this->addAction('hide_player', ['viewer' => $this->name, 'target' => $player->getName()]);
+        }
+
+        /** PM `Player::showPlayer(Player): void` -> `PluginAction::ShowPlayer`. */
+        public function showPlayer(Player $player): void
+        {
+            if ($player === $this) {
+                return;
+            }
+            unset($this->hiddenPlayers[$player->getLowerCaseName()]);
+            $this->addAction('show_player', ['viewer' => $this->name, 'target' => $player->getName()]);
+        }
+
+        /**
+         * PM `Player::getSkin(): Skin`. Stub Steve (sin textura real).
+         * TODO(A1): skin real (128x128 / geometría) + `changeSkin`/`sendSkin`.
+         */
+        public function getSkin(): object
+        {
+            if (class_exists(\pocketmine\entity\Skin::class)) {
+                return new \pocketmine\entity\Skin();
+            }
+            $skin = new \stdClass();
+            $skin->skinId = 'standard';
+            $skin->skinData = '';
+            return $skin;
+        }
+
+        /** PM `Player::getLocale(): string` (`en_US` por defecto). */
+        public function getLocale(): string
+        {
+            return $this->locale;
+        }
+
+        /**
+         * PM `Player::getEnderInventory(): EnderInventory`. Stub `PlayerInventory`.
+         * TODO(A1): tipo `EnderInventory` + sync con sesión (inventario Rust).
+         */
+        public function getEnderInventory(): PlayerInventory
+        {
+            return $this->enderInventory;
+        }
+
+        /**
+         * PM `Player::getCursorInventory(): PlayerCursorInventory`. Stub.
+         * TODO(A1): inventario temporal cursor + sync de ventana.
+         */
+        public function getCursorInventory(): PlayerInventory
+        {
+            return $this->cursorInventory;
+        }
+
+        /**
+         * PM `Player::getCraftingGrid(): CraftingGrid`. Stub.
+         * TODO(A1): grid 2x2+output + recetas (CraftingManager).
+         */
+        public function getCraftingGrid(): PlayerInventory
+        {
+            return $this->craftingGrid;
+        }
+
+        /**
+         * PM `Player::getCreativeInventory(): CreativeInventory`. Stub.
+         * TODO(A1): inventario creativo compartido + `syncCreative`.
+         */
+        public function getCreativeInventory(): PlayerInventory
+        {
+            return $this->creativeInventory;
+        }
+
+        /** PM `Player::isSurvival(bool $literal = false)`. */
+        public function isSurvival(bool $literal = false): bool
+        {
+            return $this->gamemode === 0 || (!$literal && $this->gamemode === 2);
+        }
+
+        /** PM `Player::isCreative(bool $literal = false)`. */
+        public function isCreative(bool $literal = false): bool
+        {
+            return $this->gamemode === 1 || (!$literal && $this->gamemode === 3);
+        }
+
+        /** PM `Player::isAdventure(bool $literal = false)`. */
+        public function isAdventure(bool $literal = false): bool
+        {
+            return $this->gamemode === 2 || (!$literal && $this->gamemode === 3);
+        }
+
+        /** PM `Player::isSpectator(): bool`. */
+        public function isSpectator(): bool
+        {
+            return $this->gamemode === 3;
+        }
+
+        public function isSprinting(): bool
+        {
+            return $this->sprinting;
+        }
+
+        public function isSneaking(): bool
+        {
+            return $this->sneaking;
+        }
+
+        public function isGliding(): bool
+        {
+            return $this->gliding;
+        }
+
+        public function isSwimming(): bool
+        {
+            return $this->swimming;
+        }
+
+        /** PM `Player::toggleSprint(bool): bool`. Estado local; sync TODO. */
+        public function toggleSprint(bool $sprint): bool
+        {
+            if ($sprint === $this->sprinting) {
+                return true;
+            }
+            // TODO(A1): evento `PlayerToggleSprintEvent` + sync de flags
+            // (`SetActorData` DATA_FLAGS) vía `PluginAction::SetFlags`.
+            $this->sprinting = $sprint;
+            return true;
+        }
+
+        /** PM `Player::toggleSneak(bool, bool $sneakPressed = true): bool`. */
+        public function toggleSneak(bool $sneak, bool $sneakPressed = true): bool
+        {
+            $this->sneakPressed = $sneakPressed;
+            if ($sneak === $this->sneaking) {
+                return true;
+            }
+            // TODO(A1): evento `PlayerToggleSneakEvent` + sync DATA_FLAGS.
+            $this->sneaking = $sneak;
+            return true;
+        }
+
+        /** PM `Player::toggleFlight(bool): bool` (usa `flying`). */
+        public function toggleFlight(bool $fly): bool
+        {
+            if ($fly === $this->flying) {
+                return true;
+            }
+            // TODO(A1): evento `PlayerToggleFlightEvent` + chequeo
+            // `allowFlight` (creative/spectator) + `UpdateAbilitiesPacket`.
+            $this->flying = $fly;
+            return true;
+        }
+
+        /** PM `Player::toggleGlide(bool): bool`. */
+        public function toggleGlide(bool $glide): bool
+        {
+            if ($glide === $this->gliding) {
+                return true;
+            }
+            // TODO(A1): evento + sync FLAG_GLIDING.
+            $this->gliding = $glide;
+            return true;
+        }
+
+        /** PM `Player::toggleSwim(bool): bool`. */
+        public function toggleSwim(bool $swim): bool
+        {
+            if ($swim === $this->swimming) {
+                return true;
+            }
+            // TODO(A1): evento + sync FLAG_SWIMMING.
+            $this->swimming = $swim;
+            return true;
+        }
+
+        /** PM `Player::isSleeping(): bool`. */
+        public function isSleeping(): bool
+        {
+            return $this->sleeping !== null;
+        }
+
+        /**
+         * PM `Player::sleepOn(Vector3): bool`. Stub: solo guarda posición
+         * (floor). TODO(A1): bloque `Bed` + `PlayerBedEnterEvent` + spawn.
+         */
+        public function sleepOn(mixed $pos): bool
+        {
+            if ($this->sleeping !== null) {
+                return false;
+            }
+            if ($pos instanceof Vector3) {
+                $this->sleeping = $pos->floor();
+                return true;
+            }
+            return false;
+        }
+
+        /** PM `Player::stopSleep(): void`. */
+        public function stopSleep(): void
+        {
+            $this->sleeping = null;
+        }
+
+        /**
+         * PM `Player::canEat(): bool` (`isCreative() || HungerManager`).
+         * Simplificación: creative o vivo. TODO: hambre real (`food`).
+         */
+        public function canEat(): bool
+        {
+            return $this->isCreative() || $this->isAlive();
+        }
+
+        /**
+         * PM `Player::canBreathe(): bool` (`isCreative() || air > 0`).
+         * Simplificación: creative o vivo. TODO: aire real (`air`).
+         */
+        public function canBreathe(): bool
+        {
+            return $this->isCreative() || $this->isAlive();
+        }
+
+        /**
+         * PM `Player::pickBlock(Vector3, bool): bool`.
+         * TODO(A1): `World::getBlock` + `PlayerBlockPickEvent` + item pick.
+         * Hoy stub devuelve `false` (sin mundo/bloque real en bridge).
+         */
+        public function pickBlock(mixed $pos, bool $addTileNBT = false): bool
+        {
+            return false;
+        }
+
+        /**
+         * PM `Player::attackBlock(Vector3, int): bool` (clic izquierdo).
+         * TODO(A1): `PlayerInteractEvent` + `World::useBreakOn` + handler.
+         */
+        public function attackBlock(mixed $pos, int $face = 0): bool
+        {
+            return false;
+        }
+
+        /**
+         * PM `Player::interactBlock(Vector3, int, Vector3): bool`.
+         * TODO(A1): `World::useItemOn` + alcance (`canInteract`).
+         */
+        public function interactBlock(mixed $pos, int $face = 0, mixed $clickOffset = null): bool
+        {
+            return false;
+        }
+
+        /**
+         * PM `Player::attackEntity(Entity): bool`.
+         * TODO(A1): `EntityDamageByEntityEvent` + `Entity::attack()` (sin
+         * sistema de entidades en bridge).
+         */
+        public function attackEntity(mixed $entity): bool
+        {
+            return false;
+        }
+
+        /** Fallback virtual: sincroniza salud en registro host si hay Bridge. */
+        private function hostUpdateHealthFallback(): void
+        {
+            if (class_exists(\pocketmine\runtime\Bridge::class) && \pocketmine\runtime\Bridge::isActive()) {
+                \pocketmine\runtime\Bridge::hostCall('player.update_health', [
+                    'name' => $this->name,
+                    'health' => $this->health,
+                    'max_health' => $this->maxHealth,
+                ]);
+            }
+        }
+
+        /**
+         * Persiste el jugador (`players/<name>.json` vía host `player.save`).
+         *
+         * Dispara `PlayerDataSaveEvent` antes de escribir; si un plugin lo
+         * cancela no se guarda.
+         */
+        public function save(bool $isQuit = true): bool
+        {
+            if (class_exists(\pocketmine\event\player\PlayerDataSaveEvent::class)) {
+                try {
+                    $manager = \pocketmine\Server::getInstance()->getPluginManager();
+                    $event = new \pocketmine\event\player\PlayerDataSaveEvent($this);
+                    $manager->dispatchEvent($event);
+                    if (method_exists($event, 'isCancelled') && $event->isCancelled()) {
+                        return false;
+                    }
+                } catch (\Throwable $e) {
+                    fwrite(STDERR, '[PHP/PLAYER] PlayerDataSaveEvent failed: ' . $e->getMessage() . PHP_EOL);
+                    return false;
+                }
+            }
+            if (!class_exists(\pocketmine\runtime\Bridge::class) || !\pocketmine\runtime\Bridge::isActive()) {
+                return false;
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall('player.save', [
+                'name' => $this->name,
+                'x' => $this->x,
+                'y' => $this->y,
+                'z' => $this->z,
+                'yaw' => $this->yaw,
+                'pitch' => $this->pitch,
+                'gamemode' => $this->gamemode,
+                'health' => $this->health,
+                'max_health' => $this->maxHealth,
+                'world' => $this->worldName,
+                'first_played' => $this->firstPlayed,
+                'last_played' => $this->lastPlayed,
+            ]);
+            return is_array($result) && ($result['ok'] ?? false) === true;
+        }
+
+        /** Guarda datos genéricos del jugador (`player.save_data`). */
+        public function saveData(array $data): bool
+        {
+            if (!class_exists(\pocketmine\runtime\Bridge::class) || !\pocketmine\runtime\Bridge::isActive()) {
+                return false;
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall('player.save_data', [
+                'name' => $this->name,
+                'data' => $data,
+            ]);
+            return is_array($result) && ($result['ok'] ?? false) === true;
+        }
+
         public function toArray(): array
         {
             return [
@@ -394,6 +941,8 @@ namespace pocketmine\player {
                 'flying' => $this->flying,
                 'online' => $this->online,
                 'is_op' => $this->isOp(),
+                'first_played' => $this->firstPlayed,
+                'last_played' => $this->lastPlayed,
             ];
         }
 
@@ -423,6 +972,12 @@ namespace pocketmine\player {
             return $this->name;
         }
 
+        /** Datos guardados (`player.load`), o null si nunca jugó. */
+        public function getData(): ?array
+        {
+            return $this->data;
+        }
+
         public function getXuid(): string
         {
             return (string)($this->data['unique_id'] ?? $this->name);
@@ -438,24 +993,43 @@ namespace pocketmine\player {
             return \pocketmine\Server::getInstance()->isOp($this->name);
         }
 
+        public function hasOpPermission(): bool
+        {
+            return $this->isOp();
+        }
+
         public function hasPermission($permission): bool
         {
             return $this->isOp();
         }
 
-        public function getFirstPlayed(): int
+        /** PM `OfflinePlayer::getFirstPlayed(): float` (0.0 = nunca). */
+        public function getFirstPlayed(): float
         {
-            return 0;
+            $source = $this->data;
+            if (is_array($source) && isset($source['data']) && is_array($source['data'])) {
+                $source = array_merge($source, $source['data']);
+            }
+            return (float)($source['first_played'] ?? $source['firstPlayed'] ?? 0.0);
         }
 
-        public function getLastPlayed(): int
+        /** PM `OfflinePlayer::getLastPlayed(): float` (0.0 = nunca). */
+        public function getLastPlayed(): float
         {
-            return 0;
+            $source = $this->data;
+            if (is_array($source) && isset($source['data']) && is_array($source['data'])) {
+                $source = array_merge($source, $source['data']);
+            }
+            return (float)($source['last_played'] ?? $source['lastPlayed'] ?? 0.0);
         }
 
         public function hasPlayedBefore(): bool
         {
-            return true;
+            if ($this->data === null) {
+                return false;
+            }
+            return ($this->getLastPlayed() > $this->getFirstPlayed() + 0.001)
+                || ($this->data['has_data'] ?? $this->data['exists'] ?? true) === true;
         }
 
         public function __toString(): string
@@ -626,6 +1200,49 @@ namespace pocketmine\inventory {
         public function setItemInHand(Item $item): void
         {
             $this->setItem(0, $item);
+        }
+    }
+}
+
+namespace pocketmine\entity {
+
+    /**
+     * PM `pocketmine\entity\Skin` stub (Fase A1): skin Steve por defecto.
+     * TODO(A1): textura 64x64/128x128 real + geometría + capa + `setSkin`.
+     */
+    class Skin
+    {
+        public function __construct(
+            private string $skinId = 'standard',
+            private string $skinData = '',
+            private string $capeData = '',
+            private string $geometryData = ''
+        ) {
+        }
+
+        public function getSkinId(): string
+        {
+            return $this->skinId;
+        }
+
+        public function getSkinData(): string
+        {
+            return $this->skinData;
+        }
+
+        public function getCapeData(): string
+        {
+            return $this->capeData;
+        }
+
+        public function getGeometryData(): string
+        {
+            return $this->geometryData;
+        }
+
+        public function __toString(): string
+        {
+            return 'Skin(' . $this->skinId . ')';
         }
     }
 }

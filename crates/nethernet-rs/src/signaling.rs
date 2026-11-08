@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 use rtc::ice::network_type::NetworkType;
 use rtc::peer_connection::transport::{RTCDtlsRole, RTCIceCandidateInit};
@@ -20,7 +20,7 @@ use webrtc::peer_connection::{
 
 use crate::identity::NetherNetIdentity;
 use crate::info::ServerInfo;
-use crate::negotiation::{AnswerBuilder, IceCandidateFormatter};
+use crate::negotiation::{AnswerBuilder, IceCandidate, IceCandidateFormatter};
 
 pub trait NetherNetPacketHandler: Send + Sync {
     fn handle_message(&self, peer: SocketAddr, channel: &str, data: bytes::Bytes) -> Vec<bytes::Bytes>;
@@ -47,11 +47,11 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
-        info!("[:WebRTC] ICE connection state changed to {:?} for {}", state, self.peer_addr);
+        debug!("[:WebRTC] ICE connection state changed to {:?} for {}", state, self.peer_addr);
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        info!("[:WebRTC] PeerConnection state changed to {:?} for {}", state, self.peer_addr);
+        debug!("[:WebRTC] PeerConnection state changed to {:?} for {}", state, self.peer_addr);
         if state == RTCPeerConnectionState::Disconnected || state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
             if let Some(pc) = self.peer_conn.lock().await.take() {
                 debug!("[:WebRTC] Closing PeerConnection on disconnect/fail for {}", self.peer_addr);
@@ -64,7 +64,7 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
         let peer = self.peer_addr;
         let label = dc.label().await.unwrap_or_default();
         let id = dc.id();
-        info!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
+        debug!("[:WebRTC] DataChannel '{}' (id: {:?}) established with {}", label, id, peer);
 
         if label == "ReliableDataChannel" {
             *self.reliable_dc.lock().await = Some(Arc::clone(&dc));
@@ -108,7 +108,7 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                         }
                     }
                     Some(DataChannelEvent::OnClose) | None => {
-                        info!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
+                        debug!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
                         if let Some(ph) = &handler {
                             ph.on_disconnect(peer);
                         }
@@ -181,6 +181,183 @@ impl SignalingServer {
         self
     }
 
+    /// `172.16.0.0/12`: the range Hyper-V's Default Switch and docker bridges
+    /// carve for virtual adapters. Those addresses have no route to the LAN.
+    fn is_virtual_subnet(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                a == 172 && (16..=31).contains(&b)
+            }
+            IpAddr::V6(_) => false,
+        }
+    }
+
+    /// Link-local unicast: `169.254.0.0/16` (RFC 3927) and `fe80::/10` (RFC 4291).
+    fn is_link_local(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        }
+    }
+
+    /// Probes the local source the stack would use to reach `dest_ip`, by
+    /// `connect`ing a throwaway UDP socket (no packet is sent). Returns
+    /// `None` when the probe cannot be made.
+    fn probe_local_ip(dest_ip: IpAddr, udp_port: u16) -> Option<IpAddr> {
+        let dest = SocketAddr::new(dest_ip, udp_port);
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        if probe.connect(dest).is_err() {
+            return None;
+        }
+        probe
+            .local_addr()
+            .ok()
+            .map(|local| local.ip())
+            .filter(|ip| !ip.is_unspecified())
+    }
+
+    /// Remote IPv4 addresses named by the offer's host candidates and `c=`
+    /// lines, ranked most-usable first: LAN, then virtual (`172.16/12`), then
+    /// loopback. A loopback-only offer (an emulator) keeps its loopback bind;
+    /// a same-host client that signals over `127.0.0.1` but advertises its
+    /// LAN adapters resolves to the Wi-Fi/LAN interface instead of the
+    /// unusable loopback socket.
+    fn ranked_remote_targets(offer_sdp: &str) -> Vec<IpAddr> {
+        let mut with_rank: Vec<(u8, IpAddr)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut push = |ip: IpAddr| {
+            // The ICE agent gathers `NetworkType::Udp4` only, so an IPv6
+            // target can never be reached from the IPv4 socket.
+            if ip.is_ipv6() || ip.is_unspecified() || Self::is_link_local(ip) {
+                return;
+            }
+            let rank = if ip.is_loopback() {
+                2
+            } else if Self::is_virtual_subnet(ip) {
+                1
+            } else {
+                0
+            };
+            if seen.insert(ip) {
+                with_rank.push((rank, ip));
+            }
+        };
+        for line in offer_sdp.lines() {
+            let line = line.trim();
+            if let Some(cand_str) = line
+                .strip_prefix("a=candidate:")
+                .or_else(|| line.strip_prefix("candidate:"))
+            {
+                if let Some(cand) = IceCandidate::parse(cand_str) {
+                    if let Ok(ip) = cand.address.parse::<IpAddr>() {
+                        push(ip);
+                    }
+                }
+            } else if let Some(conn) = line.strip_prefix("c=IN IP4 ") {
+                if let Ok(ip) = conn.trim().parse::<IpAddr>() {
+                    push(ip);
+                }
+            }
+        }
+        with_rank.sort_by_key(|(rank, _)| *rank);
+        with_rank.into_iter().map(|(_, ip)| ip).collect()
+    }
+
+    /// Picks the single local IP the ICE agent should bind for this peer.
+    ///
+    /// Binding the wildcard `0.0.0.0` fans out (webrtc docs) to one socket per
+    /// local interface, including virtual adapters such as the Hyper-V
+    /// Default Switch (`172.19.16.1`) which has no route to the LAN.
+    /// A concrete address binds exactly one interface, so those pairs are
+    /// never formed. The railgun detail: the *signaling* TCP peer is not
+    /// evidence about the *data* plane. A Bedrock client on this host signals
+    /// over `127.0.0.1:19132` (loopback), so probing the signaling source
+    /// used to bind `127.0.0.1:19133` — a socket that cannot write to the
+    /// client's LAN candidates (`10051`) and leaves ICE with no working pair.
+    /// The source is therefore probed towards the offer's own remote
+    /// candidates (LAN first), then the Host header, then the signaling peer,
+    /// and never degrades to loopback for a non-loopback destination.
+    fn choose_bind_addr(peer_addr: SocketAddr, client_host: &str, offer_sdp: &str, udp_port: u16) -> String {
+        let acceptable = |local: IpAddr, target: IpAddr| -> bool {
+            // Never send LAN checks from loopback (or via a virtual-only
+            // route) when the destination sits on another interface.
+            if local.is_loopback() && !target.is_loopback() {
+                return false;
+            }
+            if Self::is_virtual_subnet(local)
+                && !Self::is_virtual_subnet(target)
+                && !target.is_loopback()
+            {
+                return false;
+            }
+            true
+        };
+        let probe_toward = |target: IpAddr| -> Option<String> {
+            Self::probe_local_ip(target, udp_port)
+                .filter(|local| acceptable(*local, target))
+                .map(|local| format!("{}:{}", local, udp_port))
+        };
+
+        for target in Self::ranked_remote_targets(offer_sdp) {
+            if let Some(bind) = probe_toward(target) {
+                return bind;
+            }
+        }
+        if let Ok(host_ip) = client_host.trim().parse::<IpAddr>() {
+            if let Some(bind) = probe_toward(host_ip) {
+                return bind;
+            }
+        }
+        if let Some(bind) = probe_toward(peer_addr.ip()) {
+            return bind;
+        }
+        format!("0.0.0.0:{}", udp_port)
+    }
+
+    /// Strips `a=identity:` lines and, when the ICE bind is a LAN address
+    /// while the offer advertises a non-loopback (LAN/virtual) address,
+    /// loopback remote candidates.
+    ///
+    /// A LAN socket (`192.168.100.51:19133`) writing to a loopback remote
+    /// (`127.0.0.1:65335`) is an impossible pair on Windows (`10049`) and
+    /// noise once the LAN->LAN pair already connects. Emulator peers that
+    /// only offer loopback keep their candidates because the bind stays
+    /// loopback in that case.
+    fn strip_impossible_candidates(offer_sdp: &str, bind_ip: &str) -> String {
+        let bind_is_loopback = bind_ip == "127.0.0.1" || bind_ip == "::1";
+        let has_non_loopback = Self::ranked_remote_targets(offer_sdp)
+            .iter()
+            .any(|ip| !ip.is_loopback());
+        let strip_loopback = !bind_is_loopback && has_non_loopback;
+        offer_sdp
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                if line.starts_with("a=identity:") {
+                    return false;
+                }
+                if strip_loopback {
+                    if let Some(cand_str) = line
+                        .strip_prefix("a=candidate:")
+                        .or_else(|| line.strip_prefix("candidate:"))
+                    {
+                        if let Some(cand) = IceCandidate::parse(cand_str) {
+                            if let Ok(ip) = cand.address.parse::<IpAddr>() {
+                                if ip.is_loopback() {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                true
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n"
+    }
+
     fn create_self_signed_tls_acceptor() -> TlsAcceptor {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let subject_alt_names = vec![
@@ -203,6 +380,8 @@ impl SignalingServer {
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
+        // `NetherNetInterface::start()`: debug waiting/booted pair.
+        debug!("Waiting for NetherNet to start...");
         for &addr in &self.addrs {
             let info = Arc::clone(&self.info);
             let udp_ports = self.udp_ports.clone();
@@ -215,8 +394,9 @@ impl SignalingServer {
                     error!("Signaling listener failed on {}: {}", addr, e);
                 }
             });
-            info!("NetherNet HTTP/HTTPS signaling listening on {}", addr);
+            debug!("NetherNet HTTP/HTTPS signaling listening on {}", addr);
         }
+        debug!("NetherNet booted successfully");
         Ok(())
     }
 
@@ -383,7 +563,7 @@ impl SignalingServer {
             body_bytes.extend_from_slice(&temp[..n]);
         }
 
-        info!("[:{}] Incoming signaling request: {} {} from {}", signaling_port, method, raw_path, peer_addr);
+        debug!("[:{}] Incoming signaling request: {} {} from {}", signaling_port, method, raw_path, peer_addr);
 
         // GET or HEAD /v1/join or / -> ServerInfo JSON
         if method == "GET" || method == "HEAD" {
@@ -436,14 +616,14 @@ impl SignalingServer {
                 json
             );
             stream.write_all(response.as_bytes()).await?;
-            info!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
+            debug!("[:{}] Responded with exact JSON ServerInfo (v{}, p{}) to {}", signaling_port, probe_info.version, probe_info.protocol, peer_addr);
         } else if method == "POST" && raw_path.contains("/v1/join/") {
             let network_id = raw_path.split("/v1/join/").nth(1).unwrap_or("").split('?').next().unwrap_or("");
-            info!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
+            debug!("[:{}] Received NetherNet WebRTC offer from {} for networkId {}", signaling_port, peer_addr, network_id);
 
             let offer_sdp = String::from_utf8_lossy(&body_bytes).to_string();
             if offer_sdp.trim().is_empty() {
-                warn!("[:{}] Empty offer SDP received from {}", signaling_port, peer_addr);
+                debug!("[:{}] Empty offer SDP received from {}", signaling_port, peer_addr);
                 let err_body = "5";
                 let response = format!(
                     "HTTP/1.1 500 Internal Server Error\r\n\
@@ -485,10 +665,9 @@ impl SignalingServer {
                         sdp_answer
                     );
                     stream.write_all(response.as_bytes()).await?;
-                    info!("[:{}] Responded with WebRTC SDP Answer (srflx advertised {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
+                    debug!("[:{}] Responded with WebRTC SDP Answer (srflx advertised {}:{}) to {}", signaling_port, client_host, primary_udp, peer_addr);
                 }
                 Err(e) => {
-                    eprintln!("[:{}] WebRTC negotiation failed for {}: {:?}", signaling_port, network_id, e);
                     error!("[:{}] WebRTC negotiation failed for {}: {}", signaling_port, network_id, e);
                     // Match Axolotl JoinHandler failure response: HTTP 500 with error code string
                     let err_body = "5"; // ErrorCode::ICE
@@ -528,24 +707,41 @@ impl SignalingServer {
             return Err("Offer SDP is empty".into());
         }
 
-        // Clean client offer before creating PC
-        let cleaned_offer = offer_sdp
-            .lines()
-            .filter(|line| !line.starts_with("a=identity:"))
-            .collect::<Vec<_>>()
-            .join("\r\n") + "\r\n";
+        // Concrete single-interface bind (see choose_bind_addr), not the
+        // wildcard, so ICE never pairs virtual adapters.
+        let bind_addr = Self::choose_bind_addr(peer_addr, client_host, offer_sdp, udp_port);
+        let bind_ip_for_filter = bind_addr.split(':').next().unwrap_or("").to_string();
+        let has_non_loopback_remote = Self::ranked_remote_targets(offer_sdp)
+            .iter()
+            .any(|ip| !ip.is_loopback());
 
+        // Clean client offer before creating PC: drop identity lines and,
+        // for a LAN bind with LAN remote candidates, loopback remote
+        // candidates so a LAN socket never writes to `127.0.0.1` (10049).
+        let cleaned_offer = Self::strip_impossible_candidates(offer_sdp, &bind_ip_for_filter);
         let offer = RTCSessionDescription::offer(cleaned_offer)?;
 
-        // 1. Clean up all previous PeerConnections on this UDP port to ensure the port is cleanly freed
-        {
+        // 1. Only retire the previous PeerConnection for this network id.
+        // Draining every entry (previous behaviour) closed *other* players'
+        // connections whenever a new join negotiated on the same port, so
+        // those players never got to spawn.
+        let had_prior = {
             let mut peers = active_peers.lock().await;
-            for (id, old_pc) in peers.drain() {
-                debug!("[:WebRTC] Closing prior PeerConnection for {} on port {}", id, udp_port);
-                let _ = old_pc.close().await;
+            match peers.remove(network_id) {
+                Some(old_pc) => {
+                    debug!(
+                        "[:WebRTC] Closing prior PeerConnection for {} on port {}",
+                        network_id, udp_port
+                    );
+                    let _ = old_pc.close().await;
+                    true
+                }
+                None => false,
             }
+        };
+        if had_prior {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let gather_notify = Arc::new(tokio::sync::Notify::new());
         let peer_conn_holder: Arc<Mutex<Option<Arc<dyn PeerConnection>>>> = Arc::new(Mutex::new(None));
@@ -574,7 +770,7 @@ impl SignalingServer {
                 .with_configuration(config)
                 .with_setting_engine(setting_engine)
                 .with_handler(Arc::clone(&handler))
-                .with_udp_addrs(vec![format!("0.0.0.0:{}", udp_port)])
+                .with_udp_addrs(vec![bind_addr.clone()])
                 .build()
                 .await
             {
@@ -599,9 +795,22 @@ impl SignalingServer {
         let negotiation = async {
             pc.set_remote_description(offer).await?;
 
-            // Check if client offer needs signalingPeer candidate (from Axolotl TransportNegotiator.php)
+            // Check if client offer needs signalingPeer candidate (from Axolotl TransportNegotiator.php).
+            // A same-host client signals over loopback (`127.0.0.1`) while its
+            // data plane is LAN: re-adding loopback as a remote candidate
+            // creates the impossible LAN->loopback pair (10049). Skip it in
+            // that case; the LAN candidate already covers the client.
             let peer_ip = peer_addr.ip().to_string();
-            if let Some(cand_str) = IceCandidateFormatter::signaling_peer(offer_sdp, &peer_ip) {
+            let bind_ip = bind_addr.split(':').next().unwrap_or("").to_string();
+            let bind_is_loopback = bind_ip == "127.0.0.1" || bind_ip == "::1";
+            let skip_signaling_peer =
+                peer_addr.ip().is_loopback() && !bind_is_loopback && has_non_loopback_remote;
+            let signaling_cand = if skip_signaling_peer {
+                None
+            } else {
+                IceCandidateFormatter::signaling_peer(offer_sdp, &peer_ip)
+            };
+            if let Some(cand_str) = signaling_cand {
                 let init = RTCIceCandidateInit {
                     candidate: cand_str,
                     sdp_mid: Some("0".to_string()),
@@ -630,9 +839,38 @@ impl SignalingServer {
             let local_desc = pc.local_description().await.ok_or_else(|| std::io::Error::other("No local description produced"))?;
 
             // Build the final SDP answer using AnswerBuilder (translating Axolotl AnswerBuilder.php & IceCandidateFormatter.php)
+            // Advertise the address the client actually connected to (Host
+            // header), plus this peer's concrete ICE bind address when it
+            // differs, so the client never pairs an impossible server IP.
+            // The hardcoded LAN address is only a fallback for non-loopback
+            // binds; loopback (emulator) peers must not be offered the LAN IP.
             let mut advertised_addrs = vec![client_host.to_string()];
-            if client_host != "192.168.100.51" {
+            let bind_ip = bind_addr.split(':').next().unwrap_or("").to_string();
+            let bind_is_loopback = bind_ip == "127.0.0.1" || bind_ip == "::1";
+            if !bind_ip.is_empty() && bind_ip != "0.0.0.0" && bind_ip != *client_host {
+                advertised_addrs.push(bind_ip.clone());
+            }
+            if !bind_is_loopback && !advertised_addrs.iter().any(|a| a == "192.168.100.51") {
                 advertised_addrs.push("192.168.100.51".to_string());
+            }
+            // A LAN bind cannot be reached at a loopback or virtual
+            // (`172.19.16.1`) address: never offer the client an address its
+            // checks cannot complete on. Loopback stays advertised only when
+            // it is all there is (loopback-only emulator peers).
+            let has_lan = advertised_addrs.iter().any(|a| {
+                a.parse::<IpAddr>()
+                    .map(|ip| !ip.is_loopback() && !Self::is_virtual_subnet(ip) && !Self::is_link_local(ip))
+                    .unwrap_or(false)
+            });
+            if has_lan {
+                advertised_addrs.retain(|a| match a.parse::<IpAddr>() {
+                    Ok(ip) => !ip.is_loopback() && !Self::is_virtual_subnet(ip) && !Self::is_link_local(ip),
+                    Err(_) => true,
+                });
+            }
+            {
+                let mut seen = std::collections::HashSet::new();
+                advertised_addrs.retain(|a| seen.insert(a.clone()));
             }
             let builder = AnswerBuilder::new(advertised_addrs);
             let final_sdp = builder
@@ -682,5 +920,72 @@ impl SignalingServer {
             fingerprint = fingerprint,
             udp_port = udp_port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offer_with_candidates(candidates: &str) -> String {
+        format!(
+            "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n{candidates}"
+        )
+    }
+
+    #[test]
+    fn lan_offer_signaled_over_loopback_binds_lan_not_loopback() {
+        // Bedrock on this host signals over 127.0.0.1 but advertises its LAN
+        // adapters in the offer. The bind must follow the data plane.
+        let offer = offer_with_candidates(
+            "a=candidate:1 1 udp 2122260199 172.19.16.1 62046 typ host\r\n\
+             a=candidate:2 1 udp 2122260199 192.168.100.51 62047 typ host\r\n",
+        );
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let bind = SignalingServer::choose_bind_addr(peer, "192.168.100.51", &offer, 19133);
+        assert!(
+            !bind.starts_with("127.0.0.1:") && !bind.starts_with("0.0.0.0:") && !bind.starts_with("172.19.16.1:"),
+            "expected a LAN bind, got {bind}"
+        );
+    }
+
+    #[test]
+    fn loopback_only_offer_keeps_loopback_bind() {
+        // Emulator parity: a loopback-only offer must still bind loopback.
+        let offer = offer_with_candidates("a=candidate:1 1 udp 2122260199 127.0.0.1 39240 typ host\r\n");
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let bind = SignalingServer::choose_bind_addr(peer, "127.0.0.1", &offer, 19133);
+        assert_eq!(bind, "127.0.0.1:19133");
+    }
+
+    #[test]
+    fn lan_bind_strips_loopback_remote_candidates() {
+        // Regression for `10049` (`192.168.100.51 -> 127.0.0.1`): with a LAN
+        // bind and a mixed LAN+loopback offer, loopback remote must be
+        // stripped so ICE never attempts the impossible pair.
+        let offer = offer_with_candidates(
+            "a=candidate:1 1 udp 2122260199 192.168.100.51 65334 typ host\r\n\
+             a=candidate:2 1 udp 2122260199 127.0.0.1 65335 typ host\r\n",
+        );
+        let filtered = SignalingServer::strip_impossible_candidates(&offer, "192.168.100.51");
+        assert!(
+            filtered.contains("192.168.100.51 65334"),
+            "LAN candidate must survive: {filtered}"
+        );
+        assert!(
+            !filtered.contains("127.0.0.1 65335"),
+            "loopback candidate must be stripped for LAN bind: {filtered}"
+        );
+    }
+
+    #[test]
+    fn loopback_bind_keeps_loopback_remote_candidates() {
+        // Emulator parity: loopback-only offers keep their candidates.
+        let offer = offer_with_candidates("a=candidate:1 1 udp 2122260199 127.0.0.1 39240 typ host\r\n");
+        let filtered = SignalingServer::strip_impossible_candidates(&offer, "127.0.0.1");
+        assert!(
+            filtered.contains("127.0.0.1 39240"),
+            "loopback candidate must survive for loopback bind: {filtered}"
+        );
     }
 }

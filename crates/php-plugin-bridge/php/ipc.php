@@ -18,6 +18,14 @@ namespace pocketmine\runtime {
         private static mixed $server = null;
         private static ?PluginManager $pluginManager = null;
         private static int $tick = 0;
+        /**
+         * STDOUT (pipe IPC hacia Rust) está roto: Rust cerró el worker
+         * (shutdown / restart / kill por timeout). A partir de ahí ningún
+         * fwrite a STDOUT debe intentarse: en Windows produce
+         * `fwrite(): Write of N bytes failed with errno=22 Invalid argument`
+         * en cada respuesta/host_call y los notices se acumulan al apagar.
+         */
+        private static bool $ipcBroken = false;
 
         /** @var array<string, PluginBase> lowercase name => plugin */
         private static array $plugins = [];
@@ -28,12 +36,14 @@ namespace pocketmine\runtime {
             self::initialize();
             fwrite(STDERR, '[PHP/RUNTIME] Runtime ready' . PHP_EOL);
 
-            while (!self::$shutdown) {
+            while (!self::$shutdown && !self::$ipcBroken) {
                 $line = Bridge::$pendingResponse;
                 if ($line !== null) {
                     Bridge::$pendingResponse = null;
+                } elseif (defined('STDIN') && is_resource(STDIN)) {
+                    $line = @fgets(STDIN);
                 } else {
-                    $line = fgets(STDIN);
+                    break;
                 }
 
                 if ($line === false) {
@@ -233,7 +243,17 @@ namespace pocketmine\runtime {
                     $real = realpath($path) ?: $path;
                     $manifest = self::readPharEntry($real, 'plugin.yml');
                     if ($manifest === null) {
-                        self::log('Skipping phar without plugin.yml: ' . $path);
+                        if (!self::pharAvailable()) {
+                            // Not fatal: the server keeps running without
+                            // phar support; the operator just cannot use .phar
+                            // plugins until extension=phar is enabled.
+                            self::log(
+                                'Skipping ' . $path . ': the PHP phar extension appears to be disabled; '
+                                . 'enable extension=phar and set phar.readonly=Off in php.ini to load .phar plugins'
+                            );
+                        } else {
+                            self::log('Skipping phar without plugin.yml: ' . $path);
+                        }
                         continue;
                     }
                     $plugins[] = [
@@ -276,15 +296,28 @@ namespace pocketmine\runtime {
                 @mkdir($dataFolder, 0777, true);
             }
 
-            PluginAutoloader::registerPlugin($name, $root, $main);
+            PluginAutoloader::registerPlugin($name, $root, $main, self::requestedSrcPrefix($request));
 
             $relativeMain = str_replace('\\', '/', ltrim($main, '\\')) . '.php';
             $mainFile = $file !== ''
                 ? str_replace('\\', '/', $file)
                 : $root . '/src/' . $relativeMain;
-            $resolvedMain = PluginAutoloader::resolve($mainFile)
-                ?? PluginAutoloader::resolve($root . '/src/' . $relativeMain)
-                ?? PluginAutoloader::resolve($root . '/' . $relativeMain);
+            $candidates = [$mainFile, $root . '/src/' . $relativeMain];
+            // `src-namespace-prefix` layout (`BetterChat\Main` -> `src/Main.php`).
+            $stripped = ltrim($main, '\\');
+            $prefixNs = rtrim(str_replace('/', '\\', self::requestedSrcPrefix($request)), '\\');
+            if ($prefixNs !== '' && stripos($stripped, $prefixNs . '\\') === 0) {
+                $stripped = substr($stripped, strlen($prefixNs) + 1);
+            }
+            $candidates[] = $root . '/src/' . str_replace('\\', '/', $stripped) . '.php';
+            $candidates[] = $root . '/' . $relativeMain;
+            $resolvedMain = null;
+            foreach ($candidates as $candidate) {
+                $resolvedMain = PluginAutoloader::resolve($candidate);
+                if ($resolvedMain !== null) {
+                    break;
+                }
+            }
 
             if ($resolvedMain !== null) {
                 try {
@@ -406,11 +439,26 @@ namespace pocketmine\runtime {
             ];
         }
 
+        /** `src-namespace-prefix` carried by the Rust-side description JSON. */
+        private static function requestedSrcPrefix(array $request): string
+        {
+            $raw = $request['description'] ?? [];
+            if (!is_array($raw)) {
+                return '';
+            }
+            $prefix = (string)($raw['src-namespace-prefix'] ?? $raw['src_namespace_prefix'] ?? '');
+            return trim(str_replace('/', '\\', $prefix), '\\');
+        }
+
         private static function actionDisablePlugin(array $request): array
         {
             $name = (string)($request['name'] ?? '');
             $plugin = self::getPluginManager()->getPlugin($name);
             if ($plugin === null) {
+                // Still drop any stale autoloader entry so a later load of
+                // the same name starts clean (load/unload cycles).
+                PluginAutoloader::unregisterPlugin($name);
+                unset(self::$plugins[strtolower($name)]);
                 return ['status' => 'ok', 'message' => 'Plugin not loaded: ' . $name];
             }
 
@@ -422,8 +470,15 @@ namespace pocketmine\runtime {
 
             $commandMap = self::$server instanceof \pocketmine\Server ? self::$server->getCommandMap() : null;
             foreach ($plugin->getCommands() as $command) {
-                $commandMap?->unregister($command->getName());
+                $commandMap?->unregister($command);
             }
+
+            // Full unload: free the isolated autoloader entry (name + root)
+            // and the runtime registry, so the plugin can be loaded again
+            // and sibling phar archives are unaffected.
+            PluginAutoloader::unregisterPlugin($plugin->getName());
+            PluginAutoloader::unregisterPlugin($name);
+            unset(self::$plugins[strtolower($plugin->getName())]);
 
             return [
                 'status' => 'ok',
@@ -687,15 +742,54 @@ namespace pocketmine\runtime {
             return str_replace('\\', '/', $path);
         }
 
+        /** Whether PHP here can read Phar archives (extension + wrapper). */
+        private static function pharAvailable(): bool
+        {
+            return class_exists(\Phar::class) || in_array('phar', stream_get_wrappers(), true);
+        }
+
+        /**
+         * Reads one entry from a `.phar`, preferring the `Phar` class and
+         * falling back to the `phar://` stream wrapper. Returns null when
+         * the entry is absent or the archive cannot be opened (including a
+         * disabled Phar extension); callers log a specific message.
+         */
         private static function readPharEntry(string $pharPath, string $entry): ?string
         {
-            $uri = 'phar://' . self::normalizeFsPath($pharPath) . '/' . ltrim($entry, '/');
+            if (!self::pharAvailable()) {
+                return null;
+            }
+            $file = self::normalizeFsPath($pharPath);
+            $entry = ltrim(str_replace('\\', '/', $entry), '/');
+            if (class_exists(\Phar::class)) {
+                try {
+                    $phar = new \Phar($file);
+                    if (isset($phar[$entry])) {
+                        $contents = $phar[$entry]->getContent();
+                        if (is_string($contents) && $contents !== '') {
+                            return $contents;
+                        }
+                    }
+                    return null;
+                } catch (\Throwable) {
+                    // Not a valid Phar: fall through to the phar:// wrapper.
+                }
+            }
+            $uri = 'phar://' . $file . '/' . $entry;
             $contents = @file_get_contents($uri);
-            return $contents === false ? null : $contents;
+            return ($contents === false || $contents === '') ? null : $contents;
         }
 
         private static function write(array $payload): void
         {
+            if (self::$ipcBroken) {
+                return;
+            }
+            if (!defined('STDOUT') || !is_resource(STDOUT)) {
+                self::$ipcBroken = true;
+                Bridge::markBroken();
+                return;
+            }
             $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
             if ($json === false) {
                 $json = json_encode([
@@ -704,13 +798,28 @@ namespace pocketmine\runtime {
                     'actions' => [],
                 ]);
             }
-            fwrite(STDOUT, $json . PHP_EOL);
-            fflush(STDOUT);
+            $line = $json . PHP_EOL;
+            // @: si Rust ya cerró el pipe (shutdown/restart) fwrite avisa
+            // con errno=22 y devuelve false/short; no se reintenta ni se
+            // repite el aviso: el bucle main() sale limpio en la siguiente
+            // iteración y el proceso PHP termina sin Notices acumulados.
+            $written = @fwrite(STDOUT, $line);
+            if ($written === false || $written !== strlen($line)) {
+                self::$ipcBroken = true;
+                Bridge::markBroken();
+                return;
+            }
+            if (!@fflush(STDOUT)) {
+                self::$ipcBroken = true;
+                Bridge::markBroken();
+            }
         }
 
         private static function log(string $message): void
         {
-            fwrite(STDERR, '[PHP/RUNTIME] ' . $message . PHP_EOL);
+            if (defined('STDERR') && is_resource(STDERR)) {
+                @fwrite(STDERR, '[PHP/RUNTIME] ' . $message . PHP_EOL);
+            }
         }
     }
 
@@ -723,15 +832,32 @@ namespace pocketmine\runtime {
         public static int $nextId = 1;
         public static ?string $pendingResponse = null;
         private static bool $active = false;
+        private static bool $broken = false;
 
         public static function isActive(): bool
         {
-            return self::$active && defined('STDIN') && defined('STDOUT');
+            return self::$active && !self::$broken && defined('STDIN') && is_resource(STDIN) && defined('STDOUT') && is_resource(STDOUT);
         }
 
         public static function setActive(bool $active): void
         {
             self::$active = $active;
+        }
+
+        /**
+         * Memo de `player.get` por tick: lo marca `Runtime::write`/hostCall si
+         * STDOUT se rompe a mitad de una host call (pipe cerrado por Rust).
+         * A partir de ahí hostCall devuelve null sin escribir ni bloquear.
+         */
+        public static function markBroken(): void
+        {
+            self::$broken = true;
+            self::$active = false;
+        }
+
+        public static function isBroken(): bool
+        {
+            return self::$broken;
         }
 
         /**
@@ -755,12 +881,20 @@ namespace pocketmine\runtime {
                 return null;
             }
 
-            fwrite(STDOUT, $request . PHP_EOL);
-            fflush(STDOUT);
+            $requestLine = $request . PHP_EOL;
+            $written = @fwrite(STDOUT, $requestLine);
+            if ($written === false || $written !== strlen($requestLine) || !@fflush(STDOUT)) {
+                // Pipe cerrado a mitad de host call (p. ej. shutdown durante
+                // disable_plugin): no bloquear 10 s esperando un host_result
+                // que nunca llegará; las gestiones superiores tratan el null
+                // como "host no disponible" y el shutdown sigue limpio.
+                self::markBroken();
+                return null;
+            }
 
             $deadline = microtime(true) + 10.0;
             while (microtime(true) < $deadline) {
-                $line = fgets(STDIN);
+                $line = @fgets(STDIN);
                 if ($line === false) {
                     self::$pendingResponse = null;
                     return null;
@@ -777,7 +911,7 @@ namespace pocketmine\runtime {
                     if (($decoded['ok'] ?? false) === true) {
                         return $decoded['result'] ?? null;
                     }
-                    fwrite(STDERR, '[PHP/BRIDGE] Host call ' . $method . ' failed: '
+                    @fwrite(STDERR, '[PHP/BRIDGE] Host call ' . $method . ' failed: '
                         . (string)($decoded['error'] ?? 'unknown error') . PHP_EOL);
                     return null;
                 }

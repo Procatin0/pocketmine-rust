@@ -14,6 +14,22 @@ pub const INPUT_FLAG_PERFORM_ITEM_STACK_REQUEST: u32 = 36;
 pub const INPUT_FLAG_VEHICLE: u32 = 45;
 pub const INPUT_FLAG_VEHICLE_OLD: u32 = 40;
 
+/// Movement flags used by PocketMine's InGamePacketHandler to drive the
+/// sneak/sprint/swim/glide/fly/jump toggles (see PlayerAuthInputFlags.php).
+pub const INPUT_FLAG_SNEAKING: u32 = 8;
+pub const INPUT_FLAG_START_SPRINTING: u32 = 25;
+pub const INPUT_FLAG_STOP_SPRINTING: u32 = 26;
+pub const INPUT_FLAG_START_SNEAKING: u32 = 27;
+pub const INPUT_FLAG_STOP_SNEAKING: u32 = 28;
+pub const INPUT_FLAG_START_SWIMMING: u32 = 29;
+pub const INPUT_FLAG_STOP_SWIMMING: u32 = 30;
+pub const INPUT_FLAG_START_JUMPING: u32 = 31;
+pub const INPUT_FLAG_START_GLIDING: u32 = 32;
+pub const INPUT_FLAG_STOP_GLIDING: u32 = 33;
+pub const INPUT_FLAG_START_FLYING: u32 = 42;
+pub const INPUT_FLAG_STOP_FLYING: u32 = 43;
+pub const INPUT_FLAG_MISSED_SWING: u32 = 39;
+
 /// Block action types (see `PlayerAction` in BedrockProtocol).
 pub const BLOCK_ACTION_START_BREAK: i32 = 0;
 pub const BLOCK_ACTION_ABORT_BREAK: i32 = 1;
@@ -71,6 +87,17 @@ pub fn parse_block_actions(input_data: &[u8]) -> Vec<PlayerBlockAction> {
         return modern;
     }
     parse_block_actions_with(input_data, false, vehicle).unwrap_or_default()
+}
+
+/// Decodes the PlayerAuthInput flag bitset as a 128-bit mask, or 0 when the
+/// tail is empty/malformed. Bit n corresponds to PlayerAuthInputFlags.
+pub fn parse_input_flags(input_data: &[u8]) -> u128 {
+    split_auth_input_flags(input_data).map(|(flags, _)| flags).unwrap_or(0)
+}
+
+/// Whether flag bit is set in a mask returned by parse_input_flags.
+pub fn has_input_flag(flags: u128, bit: u32) -> bool {
+    (flags >> bit) & 1 == 1
 }
 
 /// Reads the varlen 7-bits-per-byte flag bitset, returning the assembled

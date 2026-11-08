@@ -1,0 +1,15 @@
+name: JavaBridge
+version: "0.1.0"
+main: javabridge\Main
+api: ["5.0.0"]
+author: PocketMine-Rust Team
+description: "Puente TCP para que clientes de Minecraft Java Edition (1.12.2 y 1.21.4 - 26.1) entren al mundo Bedrock."
+website: "https://github.com/pmmp/PocketMine-MP"
+
+# /javabridge se registra desde código con CommandMap, por eso no aparece aquí.
+# Su permiso se declara abajo.
+
+permissions:
+  javabridge.command:
+    description: "Permite consultar y controlar el puente Java -> Bedrock."
+    default: op
