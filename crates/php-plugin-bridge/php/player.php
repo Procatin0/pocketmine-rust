@@ -528,13 +528,22 @@ namespace pocketmine\player {
                     $this->pitch = (float)$position->pitch;
                 }
             }
-            $this->addAction('teleport', [
+            $action = [
                 'target_player' => $this->name,
                 'x' => $this->x,
                 'y' => $this->y,
                 'z' => $this->z,
                 'world' => $this->worldName,
-            ]);
+            ];
+            // Yaw/pitch Bedrock-canónico (los que la copia API guarda):
+            // sin ellos el teleport de un plugin pierde la rotación en
+            // Rust y el Java ve el giro viejo tras el salto (ver
+            // `syncTeleport` + `tp_sync_test.php`).
+            if ($position instanceof Vector3 && (property_exists($position, 'yaw') || property_exists($position, 'pitch'))) {
+                $action['yaw'] = $this->yaw;
+                $action['pitch'] = $this->pitch;
+            }
+            $this->addAction('teleport', $action);
             return true;
         }
 

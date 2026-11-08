@@ -325,6 +325,8 @@ permissions:
                     y: 64.0,
                     z: -2.0,
                     world: Some("world".to_string()),
+                    yaw: None,
+                    pitch: None,
                 },
             ),
             (
@@ -416,10 +418,25 @@ permissions:
             y: 2.0,
             z: 3.0,
             world: None,
+            yaw: None,
+            pitch: None,
         };
         assert_eq!(
             serde_json::to_value(&teleport).unwrap(),
             json!({"action":"teleport","data":{"target_player":"Steve","x":1.0,"y":2.0,"z":3.0}})
+        );
+        let rotated = PluginAction::Teleport {
+            target_player: "Steve".to_string(),
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            world: None,
+            yaw: Some(90.0),
+            pitch: Some(-15.0),
+        };
+        assert_eq!(
+            serde_json::to_value(&rotated).unwrap(),
+            json!({"action":"teleport","data":{"target_player":"Steve","x":1.0,"y":2.0,"z":3.0,"yaw":90.0,"pitch":-15.0}})
         );
 
         let command = PluginAction::DispatchCommand {
