@@ -2693,6 +2693,16 @@ impl SessionManager {
         }
     }
 
+    /// `allow-cheats` read by the Java chat router to build command sources.
+    pub fn allow_cheats(&self) -> bool {
+        *self.allow_cheats.read()
+    }
+
+    /// `max-players` reported by `/list` for sources built outside a session.
+    pub fn max_players(&self) -> i32 {
+        self.max_players.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn plugin_manager(&self) -> Option<Arc<PluginManager>> {
         self.plugins.read().clone()
     }
@@ -4345,6 +4355,12 @@ impl SessionManager {
         let output = crate::command::handle_command(line, &source, &players)?;
         self.apply_command_actions(&output.actions);
         Some(output.feedback)
+    }
+
+    /// Public alias of [`Self::online_players_snapshot`] for the Java
+    /// chat router (`crates/server-core/src/chat.rs`).
+    pub fn online_players_snapshot_public(&self) -> Vec<OnlinePlayer> {
+        self.online_players_snapshot()
     }
 
     /// Authoritative list of players in the world: live Bedrock sessions

@@ -685,6 +685,7 @@ namespace pocketmine\event\player {
     {
         private string $message;
         private string $format;
+        private ?\pocketmine\player\chat\ChatFormatter $formatter = null;
 
         /** @var Player[] */
         private array $recipients;
@@ -714,14 +715,28 @@ namespace pocketmine\event\player {
             $this->message = $message;
         }
 
+        /** Rendered line: formatter takes precedence over the raw format string. */
         public function getFormat(): string
         {
+            if ($this->formatter !== null) {
+                return $this->formatter->format($this->player->getName(), $this->message);
+            }
             return $this->format;
         }
 
         public function setFormat(string $format): void
         {
             $this->format = $format;
+        }
+
+        public function getFormatter(): ?\pocketmine\player\chat\ChatFormatter
+        {
+            return $this->formatter;
+        }
+
+        public function setFormatter(?\pocketmine\player\chat\ChatFormatter $formatter): void
+        {
+            $this->formatter = $formatter;
         }
 
         /** @return Player[] */
@@ -768,7 +783,7 @@ namespace pocketmine\event\player {
             return [
                 'player' => EventData::playerToArray($this->player),
                 'message' => $this->message,
-                'format' => $this->format,
+                'format' => $this->getFormat(),
                 'recipients' => $recipients,
                 'cancelled' => $this->isCancelled(),
             ];

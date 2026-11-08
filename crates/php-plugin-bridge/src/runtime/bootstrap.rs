@@ -22,6 +22,7 @@ pub const PHP_RUNTIME_FILES: &[(&str, &str)] = &[
     ("item.php", include_str!("../../php/item.php")),
     ("world.php", include_str!("../../php/world.php")),
     ("player.php", include_str!("../../php/player.php")),
+    ("chat.php", include_str!("../../php/chat.php")),
     ("core.php", include_str!("../../php/core.php")),
     ("event.php", include_str!("../../php/event.php")),
     ("plugin.php", include_str!("../../php/plugin.php")),

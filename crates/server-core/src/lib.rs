@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod auth_keys;
+pub mod chat;
 pub mod command;
 pub mod config;
 pub mod crash;

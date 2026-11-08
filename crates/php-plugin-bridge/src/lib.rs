@@ -1,5 +1,6 @@
 //! PHP Plugin Bridge - FFI & Process Architecture between Rust Server Core and PocketMine Plugins
 
+pub mod chat;
 pub mod command;
 pub mod context;
 pub mod description;
@@ -11,7 +12,8 @@ pub mod manager;
 pub mod plugin;
 pub mod runtime;
 
-pub use command::{Command, CommandMap, CommandSender};
+pub use chat::{default_format, ChatFormatter, PlaceholderFormatter};
+pub use command::{Command, CommandMap, CommandSender, merge_selector_tokens};
 pub use context::{PlayerContext, PluginAction};
 pub use description::{CommandDescription, PermissionDescription, PluginDescription};
 pub use error::PluginError;
