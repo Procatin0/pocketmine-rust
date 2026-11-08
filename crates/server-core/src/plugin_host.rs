@@ -16,9 +16,19 @@ use crate::world_state::WorldState;
 #[derive(Default)]
 pub struct PlayerRegistry {
     players: RwLock<HashMap<String, PlayerContext>>,
+    /// Pending chat lines per player, keyed by lowercase name.
+    ///
+    /// Bedrock players receive their lines as packets from the session
+    /// manager; virtual players (Java bridge) have no session, so their
+    /// lines wait here until `player.take_messages` drains them.
+    inboxes: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl PlayerRegistry {
+    /// Maximum queued chat lines per player; oldest lines are dropped past
+    /// this so a player that never drains cannot grow an inbox without
+    /// bound.
+    const INBOX_CAP: usize = 128;
     pub fn new() -> Self {
         Self::default()
     }
@@ -30,7 +40,35 @@ impl PlayerRegistry {
     }
 
     pub fn remove(&self, name: &str) {
-        self.players.write().remove(&name.to_lowercase());
+        let key = name.to_lowercase();
+        self.players.write().remove(&key);
+        self.inboxes.write().remove(&key);
+    }
+
+    /// Removes the entry only if it is a virtual (Java bridge) player.
+    /// Used by `player.unregister` so a stale Java disconnect cannot delete
+    /// a live Bedrock entry that took the name meanwhile.
+    pub fn remove_if_virtual(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        let is_virtual = self.players.read().get(&key).map(|p| p.is_virtual).unwrap_or(false);
+        if is_virtual {
+            self.players.write().remove(&key);
+            self.inboxes.write().remove(&key);
+        }
+        is_virtual
+    }
+
+    /// Removes the entry only if it is owned by a Bedrock session.
+    /// Used by `finalize_session` so a Bedrock disconnect cannot delete
+    /// a live virtual player that took the name.
+    pub fn remove_if_bedrock(&self, name: &str) -> bool {
+        let key = name.to_lowercase();
+        let is_bedrock = self.players.read().get(&key).map(|p| !p.is_virtual).unwrap_or(false);
+        if is_bedrock {
+            self.players.write().remove(&key);
+            self.inboxes.write().remove(&key);
+        }
+        is_bedrock
     }
 
     pub fn get(&self, name: &str) -> Option<PlayerContext> {
@@ -44,6 +82,25 @@ impl PlayerRegistry {
     pub fn all(&self) -> Vec<PlayerContext> {
         self.players.read().values().cloned().collect()
     }
+
+    /// Queues a chat line for a player (see the `inboxes` field).
+    pub fn push_message(&self, name: &str, message: impl Into<String>) {
+        let mut inboxes = self.inboxes.write();
+        let queue = inboxes.entry(name.to_lowercase()).or_default();
+        queue.push(message.into());
+        if queue.len() > Self::INBOX_CAP {
+            queue.remove(0);
+        }
+    }
+
+    /// Drains and returns every queued chat line for the player, oldest
+    /// first. Returns an empty list when nothing is pending.
+    pub fn take_messages(&self, name: &str) -> Vec<String> {
+        self.inboxes
+            .write()
+            .remove(&name.to_lowercase())
+            .unwrap_or_default()
+    }
 }
 
 /// Host bridge backed by the live world and player registry.
@@ -53,6 +110,56 @@ pub struct ServerPluginHost {
     ops: Arc<RwLock<std::collections::HashSet<String>>>,
     motd: String,
     max_players: i32,
+    /// Invoked after a virtual player registers, moves or unregisters so the
+    /// session manager can sync Bedrock viewers (`AddPlayer` /
+    /// `MoveActorAbsolute` / `RemoveActor`). Installed by `main.rs`;
+    /// `None` in unit tests (polling still covers it).
+    virtual_notify: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// `players/<name>.json` root; same directory Bedrock sessions use
+    /// (`SessionManager::enable_persistence`). Defaults to `"."` (the server
+    /// CWD) so the production wiring matches `main.rs`; tests override it
+    /// with a temp dir to avoid polluting the repo.
+    data_dir: RwLock<std::path::PathBuf>,
+}
+
+/// `players/<name>.json` shared with Bedrock sessions.
+fn player_data_path_in(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    dir.join("players").join(format!("{}.json", name.to_lowercase()))
+}
+
+#[allow(dead_code)]
+fn player_data_path(name: &str) -> std::path::PathBuf {
+    player_data_path_in(std::path::Path::new("."), name)
+}
+
+fn read_player_data_in(dir: &std::path::Path, name: &str) -> Option<Value> {
+    let bytes = std::fs::read(player_data_path_in(dir, name)).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    if value.is_object() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn read_player_data(name: &str) -> Option<Value> {
+    read_player_data_in(std::path::Path::new("."), name)
+}
+
+fn write_player_data_in(dir: &std::path::Path, name: &str, value: &Value) -> std::io::Result<()> {
+    let path = player_data_path_in(dir, name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    std::fs::write(path, bytes)
+}
+
+#[allow(dead_code)]
+fn write_player_data(name: &str, value: &Value) -> std::io::Result<()> {
+    write_player_data_in(std::path::Path::new("."), name, value)
 }
 
 impl ServerPluginHost {
@@ -69,7 +176,178 @@ impl ServerPluginHost {
             ops,
             motd: motd.into(),
             max_players,
+            virtual_notify: RwLock::new(None),
+            data_dir: RwLock::new(std::path::PathBuf::from(".")),
         }
+    }
+
+    /// Points `players/<name>.json` at the same root Bedrock uses.
+    pub fn set_data_dir(&self, dir: std::path::PathBuf) {
+        *self.data_dir.write() = dir;
+    }
+
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.data_dir.read().clone()
+    }
+
+    fn read_player_data(&self, name: &str) -> Option<Value> {
+        read_player_data_in(&self.data_dir(), name)
+    }
+
+    fn write_player_data(&self, name: &str, value: &Value) -> std::io::Result<()> {
+        write_player_data_in(&self.data_dir(), name, value)
+    }
+
+    /// Wires the virtual-visibility sync (see `virtual_notify`).
+    pub fn set_virtual_notify(&self, notify: impl Fn() + Send + Sync + 'static) {
+        *self.virtual_notify.write() = Some(Arc::new(notify));
+    }
+
+    fn notify_virtual(&self) {
+        if let Some(notify) = self.virtual_notify.read().as_ref() {
+            notify();
+        }
+    }
+
+    /// Shared `player.save` / quit save: merges supplied fields over the
+    /// existing v2 file (defaults from the live registry snapshot), stamps
+    /// `last_played=now`, preserves `first_played`, and writes directly to
+    /// `players/<name>.json` (no staging). Returns the host result object.
+    fn save_player_v2(&self, name: &str, params: &Value) -> Result<Value, String> {
+        let now = crate::session::PlayerSession::now_played_secs();
+        let existing = self.read_player_data(name);
+        let existing_num = |key: &str| {
+            existing
+                .as_ref()
+                .and_then(|entry| entry.get(key))
+                .and_then(Value::as_f64)
+        };
+        let param_num = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| params.get(*key).and_then(Value::as_f64))
+                .next()
+        };
+        let param_i64 = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| params.get(*key).and_then(Value::as_i64))
+                .next()
+        };
+        let param_bool = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| params.get(*key).and_then(Value::as_bool))
+                .next()
+        };
+        let param_str = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| params.get(*key).and_then(Value::as_str))
+                .next()
+        };
+        let merged_num = |keys: &[&str], fallback: f64| {
+            param_num(keys)
+                .or_else(|| keys.iter().filter_map(|key| existing_num(key)).next())
+                .unwrap_or(fallback)
+        };
+        let merged_i64 = |keys: &[&str], fallback: i64| {
+            param_i64(keys)
+                .or_else(|| {
+                    keys.iter()
+                        .filter_map(|key| {
+                            existing
+                                .as_ref()
+                                .and_then(|entry| entry.get(*key))
+                                .and_then(Value::as_i64)
+                        })
+                        .next()
+                })
+                .unwrap_or(fallback)
+        };
+        let merged_bool = |keys: &[&str], fallback: bool| {
+            param_bool(keys)
+                .or_else(|| {
+                    keys.iter()
+                        .filter_map(|key| {
+                            existing
+                                .as_ref()
+                                .and_then(|entry| entry.get(*key))
+                                .and_then(Value::as_bool)
+                        })
+                        .next()
+                })
+                .unwrap_or(fallback)
+        };
+        let merged_str = |keys: &[&str], fallback: String| -> String {
+            param_str(keys)
+                .map(|value| value.to_string())
+                .or_else(|| {
+                    keys.iter()
+                        .filter_map(|key| {
+                            existing
+                                .as_ref()
+                                .and_then(|entry| entry.get(*key))
+                                .and_then(Value::as_str)
+                                .map(|value| value.to_string())
+                        })
+                        .next()
+                })
+                .unwrap_or(fallback)
+        };
+        // Live registry fills gaps the caller omitted.
+        let live = self.players.get(name);
+        let live_f64 = |current: Option<f64>, slot: Option<f64>| current.or(slot);
+        let first_played = param_num(&["first_played", "firstPlayed"])
+            .filter(|value| *value > 0.0)
+            .or_else(|| existing_num("first_played").filter(|value| *value > 0.0))
+            .or_else(|| live.as_ref().map(|player| player.first_played).filter(|value| *value > 0.0))
+            .unwrap_or(now);
+        let spawn_point = params
+            .get("spawn_point")
+            .or_else(|| params.get("spawnPoint"))
+            .and_then(Value::as_array)
+            .map(|point| point.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+            .filter(|point| point.len() == 3)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|entry| entry.get("spawn_point").or_else(|| entry.get("spawnPoint")))
+                    .and_then(Value::as_array)
+                    .map(|point| point.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+                    .filter(|point| point.len() == 3)
+            })
+            .or_else(|| live.as_ref().and_then(|player| player.spawn_point.map(|point| vec![point[0], point[1], point[2]])));
+        let value = json!({
+            "name": name,
+            "xuid": merged_str(&["xuid"], live.as_ref().map(|player| player.xuid.clone()).unwrap_or_default()),
+            "display_name": merged_str(&["display_name", "displayName"], live.as_ref().map(|player| player.display_name.clone()).unwrap_or_else(|| name.to_string())),
+            "x": live_f64(param_num(&["x"]), live.as_ref().map(|player| player.x)).unwrap_or(0.0),
+            "y": live_f64(param_num(&["y"]), live.as_ref().map(|player| player.y)).unwrap_or(64.0),
+            "z": live_f64(param_num(&["z"]), live.as_ref().map(|player| player.z)).unwrap_or(0.0),
+            "yaw": live_f64(param_num(&["yaw"]), live.as_ref().map(|player| player.yaw)).unwrap_or(0.0),
+            "pitch": live_f64(param_num(&["pitch"]), live.as_ref().map(|player| player.pitch)).unwrap_or(0.0),
+            "gamemode": merged_i64(&["gamemode"], live.as_ref().map(|player| player.gamemode as i64).unwrap_or(0)),
+            "health": merged_num(&["health"], live.as_ref().map(|player| player.health as f64).unwrap_or(20.0)),
+            "max_health": merged_num(&["max_health", "maxHealth"], live.as_ref().map(|player| player.max_health as f64).unwrap_or(20.0)),
+            "food": merged_num(&["food"], live.as_ref().map(|player| player.food as f64).unwrap_or(20.0)),
+            "saturation": merged_num(&["saturation"], live.as_ref().map(|player| player.saturation as f64).unwrap_or(20.0)),
+            "xp": merged_num(&["xp"], live.as_ref().map(|player| player.xp as f64).unwrap_or(0.0)),
+            "xp_level": merged_i64(&["xp_level", "xpLevel"], live.as_ref().map(|player| player.xp_level as i64).unwrap_or(0)),
+            "air": merged_i64(&["air"], live.as_ref().map(|player| player.air as i64).unwrap_or(300)),
+            "flying": merged_bool(&["flying", "is_flying", "isFlying"], live.as_ref().map(|player| player.is_flying).unwrap_or(false)),
+            "sneaking": merged_bool(&["sneaking", "is_sneaking", "isSneaking"], live.as_ref().map(|player| player.is_sneaking).unwrap_or(false)),
+            "sprinting": merged_bool(&["sprinting", "is_sprinting", "isSprinting"], live.as_ref().map(|player| player.is_sprinting).unwrap_or(false)),
+            "swimming": merged_bool(&["swimming", "is_swimming", "isSwimming"], live.as_ref().map(|player| player.is_swimming).unwrap_or(false)),
+            "gliding": merged_bool(&["gliding", "is_gliding", "isGliding"], live.as_ref().map(|player| player.is_gliding).unwrap_or(false)),
+            "world": merged_str(&["world"], live.as_ref().map(|player| player.world.clone()).unwrap_or_else(|| "world".to_string())),
+            "is_op": merged_bool(&["is_op", "op"], live.as_ref().map(|player| player.is_op).unwrap_or(false)),
+            "spawn_point": spawn_point,
+            "first_played": first_played,
+            "last_played": now,
+        });
+        self.write_player_data(name, &value).map_err(|error| error.to_string())?;
+        if let Some(mut player) = self.players.get(name) {
+            player.apply_save_json(&value);
+            self.players.upsert(player);
+        }
+        Ok(json!({ "ok": true }))
     }
 }
 
@@ -94,8 +372,40 @@ impl PluginHost for ServerPluginHost {
                     .get("block_id")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "missing block_id".to_string())? as u32;
+                // `set_block` enqueues the edit for both sync directions:
+                // Java polling `world.take_block_changes` (Fase 1) and
+                // Bedrock `UpdateBlockPacket` broadcast (Fase 2).
                 let changed = self.world.set_block(x, y, z, block_id);
                 Ok(json!({ "ok": true, "changed": changed }))
+            }
+            // ---- Fase 1 (Bedrock -> Java): block-change queue ----
+            // Format (documented for the Java bridge, poll 1x/tick):
+            //   request:  {}                                    (no params)
+            //   response: {"ok": true, "changes": [
+            //       {"x": i32, "y": i32, "z": i32, "block_id": u32},
+            //       ...]}
+            // Entries are oldest-first and the queue is drained by the
+            // call, so a bridge that polls every tick applies each edit
+            // exactly once. `block_id` is the same Bedrock network runtime
+            // id `world.get_block` returns / `world.set_block` accepts.
+            // The queue is capped (`BLOCK_CHANGE_QUEUE_CAP`, 512) with the
+            // oldest entries dropped, and draining it does not affect the
+            // separate Bedrock broadcast queue.
+            "world.take_block_changes" | "world.drain_changes" => {
+                let changes: Vec<Value> = self
+                    .world
+                    .take_changes()
+                    .into_iter()
+                    .map(|change| {
+                        json!({
+                            "x": change.x,
+                            "y": change.y,
+                            "z": change.z,
+                            "block_id": change.block_id,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "ok": true, "changes": changes }))
             }
             "world.get_highest_block" => {
                 let (x, z) = (int("x")?, int("z")?);
@@ -103,7 +413,78 @@ impl PluginHost for ServerPluginHost {
             }
             "world.get_spawn" => {
                 let (x, y, z) = self.world.spawn();
-                Ok(json!({ "x": x, "y": y, "z": z, "world": self.world.name }))
+                let (px, py, pz) = self.world.player_position();
+                Ok(json!({ "x": x, "y": y, "z": z, "world": self.world.name, "player": [px, py, pz] }))
+            }
+            // ---- Fase A3 (World/Block/Item): solo `world.*` ----
+            "world.get_time" => Ok(json!({ "time": self.world.time(), "running": self.world.is_time_running() })),
+            "world.get_time_running" => Ok(json!({ "running": self.world.is_time_running(), "time": self.world.time() })),
+            "world.set_time" => {
+                let time = int("time").unwrap_or(self.world.time());
+                Ok(json!({ "time": self.world.set_time(time) }))
+            }
+            "world.set_time_running" => {
+                let running = params.get("running").and_then(Value::as_bool).unwrap_or(true);
+                if running {
+                    self.world.start_time();
+                } else {
+                    self.world.stop_time();
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "world.get_difficulty" => Ok(json!({ "difficulty": self.world.difficulty() })),
+            "world.set_difficulty" => {
+                let difficulty = int("difficulty").unwrap_or(self.world.difficulty());
+                Ok(json!({ "difficulty": self.world.set_difficulty(difficulty) }))
+            }
+            "world.get_seed" => Ok(json!({ "seed": self.world.seed() })),
+            "world.save" => Ok(json!({ "ok": self.world.save().is_ok() })),
+            "world.generate" => {
+                // Single-world (ver `world_state.rs`): el nombre se registra
+                // en PHP; aquí solo confirmamos el sobrevuelo del generador.
+                Ok(json!({ "ok": true, "world": self.world.name }))
+            }
+            "world.get_auto_save" => Ok(json!({ "auto_save": self.world.auto_save() })),
+            "world.set_auto_save" => {
+                let enabled = params.get("auto_save").and_then(Value::as_bool).unwrap_or(true);
+                self.world.set_auto_save(enabled);
+                Ok(json!({ "ok": true }))
+            }
+            "world.get_auto_save_interval" => {
+                Ok(json!({ "interval": self.world.auto_save_interval() }))
+            }
+            "world.set_auto_save_interval" => {
+                let interval = params.get("interval").and_then(Value::as_i64).unwrap_or(6000) as i32;
+                self.world.set_auto_save_interval(interval);
+                Ok(json!({ "ok": true, "interval": self.world.auto_save_interval() }))
+            }
+            "world.do_auto_save" => {
+                let _ = self.world.save();
+                Ok(json!({ "ok": true }))
+            }
+            "world.tick" => {
+                let tick = int("current_tick").or_else(|_| int("tick")).unwrap_or(0);
+                self.world.record_tick(tick);
+                Ok(json!({ "ok": true, "tick": tick }))
+            }
+            "world.get_chunk" => {
+                // `World::getChunk()` / `Chunk` decodifica esta columna en
+                // `world.php`; sin esto el puente Java nunca envía chunks.
+                let chunk_x = params
+                    .get("chunk_x")
+                    .or_else(|| params.get("x"))
+                    .and_then(Value::as_i64)
+                    .map(|value| value as i32)
+                    .ok_or_else(|| "missing chunk_x".to_string())?;
+                let chunk_z = params
+                    .get("chunk_z")
+                    .or_else(|| params.get("z"))
+                    .and_then(Value::as_i64)
+                    .map(|value| value as i32)
+                    .ok_or_else(|| "missing chunk_z".to_string())?;
+                let (subchunks, payload) = self.world.chunk_payload(chunk_x, chunk_z);
+                let hex: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
+                Ok(json!({ "subchunks": subchunks, "data": hex }))
             }
             "player.get" => {
                 let name = params
@@ -134,7 +515,667 @@ impl PluginHost for ServerPluginHost {
                 let is_op = self.ops.read().contains(&name.to_lowercase());
                 Ok(json!({ "allowed": is_op }))
             }
+            // Full snapshots (Bedrock + Java bridge share this registry),
+            // used by JavaBridge to sync entities.
+            "server.get_players_full" => Ok(json!(self.players.all())),
+            // ------------------------------------------------ persistencia
+            // `players/<name>.json` con el mismo formato que las sesiones
+            // Bedrock (`PlayerSession::save_player_data`): JSON v2 (26
+            // campos) escrito directamente, sin staging virtual. `y` canónico
+            // (sin +64 legacy).
+            "player.has_data" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let has_data = self.read_player_data(name).is_some();
+                Ok(json!({ "has_data": has_data, "exists": has_data }))
+            }
+            "player.has_played_before" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let has_played_before = match self.read_player_data(name) {
+                    Some(saved) => {
+                        let first = saved.get("first_played").and_then(Value::as_f64).unwrap_or(0.0);
+                        let last = saved.get("last_played").and_then(Value::as_f64).unwrap_or(0.0);
+                        // Had a file before this session, or timers prove it.
+                        first > 0.0 && last > first + 0.001
+                    }
+                    None => false,
+                };
+                Ok(json!({ "has_played_before": has_played_before, "has_data": has_played_before, "exists": has_played_before }))
+            }
+            "player.load" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                match self.read_player_data(name) {
+                    Some(value) => {
+                        let mut out = value.clone();
+                        if let Some(object) = out.as_object_mut() {
+                            object.insert("has_data".to_string(), json!(true));
+                            object.insert("exists".to_string(), json!(true));
+                        }
+                        Ok(out)
+                    }
+                    None => Ok(json!({ "has_data": false, "exists": false })),
+                }
+            }
+            "player.save" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                Ok(self.save_player_v2(name, params)?)
+            }
+            "player.save_data" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let data = params.get("data").cloned().unwrap_or(Value::Null);
+                let mut current = self.read_player_data(name).unwrap_or_else(|| {
+                    PlayerContext::new(name, std::net::SocketAddr::from(([0, 0, 0, 0], 0))).to_save_json()
+                });
+                if let (Some(object), Some(data_object)) = (current.as_object_mut(), data.as_object()) {
+                    for (key, value) in data_object {
+                        object.insert(key.clone(), value.clone());
+                    }
+                    object.insert("name".to_string(), json!(name));
+                } else if let Some(object) = current.as_object_mut() {
+                    object.insert("data".to_string(), data);
+                    object.insert("name".to_string(), json!(name));
+                }
+                // Keep a full v2 object even for a brand-new name.
+                if let Some(object) = current.as_object() {
+                    if object.len() < 26 {
+                        let mut snapshot =
+                            PlayerContext::from_save_json(name, &current)
+                                .unwrap_or_else(|| PlayerContext::new(name, std::net::SocketAddr::from(([0, 0, 0, 0], 0))));
+                        snapshot.apply_save_json(&current);
+                        current = snapshot.to_save_json();
+                        if let Some(object) = current.as_object_mut() {
+                            object.insert("name".to_string(), json!(name));
+                        }
+                    }
+                }
+                self.write_player_data(name, &current).map_err(|error| error.to_string())?;
+                Ok(json!({ "ok": true }))
+            }
+            "player.update_position" => {
+                // Heartbeat only: updates the registry (canonical Bedrock Y,
+                // yaw Bedrock). It never writes disk — quit calls player.save.
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let x = params.get("x").and_then(Value::as_f64);
+                let y = params.get("y").and_then(Value::as_f64);
+                let z = params.get("z").and_then(Value::as_f64);
+                let yaw = params.get("yaw").and_then(Value::as_f64);
+                let pitch = params.get("pitch").and_then(Value::as_f64);
+                let mut found = false;
+                if let Some(mut player) = self.players.get(name) {
+                    if player.is_virtual {
+                        player.apply_position(
+                            x.unwrap_or(player.x),
+                            y.unwrap_or(player.y),
+                            z.unwrap_or(player.z),
+                            yaw.unwrap_or(player.yaw),
+                            pitch.unwrap_or(player.pitch),
+                        );
+                        self.players.upsert(player);
+                        found = true;
+                    }
+                }
+                if found {
+                    self.notify_virtual();
+                }
+                Ok(json!({ "ok": true, "found": found }))
+            }
+            "player.register" => {
+                // Virtual (Java bridge) player: registers a snapshot in the
+                // shared registry so plugins see them like Bedrock players.
+                // JavaServer::joinApi loads `player.load` BEFORE this call;
+                // any persisted field the caller omitted (xuid / timers /
+                // vitals) is inherited from disk here so load->register is
+                // lossless even if PHP forgot a field. `y` is copied as-is
+                // (canonical, no +64).
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let address = params
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                let saved = self.read_player_data(name);
+                let saved_num = |key: &str| saved.as_ref().and_then(|entry| entry.get(key)).and_then(Value::as_f64);
+                let float = |key: &str, default: f64| {
+                    params
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .or_else(|| saved_num(key))
+                        .unwrap_or(default)
+                };
+                let mut player = PlayerContext {
+                    name: name.to_string(),
+                    display_name: params
+                        .get("display_name")
+                        .or_else(|| params.get("displayName"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            saved
+                                .as_ref()
+                                .and_then(|entry| entry.get("display_name").or_else(|| entry.get("displayName")))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or(name)
+                        .to_string(),
+                    address,
+                    runtime_id: 0,
+                    unique_id: 0,
+                    ping: 0,
+                    gamemode: params
+                        .get("gamemode")
+                        .and_then(Value::as_i64)
+                        .or_else(|| saved.as_ref().and_then(|entry| entry.get("gamemode")).and_then(Value::as_i64))
+                        .unwrap_or(0)
+                        .max(0) as u32,
+                    x: float("x", 0.0),
+                    y: float("y", 64.0),
+                    z: float("z", 0.0),
+                    yaw: float("yaw", 0.0),
+                    pitch: float("pitch", 0.0),
+                    world: params
+                        .get("world")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            saved
+                                .as_ref()
+                                .and_then(|entry| entry.get("world"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("world")
+                        .to_string(),
+                    health: float("health", 20.0) as f32,
+                    max_health: params
+                        .get("max_health")
+                        .or_else(|| params.get("maxHealth"))
+                        .and_then(Value::as_f64)
+                        .or_else(|| saved_num("max_health").or_else(|| saved_num("maxHealth")))
+                        .unwrap_or(20.0) as f32,
+                    is_op: params
+                        .get("is_op")
+                        .or_else(|| params.get("op"))
+                        .and_then(Value::as_bool)
+                        .or_else(|| {
+                            saved
+                                .as_ref()
+                                .and_then(|entry| entry.get("is_op").or_else(|| entry.get("op")))
+                                .and_then(Value::as_bool)
+                        })
+                        .unwrap_or(false),
+                    is_virtual: true,
+                    xuid: params
+                        .get("xuid")
+                        .and_then(Value::as_str)
+                        .or_else(|| saved.as_ref().and_then(|entry| entry.get("xuid")).and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string(),
+                    first_played: params
+                        .get("first_played")
+                        .or_else(|| params.get("firstPlayed"))
+                        .and_then(Value::as_f64)
+                        .or_else(|| saved_num("first_played"))
+                        .unwrap_or(0.0),
+                    last_played: params
+                        .get("last_played")
+                        .or_else(|| params.get("lastPlayed"))
+                        .and_then(Value::as_f64)
+                        .or_else(|| saved_num("last_played"))
+                        .unwrap_or(0.0),
+                    food: params.get("food").and_then(Value::as_f64).or_else(|| saved_num("food")).unwrap_or(20.0) as f32,
+                    saturation: params.get("saturation").and_then(Value::as_f64).or_else(|| saved_num("saturation")).unwrap_or(20.0) as f32,
+                    xp: params.get("xp").and_then(Value::as_f64).or_else(|| saved_num("xp")).unwrap_or(0.0) as f32,
+                    xp_level: params
+                        .get("xp_level")
+                        .or_else(|| params.get("xpLevel"))
+                        .and_then(Value::as_i64)
+                        .or_else(|| saved.as_ref().and_then(|entry| entry.get("xp_level").or_else(|| entry.get("xpLevel"))).and_then(Value::as_i64))
+                        .unwrap_or(0) as i32,
+                    air: params.get("air").and_then(Value::as_i64).or_else(|| saved.as_ref().and_then(|entry| entry.get("air")).and_then(Value::as_i64)).unwrap_or(300) as i16,
+                    is_flying: params
+                        .get("flying")
+                        .or_else(|| params.get("is_flying"))
+                        .and_then(Value::as_bool)
+                        .or_else(|| {
+                            saved
+                                .as_ref()
+                                .and_then(|entry| entry.get("flying").or_else(|| entry.get("is_flying")))
+                                .and_then(Value::as_bool)
+                        })
+                        .unwrap_or(false),
+                    spawn_point: None,
+                    is_sneaking: params.get("sneaking").or_else(|| params.get("is_sneaking")).and_then(Value::as_bool).unwrap_or(false),
+                    is_sprinting: params.get("sprinting").or_else(|| params.get("is_sprinting")).and_then(Value::as_bool).unwrap_or(false),
+                    is_swimming: params.get("swimming").or_else(|| params.get("is_swimming")).and_then(Value::as_bool).unwrap_or(false),
+                    is_gliding: params.get("gliding").or_else(|| params.get("is_gliding")).and_then(Value::as_bool).unwrap_or(false),
+                };
+                if let Some(saved) = saved.as_ref() {
+                    let live = player.clone();
+                    player.apply_save_json(saved);
+                    // Any field the caller supplied wins over the quit save
+                    // (Java may have a newer position/health than disk).
+                    if params.get("x").is_some() || params.get("y").is_some() || params.get("z").is_some() {
+                        player.x = live.x;
+                        player.y = live.y;
+                        player.z = live.z;
+                    } else {
+                        // No live position supplied: spawn at the saved one.
+                        player.x = live.x;
+                        player.y = live.y;
+                        player.z = live.z;
+                    }
+                    if params.get("yaw").is_some() { player.yaw = live.yaw; }
+                    if params.get("pitch").is_some() { player.pitch = live.pitch; }
+                    if params.get("gamemode").is_some() { player.gamemode = live.gamemode; }
+                    if params.get("health").is_some() { player.health = live.health; }
+                    if params.get("max_health").is_some() || params.get("maxHealth").is_some() { player.max_health = live.max_health; }
+                    if params.get("food").is_some() { player.food = live.food; }
+                    if params.get("saturation").is_some() { player.saturation = live.saturation; }
+                    if params.get("xp").is_some() { player.xp = live.xp; }
+                    if params.get("xp_level").is_some() || params.get("xpLevel").is_some() { player.xp_level = live.xp_level; }
+                    if params.get("air").is_some() { player.air = live.air; }
+                    if params.get("xuid").is_some() { player.xuid = live.xuid; }
+                    if params.get("first_played").is_some() || params.get("firstPlayed").is_some() { player.first_played = live.first_played; }
+                    if params.get("last_played").is_some() || params.get("lastPlayed").is_some() { player.last_played = live.last_played; }
+                    if params.get("flying").is_some() || params.get("is_flying").is_some() { player.is_flying = live.is_flying; }
+                    if params.get("display_name").is_some() || params.get("displayName").is_some() { player.display_name = live.display_name; }
+                    if params.get("world").is_some() { player.world = live.world; }
+                    // Persisted-only fields (spawn_point, flags) stay from disk.
+                }
+                if let Some(existing) = self.players.get(name) {
+                    if !existing.is_virtual {
+                        return Ok(json!({ "ok": false, "reason": "name taken by Bedrock" }));
+                    }
+                }
+                self.players.upsert(player);
+                self.notify_virtual();
+                Ok(json!({ "ok": true }))
+            }
+            "player.unregister" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                if self.players.remove_if_virtual(name) {
+                    self.notify_virtual();
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "player.take_messages" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                Ok(json!({ "messages": self.players.take_messages(name) }))
+            }
+            "server.save_all" => {
+                // Mundo + datos del registro (Bedrock los guarda SessionManager;
+                // aquí se guardan los del registro para que `/save-all` desde
+                // Java persista también, virtuals incluidos, directo a disco).
+                let _ = self.world.save_to(std::path::Path::new("world.json"));
+                let all = self.players.all();
+                let now = crate::session::PlayerSession::now_played_secs();
+                for player in &all {
+                    let existing = self.read_player_data(&player.name);
+                    let mut value = player.to_save_json();
+                    if let Some(object) = value.as_object_mut() {
+                        if let Some(existing) = existing.as_ref() {
+                            // Preserve on-disk timers/xuid when live is empty.
+                            if player.first_played <= 0.0 {
+                                if let Some(saved) = existing.get("first_played") {
+                                    if saved.as_f64().unwrap_or(0.0) > 0.0 {
+                                        object.insert("first_played".to_string(), saved.clone());
+                                    }
+                                }
+                            }
+                            if player.xuid.is_empty() {
+                                if let Some(saved) = existing.get("xuid") {
+                                    if saved.as_str().unwrap_or("").len() > 0 {
+                                        object.insert("xuid".to_string(), saved.clone());
+                                    }
+                                }
+                            }
+                        } else if player.first_played <= 0.0 {
+                            object.insert("first_played".to_string(), json!(now));
+                        }
+                        object.insert("last_played".to_string(), json!(now));
+                    }
+                    let _ = self.write_player_data(&player.name, &value);
+                }
+                Ok(json!({ "ok": true, "players": all.len() }))
+            }
+            // ---- Fase A1 (Server+Player API): solo consultas server/player,
+            // append (sin tocar el resto para evitar conflicto Bridge) ----
+            "player.get_by_uuid" => {
+                // `Server::getPlayerByUUID` fallback: compara `unique_id`
+                // (i64) como string. Byte-raw UUIDs (16 bytes) no coinciden
+                // aquí; PHP los resuelve en su registro local.
+                let uuid = params
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let found = self
+                    .players
+                    .all()
+                    .into_iter()
+                    .find(|player| player.unique_id.to_string() == uuid);
+                match found {
+                    Some(player) => Ok(json!(player)),
+                    None => Ok(Value::Null),
+                }
+            }
+            "player.get_by_raw_uuid" => {
+                // `Server::getPlayerByRawUUID` fallback: hex-encoded raw
+                // bytes -> compara `unique_id` hex. Sin match => null.
+                let raw = params
+                    .get("raw_uuid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let found = self.players.all().into_iter().find(|player| {
+                    let unique = player.unique_id;
+                    let bytes = unique.to_be_bytes();
+                    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    raw.eq_ignore_ascii_case(&hex) || unique.to_string() == raw
+                });
+                match found {
+                    Some(player) => Ok(json!(player)),
+                    None => Ok(Value::Null),
+                }
+            }
+            "server.get_query_info" => {
+                Ok(json!({
+                    "hostname": self.motd,
+                    "numplayers": self.players.names().len(),
+                    "maxplayers": self.max_players,
+                    "players": self.players.names(),
+                }))
+            }
+            "server.get_ops" => Ok(json!({ "ops": self.ops.read().iter().cloned().collect::<Vec<_>>() })),
+            "server.set_op" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let op = params.get("op").and_then(Value::as_bool).unwrap_or(false);
+                let key = name.to_lowercase();
+                if op {
+                    self.ops.write().insert(key);
+                } else {
+                    self.ops.write().remove(&key);
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "player.update_health" => {
+                // `Player::setHealth/setMaxHealth` fallback para jugadores
+                // virtuales (sin sesión Bedrock): actualiza el snapshot del
+                // registro. Sesiones vivas se actualizan vía `PluginAction::
+                // SetHealth` en `SessionManager::apply_actions`.
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player name".to_string())?;
+                let health = params.get("health").and_then(Value::as_f64);
+                let max_health = params.get("max_health").and_then(Value::as_f64);
+                let mut found = false;
+                if let Some(mut player) = self.players.get(name) {
+                    if let Some(max) = max_health {
+                        player.max_health = max.max(1.0) as f32;
+                    }
+                    if let Some(hp) = health {
+                        player.health = hp.clamp(0.0, player.max_health as f64) as f32;
+                    }
+                    self.players.upsert(player);
+                    found = true;
+                }
+                Ok(json!({ "ok": true, "found": found }))
+            }
             other => Err(format!("unsupported host method '{}'", other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use php_plugin_bridge::PluginHost as _;
+    use std::collections::HashSet;
+
+    fn test_host() -> (ServerPluginHost, Arc<PlayerRegistry>) {
+        let generator: Arc<dyn bedrock_world::WorldGenerator> =
+            Arc::new(bedrock_world::NormalGenerator::new(42));
+        let world = Arc::new(WorldState::new("world", generator));
+        let players = Arc::new(PlayerRegistry::new());
+        let host = ServerPluginHost::new(
+            world,
+            Arc::clone(&players),
+            Arc::new(RwLock::new(HashSet::new())),
+            "test motd",
+            100,
+        );
+        (host, players)
+    }
+
+    #[test]
+    fn inbox_push_and_take_is_ordered_and_case_insensitive() {
+        let registry = PlayerRegistry::new();
+        registry.push_message("Steve", "first");
+        registry.push_message("STEVE", "second");
+        registry.push_message("Alex", "other");
+        assert_eq!(
+            registry.take_messages("steve"),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        // A drained inbox stays empty.
+        assert_eq!(registry.take_messages("Steve"), Vec::<String>::new());
+        assert_eq!(registry.take_messages("Alex"), vec!["other".to_string()]);
+        assert_eq!(registry.take_messages("Nobody"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn inbox_is_capped() {
+        let registry = PlayerRegistry::new();
+        for index in 0..(PlayerRegistry::INBOX_CAP as i32 + 1) {
+            registry.push_message("Steve", format!("line {index}"));
+        }
+        let drained = registry.take_messages("Steve");
+        assert_eq!(drained.len(), PlayerRegistry::INBOX_CAP);
+        assert_eq!(drained[0], "line 1");
+    }
+
+    #[test]
+    fn remove_clears_inbox() {
+        let registry = PlayerRegistry::new();
+        registry.push_message("Steve", "pending");
+        registry.remove("Steve");
+        assert_eq!(registry.take_messages("Steve"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn virtual_player_register_take_and_unregister() {
+        let (host, players) = test_host();
+
+        let registered = host
+            .call(
+                "player.register",
+                &json!({
+                    "name": "Steve",
+                    "display_name": "Steve",
+                    "address": "127.0.0.1:25565",
+                    "gamemode": 1,
+                    "x": 1.5, "y": 64.0, "z": -2.5,
+                    "yaw": 90.0, "pitch": 0.0,
+                    "world": "world",
+                    "health": 20.0, "max_health": 20.0,
+                    "is_op": false,
+                }),
+            )
+            .expect("player.register");
+        assert_eq!(registered, json!({ "ok": true }));
+
+        let snapshot = players.get("steve").expect("registered player");
+        assert_eq!(snapshot.name, "Steve");
+        assert_eq!(snapshot.gamemode, 1);
+        assert_eq!(snapshot.x, 1.5);
+
+        // Nothing pending yet: empty list, not an error.
+        let empty = host
+            .call("player.take_messages", &json!({ "name": "Steve" }))
+            .expect("player.take_messages");
+        assert_eq!(empty, json!({ "messages": [] }));
+
+        players.push_message("Steve", "plugin line here");
+        let drained = host
+            .call("player.take_messages", &json!({ "name": "Steve" }))
+            .expect("player.take_messages");
+        assert_eq!(drained, json!({ "messages": ["plugin line here"] }));
+
+        let unregistered = host
+            .call("player.unregister", &json!({ "name": "Steve" }))
+            .expect("player.unregister");
+        assert_eq!(unregistered, json!({ "ok": true }));
+        assert!(players.get("Steve").is_none());
+    }
+
+    #[test]
+    fn bedrock_disconnect_does_not_delete_virtual_entry() {
+        let (host, players) = test_host();
+        host.call(
+            "player.register",
+            &json!({
+                "name": "Procatin0",
+                "display_name": "Procatin0",
+                "address": "127.0.0.1:25565",
+                "gamemode": 0,
+                "x": 0.5, "y": 65.0, "z": 0.5,
+                "yaw": 0.0, "pitch": 0.0,
+                "world": "world",
+                "health": 20.0, "max_health": 20.0,
+                "is_op": false,
+            }),
+        )
+        .expect("player.register");
+        let snapshot = players.get("procatin0").expect("virtual entry");
+        assert!(snapshot.is_virtual);
+
+        // finalize_session path: same name, Bedrock owner cleanup must no-op.
+        assert!(!players.remove_if_bedrock("Procatin0"));
+        assert!(players.get("Procatin0").is_some());
+
+        // Bedrock entry is removed by that path, virtual by unregister path.
+        let mut bedrock = snapshot.clone();
+        bedrock.is_virtual = false;
+        players.upsert(bedrock);
+        assert!(players.remove_if_bedrock("Procatin0"));
+        assert!(players.get("Procatin0").is_none());
+    }
+
+    #[test]
+    fn take_block_changes_returns_and_drains_set_block_edits() {
+        let (host, _players) = test_host();
+
+        // Nothing pending yet: empty list, not an error.
+        let empty = host
+            .call("world.take_block_changes", &json!({}))
+            .expect("world.take_block_changes");
+        assert_eq!(empty, json!({ "ok": true, "changes": [] }));
+
+        host.call("world.set_block", &json!({ "x": 1, "y": 64, "z": 2, "block_id": 99 }))
+            .expect("world.set_block");
+        host.call("world.set_block", &json!({ "x": 3, "y": 65, "z": 4, "block_id": 100 }))
+            .expect("world.set_block");
+        // A no-change set_block must not enqueue a second entry. (A real
+        // second change proves the drain below is not just echoing input.)
+        host.call("world.set_block", &json!({ "x": 1, "y": 64, "z": 2, "block_id": 99 }))
+            .expect("world.set_block (no change)");
+
+        let drained = host
+            .call("world.take_block_changes", &json!({}))
+            .expect("world.take_block_changes");
+        assert_eq!(
+            drained,
+            json!({ "ok": true, "changes": [
+                { "x": 1, "y": 64, "z": 2, "block_id": 99 },
+                { "x": 3, "y": 65, "z": 4, "block_id": 100 },
+            ]})
+        );
+
+        // Drained: the next tick sees nothing; the alias drains likewise.
+        let empty_again = host
+            .call("world.drain_changes", &json!({}))
+            .expect("world.drain_changes");
+        assert_eq!(empty_again, json!({ "ok": true, "changes": [] }));
+    }
+
+    #[test]
+    fn unregister_does_not_delete_bedrock_entry() {
+        let (host, players) = test_host();
+        let mut bedrock = php_plugin_bridge::PlayerContext::new("Steve", "127.0.0.1:19132".parse().unwrap());
+        bedrock.is_virtual = false;
+        players.upsert(bedrock.clone());
+        host.call("player.unregister", &json!({ "name": "Steve" }))
+            .expect("player.unregister");
+        assert!(players.get("Steve").is_some());
+        assert!(players.remove_if_virtual("Steve") == false);
+    }
+
+    #[test]
+    fn virtual_notify_fires_on_register_move_and_unregister() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (host, _players) = test_host();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        host.set_virtual_notify(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        host.call(
+            "player.register",
+            &json!({
+                "name": "Steve",
+                "display_name": "Steve",
+                "address": "127.0.0.1:25565",
+                "gamemode": 1,
+                "x": 1.5, "y": 64.0, "z": -2.5,
+                "yaw": 90.0, "pitch": 0.0,
+                "world": "world",
+                "health": 20.0, "max_health": 20.0,
+                "is_op": false,
+            }),
+        )
+        .expect("player.register");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "register notifies");
+
+        host.call(
+            "player.update_position",
+            &json!({ "name": "Steve", "x": 3.5, "y": 64.0, "z": -2.5, "yaw": 90.0, "pitch": 0.0 }),
+        )
+        .expect("player.update_position");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "move notifies");
+
+        host.call("player.unregister", &json!({ "name": "Steve" }))
+            .expect("player.unregister");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "unregister notifies");
+
+        // Unregistering a name that is not a virtual entry must not notify.
+        host.call("player.unregister", &json!({ "name": "Steve" }))
+            .expect("player.unregister (unknown)");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

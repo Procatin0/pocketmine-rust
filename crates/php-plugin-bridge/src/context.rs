@@ -88,6 +88,44 @@ pub enum PluginAction {
         target_player: String,
         gamemode: u32,
     },
+    // Fase A1 (Server+Player API): `Player::setHealth/setMaxHealth/setXp/
+    // setXpLevel` via `addAction`. `SetHealth` bundles `health` + optional
+    // `max_health` so both PHP setters share one variant; `SetXp` bundles
+    // `xp` (progress 0..1) + optional `level` (xp_level). Tolerant of
+    // partial payloads (optionals default to `None`).
+    #[serde(rename = "set_health")]
+    SetHealth {
+        target_player: String,
+        health: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_health: Option<f32>,
+    },
+    #[serde(rename = "set_xp")]
+    SetXp {
+        target_player: String,
+        xp: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<i32>,
+    },
+    // Fase A1: `Player::hidePlayer/showPlayer` -> `SessionManager::
+    // hide_player/show_player` (`canSee`). `viewer` hides/shows `target`.
+    #[serde(rename = "hide_player")]
+    HidePlayer { viewer: String, target: String },
+    #[serde(rename = "show_player")]
+    ShowPlayer { viewer: String, target: String },
+    // Fase A1: `Player::sendSubTitle` (subtitle only, no title packet).
+    #[serde(rename = "send_subtitle")]
+    SendSubTitle {
+        target_player: String,
+        subtitle: String,
+    },
+    // Fase A1: `Player::sendActionBarMessage` (`SetTitlePacket`
+    // action-bar message, NOT `TextPacket` popup).
+    #[serde(rename = "send_action_bar")]
+    SendActionBar {
+        target_player: String,
+        message: String,
+    },
 }
 
 fn default_socket_addr() -> SocketAddr {
@@ -133,6 +171,51 @@ pub struct PlayerContext {
     pub max_health: f32,
     #[serde(default)]
     pub is_op: bool,
+    /// True when this entry is owned by a virtual (Java bridge) player,
+    /// false when it is owned by a live Bedrock session. Ownership matters
+    /// for removal: quitting one side must not delete the other's entry
+    /// when both scripts share a lowercase name.
+    #[serde(default)]
+    pub is_virtual: bool,
+    /// Xbox XUID ("" when unknown, e.g. offline Java login).
+    #[serde(default)]
+    pub xuid: String,
+    /// Microtime of first join (0.0 = never, `Player::getFirstPlayed`).
+    #[serde(default)]
+    pub first_played: f64,
+    /// Microtime of last join/save (0.0 = never, `Player::getLastPlayed`).
+    #[serde(default)]
+    pub last_played: f64,
+    #[serde(default = "default_food")]
+    pub food: f32,
+    #[serde(default = "default_food")]
+    pub saturation: f32,
+    #[serde(default)]
+    pub xp: f32,
+    #[serde(default)]
+    pub xp_level: i32,
+    #[serde(default = "default_air")]
+    pub air: i16,
+    #[serde(default)]
+    pub is_flying: bool,
+    #[serde(default)]
+    pub spawn_point: Option<[f64; 3]>,
+    #[serde(default)]
+    pub is_sneaking: bool,
+    #[serde(default)]
+    pub is_sprinting: bool,
+    #[serde(default)]
+    pub is_swimming: bool,
+    #[serde(default)]
+    pub is_gliding: bool,
+}
+
+fn default_food() -> f32 {
+    20.0
+}
+
+fn default_air() -> i16 {
+    300
 }
 
 impl PlayerContext {
@@ -155,6 +238,21 @@ impl PlayerContext {
             health: 20.0,
             max_health: 20.0,
             is_op: false,
+            is_virtual: false,
+            xuid: String::new(),
+            first_played: 0.0,
+            last_played: 0.0,
+            food: 20.0,
+            saturation: 20.0,
+            xp: 0.0,
+            xp_level: 0,
+            air: 300,
+            is_flying: false,
+            spawn_point: None,
+            is_sneaking: false,
+            is_sprinting: false,
+            is_swimming: false,
+            is_gliding: false,
         }
     }
 
@@ -172,6 +270,191 @@ impl PlayerContext {
         if player.display_name.is_empty() {
             player.display_name = player.name.clone();
         }
+        Some(player)
+    }
+
+    /// Updates position/rotation in place (`player.update_position`).
+    pub fn apply_position(&mut self, x: f64, y: f64, z: f64, yaw: f64, pitch: f64) {
+        self.x = x;
+        self.y = y;
+        self.z = z;
+        self.yaw = yaw;
+        self.pitch = pitch;
+    }
+
+    /// PM `Player::hasPlayedBefore(): bool`: saved data existed before this
+    /// session (registry carries `first_played`/`last_played` from disk), or
+    /// `last_played` exceeds `first_played` by more than 1ms (axolotl).
+    pub fn has_played_before(&self) -> bool {
+        self.first_played > 0.0 && self.last_played > self.first_played + 0.001
+    }
+
+    /// Snapshot in the `players/<name>.json` format shared with Bedrock
+    /// sessions (`PlayerSession::save_player_data`).
+    ///
+    /// JSON v2 (26 campos, canónico): `y` is the Bedrock world Y (never the
+    /// legacy Java `y+64`; the +64 lives only in legacy Java packets).
+    /// Bedrock and virtual (Java) saves write this exact object directly to
+    /// `players/<lowercase>.json` — no staging file.
+    pub fn to_save_json(&self) -> Value {
+        serde_json::json!({
+            "name": self.name,
+            "xuid": self.xuid,
+            "display_name": self.display_name,
+            "x": self.x,
+            "y": self.y,
+            "z": self.z,
+            "yaw": self.yaw,
+            "pitch": self.pitch,
+            "gamemode": self.gamemode as i64,
+            "health": self.health as f64,
+            "max_health": self.max_health as f64,
+            "food": self.food as f64,
+            "saturation": self.saturation as f64,
+            "xp": self.xp as f64,
+            "xp_level": self.xp_level,
+            "air": self.air as i64,
+            "flying": self.is_flying,
+            "sneaking": self.is_sneaking,
+            "sprinting": self.is_sprinting,
+            "swimming": self.is_swimming,
+            "gliding": self.is_gliding,
+            "world": self.world,
+            "is_op": self.is_op,
+            "spawn_point": self.spawn_point.map(|point| vec![point[0], point[1], point[2]]),
+            "first_played": self.first_played,
+            "last_played": self.last_played,
+        })
+    }
+
+    /// Restores position/rotation/gamemode/health and the rest of JSON v2
+    /// from a saved JSON object. Missing fields leave values untouched.
+    /// Accepts PHP aliases (`flying`/`is_flying`, `xp_level`/`xpLevel`,
+    /// `sneaking`/`is_sneaking`, ...).
+    pub fn apply_save_json(&mut self, value: &Value) {
+        let number = |key: &str| value.get(key).and_then(Value::as_f64);
+        let first_number = |keys: &[&str]| keys.iter().filter_map(|key| number(key)).next();
+        let first_bool = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| value.get(*key).and_then(Value::as_bool))
+                .next()
+        };
+        if let (Some(x), Some(y), Some(z)) = (number("x"), number("y"), number("z")) {
+            self.x = x;
+            self.y = y;
+            self.z = z;
+        }
+        if let Some(yaw) = number("yaw") {
+            self.yaw = yaw;
+        }
+        if let Some(pitch) = number("pitch") {
+            self.pitch = pitch;
+        }
+        if let Some(gamemode) = value.get("gamemode").and_then(Value::as_i64) {
+            self.gamemode = gamemode.max(0) as u32;
+        }
+        if let Some(health) = number("health") {
+            self.health = health as f32;
+        }
+        if let Some(max_health) = first_number(&["max_health", "maxHealth"]) {
+            self.max_health = max_health.max(1.0) as f32;
+        }
+        if let Some(world) = value.get("world").and_then(Value::as_str) {
+            if !world.is_empty() {
+                self.world = world.to_string();
+            }
+        }
+        if let Some(xuid) = value.get("xuid").and_then(Value::as_str) {
+            if !xuid.is_empty() {
+                self.xuid = xuid.to_string();
+            }
+        }
+        if let Some(display_name) = value
+            .get("display_name")
+            .or_else(|| value.get("displayName"))
+            .and_then(Value::as_str)
+        {
+            if !display_name.is_empty() {
+                self.display_name = display_name.to_string();
+            }
+        }
+        if let Some(first) = first_number(&["first_played", "firstPlayed"]) {
+            self.first_played = first;
+        }
+        if let Some(last) = first_number(&["last_played", "lastPlayed"]) {
+            self.last_played = last;
+        }
+        if let Some(food) = number("food") {
+            self.food = food as f32;
+        }
+        if let Some(saturation) = number("saturation") {
+            self.saturation = saturation as f32;
+        }
+        if let Some(xp) = number("xp") {
+            self.xp = xp as f32;
+        }
+        if let Some(level) = value
+            .get("xp_level")
+            .or_else(|| value.get("xpLevel"))
+            .and_then(Value::as_i64)
+        {
+            self.xp_level = level as i32;
+        }
+        if let Some(air) = value.get("air").and_then(Value::as_i64) {
+            self.air = air as i16;
+        }
+        if let Some(flying) = first_bool(&["flying", "is_flying", "isFlying"]) {
+            self.is_flying = flying;
+        }
+        if let Some(v) = first_bool(&["sneaking", "is_sneaking", "isSneaking"]) {
+            self.is_sneaking = v;
+        }
+        if let Some(v) = first_bool(&["sprinting", "is_sprinting", "isSprinting"]) {
+            self.is_sprinting = v;
+        }
+        if let Some(v) = first_bool(&["swimming", "is_swimming", "isSwimming"]) {
+            self.is_swimming = v;
+        }
+        if let Some(v) = first_bool(&["gliding", "is_gliding", "isGliding"]) {
+            self.is_gliding = v;
+        }
+        if let Some(is_op) = value
+            .get("is_op")
+            .or_else(|| value.get("op"))
+            .and_then(Value::as_bool)
+        {
+            self.is_op = is_op;
+        }
+        if let Some(point) = value
+            .get("spawn_point")
+            .or_else(|| value.get("spawnPoint"))
+            .and_then(Value::as_array)
+        {
+            let coords: Vec<f64> = point.iter().filter_map(Value::as_f64).collect();
+            if coords.len() == 3 {
+                self.spawn_point = Some([coords[0], coords[1], coords[2]]);
+            }
+        } else if value.get("spawn_point").is_some_and(Value::is_null) {
+            self.spawn_point = None;
+        }
+    }
+
+    /// Builds a context from a saved JSON object returning `None` when the
+    /// object has no usable position.
+    pub fn from_save_json(name: &str, value: &Value) -> Option<Self> {
+        let (x, y, z) = {
+            let object = value.as_object()?;
+            (
+                object.get("x")?.as_f64()?,
+                object.get("y")?.as_f64()?,
+                object.get("z")?.as_f64()?,
+            )
+        };
+        let mut player = Self::new(name, default_socket_addr());
+        player.x = x;
+        player.y = y;
+        player.z = z;
+        player.apply_save_json(value);
         Some(player)
     }
 }
@@ -216,6 +499,21 @@ mod tests {
             health: 20.0,
             max_health: 20.0,
             is_op: true,
+            is_virtual: false,
+            xuid: "2535412345678901".to_string(),
+            first_played: 1700000000.5,
+            last_played: 1700000100.25,
+            food: 20.0,
+            saturation: 20.0,
+            xp: 0.0,
+            xp_level: 0,
+            air: 300,
+            is_flying: false,
+            spawn_point: None,
+            is_sneaking: false,
+            is_sprinting: false,
+            is_swimming: false,
+            is_gliding: false,
         };
 
         let value = player.to_json();
@@ -235,6 +533,32 @@ mod tests {
         assert_eq!(parsed.display_name, "Alex");
         assert_eq!(parsed.y, 0.0);
         assert_eq!(parsed.max_health, 0.0);
+    }
+
+    #[test]
+    fn save_json_is_v2_26_fields_and_roundtrips() {
+        let mut player = PlayerContext::new("Steve", "127.0.0.1:19132".parse().unwrap());
+        player.xuid = "2535412345678901".to_string();
+        player.first_played = 1700000000.5;
+        player.last_played = 1700000100.25;
+        player.food = 15.0;
+        player.saturation = 12.0;
+        player.xp = 0.5;
+        player.xp_level = 3;
+        player.air = 250;
+        player.y = 65.0; // canónico, sin +64
+        let saved = player.to_save_json();
+        let object = saved.as_object().expect("save json object");
+        assert_eq!(object.len(), 26, "JSON v2 debe tener 26 campos");
+        assert_eq!(saved["y"], 65.0);
+        assert_eq!(saved["xuid"], "2535412345678901");
+        assert_eq!(saved["first_played"], 1700000000.5);
+        let mut restored =
+            PlayerContext::new("Steve", "127.0.0.1:19132".parse().unwrap());
+        restored.apply_save_json(&saved);
+        assert_eq!(restored, player);
+        assert!(restored.has_played_before());
+        assert!(!PlayerContext::new("New", "127.0.0.1:19132".parse().unwrap()).has_played_before());
     }
 
     #[test]

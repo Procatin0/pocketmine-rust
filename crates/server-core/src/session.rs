@@ -5,27 +5,39 @@ use std::sync::Arc;
 
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
-    AvailableCommandsPacket, BlockPos, ChunkRadiusUpdatedPacket, CommandRequestPacket, CommandSpec,
-    DisconnectPacket, LevelChunkPacket, LoginPacket, NetworkChunkPublisherUpdatePacket,
+    AddPlayerPacket, AvailableCommandsPacket, BlockPos, ChunkRadiusUpdatedPacket,
+    CommandRequestPacket, CommandSpec, DisconnectPacket, LevelChunkPacket, LoginPacket,
+    MetadataEntry, MetadataValue, MoveActorAbsolutePacket, MovePlayerPacket,
+    NetworkChunkPublisherUpdatePacket,
     NetworkSettingsPacket, Packet, PacketBatch, PacketViolationWarningPacket, PlayStatusPacket,
-    PlayerAuthInputPacket, RequestAbilityPacket, RequestChunkRadiusPacket,
-    RequestNetworkSettingsPacket, ResourcePackClientResponsePacket, ResourcePackStackPacket,
-    ResourcePacksInfoPacket, SetPlayerGameTypePacket, SetSpawnPositionPacket, StartGamePacket,
-    ActorEventPacket, InventoryContentPacket, InventorySlotPacket, InventoryTransactionPacket,
-    ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket, SetTitlePacket, TextPacket,
-    TransactionData, TransferPacket,
-    UpdateAbilitiesPacket, UpdatePlayerGameTypePacket, Vector3f,
+    PlayerAuthInputPacket, PlayerListEntry, PlayerListPacket, RemoveActorPacket,
+    RequestAbilityPacket, RequestChunkRadiusPacket, RequestNetworkSettingsPacket,
+    ResourcePackClientResponsePacket, ResourcePackStackPacket, ResourcePacksInfoPacket,
+    SetActorDataPacket, SetPlayerGameTypePacket, SetSpawnPositionPacket, SkinData,
+    StartGamePacket, ActorEventPacket, InventoryContentPacket, InventorySlotPacket,
+    InventoryTransactionPacket, ItemStack, RespawnPacket, SetDifficultyPacket, SetHealthPacket,
+    SetTitlePacket, TextPacket, TransactionData, TransferPacket, UpdateAbilitiesPacket,
+    UpdatePlayerGameTypePacket, Vector3f,
 };
 use bedrock_protocol::packets::actor_event::EVENT_DEATH_ANIMATION;
-use bedrock_protocol::packets::player_auth_input::{
-    parse_block_actions, BLOCK_ACTION_PREDICT_DESTROY, BLOCK_ACTION_START_BREAK,
+use bedrock_protocol::packets::inventory_transaction::{
+    ACTION_CLICK_BLOCK, UseItemData,
 };
+use bedrock_protocol::packets::player_auth_input::{
+    has_input_flag, parse_block_actions, parse_input_flags, BLOCK_ACTION_PREDICT_DESTROY,
+    BLOCK_ACTION_START_BREAK, INPUT_FLAG_MISSED_SWING, INPUT_FLAG_START_FLYING,
+    INPUT_FLAG_START_GLIDING, INPUT_FLAG_START_JUMPING, INPUT_FLAG_START_SNEAKING,
+    INPUT_FLAG_START_SPRINTING, INPUT_FLAG_START_SWIMMING, INPUT_FLAG_STOP_FLYING,
+    INPUT_FLAG_STOP_GLIDING, INPUT_FLAG_STOP_SNEAKING, INPUT_FLAG_STOP_SPRINTING,
+    INPUT_FLAG_STOP_SWIMMING,
+};
+use bedrock_protocol::packets::player_list::uuid_from_str;
 use bedrock_world::{block_id::AIR, FlatGenerator, WorldGenerator};
 use parking_lot::RwLock;
 use php_plugin_bridge::{
-    BlockBreakEvent, CommandSender, Event, PlayerChatEvent, PlayerCommandPreprocessEvent,
-    PlayerContext, PlayerInteractEvent, PlayerJoinEvent, PlayerMoveEvent, PlayerQuitEvent,
-    PluginAction, PluginManager,
+    BlockBreakEvent, BlockPlaceEvent, CommandSender, Event, PlayerChatEvent, PlayerCommandPreprocessEvent,
+    PlayerContext, PlayerDeathEvent, PlayerInteractEvent, PlayerJoinEvent, PlayerMoveEvent,
+    PlayerQuitEvent, PlayerRespawnEvent, PluginAction, PluginManager,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -40,7 +52,7 @@ use crate::inventory::{
 };
 use crate::plugin_host::PlayerRegistry;
 use crate::static_packets::StaticPackets;
-use crate::world_state::{WorldState, WORLD_MAX_Y, WORLD_MIN_Y};
+use crate::world_state::{BlockChange, WorldState, WORLD_MAX_Y, WORLD_MIN_Y};
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -57,17 +69,63 @@ pub enum SessionError {
     Disconnected,
 }
 
+/// Player eye height above the feet (Human::getOffsetPosition, 1.62 in InGamePacketHandler).
+pub const EYE_HEIGHT: f32 = 1.62;
+/// Entity metadata flags (bits of DATA_FLAGS long).
+pub const FLAG_SNEAKING: i64 = 1 << 1;
+pub const FLAG_SPRINTING: i64 = 1 << 3;
+pub const FLAG_GLIDING: i64 = 1 << 32;
+pub const FLAG_SWIMMING: i64 = 1 << 57;
+pub const FLAG_CAN_CLIMB: i64 = 1 << 19;
+pub const FLAG_HAS_COLLISION: i64 = 1 << 48;
+pub const FLAG_AFFECTED_BY_GRAVITY: i64 = 1 << 49;
+
+/// How long a session may sit in PreSpawn without `0x71` before the server
+/// forces `PLAYER_SPAWN` anyway (Bedrock 1.26 clients that only send
+/// `RequestChunkRadius` / `PlayerAuthInput`).
+pub const PRESPAWN_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `UpdateBlockPacket` id (Fase 2, Java -> Bedrock).
+///
+/// NOTE: this is `0x15` (21), *not* `0x0B`. `0x0B` is `StartGamePacket`
+/// (see `data/protocol_info.json`: `"UpdateBlockPacket": 21`,
+/// `"StartGamePacket": 11`); sending `0x0B` here would make the client
+/// try to parse a StartGame. The plan's "0x0B" label is that mix-up.
+pub const UPDATE_BLOCK_PACKET_ID: u32 = 0x15;
+/// Update flags for `UpdateBlockPacket`: neighbor updates + send to
+/// clients (`BLOCK_UPDATE_ALL` in PocketMine).
+pub const UPDATE_BLOCK_FLAGS_ALL: u8 = 0x03;
+
+/// Ticks between periodic `SetTimePacket` broadcasts to Bedrock
+/// clients (20 ticks = 1 second at 20 TPS). Clients advance the sun
+/// locally between packets, so 1 Hz keeps them in lock-step with the
+/// server clock without a packet per tick; jumps (`/time set`) are
+/// broadcast immediately instead of waiting for this interval.
+pub const TIME_BROADCAST_INTERVAL_TICKS: i32 = 20;
+
+/// `UpdateBlockPacket` (0x15) wire bytes for one block.
+///
+/// Layout mirrors PocketMine's `UpdateBlockPacket` serializer:
+/// packet id (var_u32), `BlockPos` (var_i32 x/y/z), runtime block id
+/// (zigzag var_i32 — the same encoding the chunk palette uses for these
+/// FNV-1a hash ids, so `block_id as i32` round-trips the stored `u32`),
+/// flags (byte, [`UPDATE_BLOCK_FLAGS_ALL`]).
+pub fn update_block_wire(x: i32, y: i32, z: i32, block_id: u32) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.write_var_u32(UPDATE_BLOCK_PACKET_ID);
+    BlockPos::new(x, y, z).write(&mut writer);
+    writer.write_var_i32(block_id as i32);
+    writer.write_byte(UPDATE_BLOCK_FLAGS_ALL);
+    writer.into_bytes().to_vec()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// Connected, waiting for RequestNetworkSettings (0xC1) or Login (0x01)
     Connected,
-    /// Login received, waiting for ResourcePacksClientResponse (0x08)
     ResourcePacks,
-    /// Stack sent, waiting for final ResourcePacksClientResponse COMPLETED
     ResourcePackStack,
-    /// In world, spawned, chunks sent
+    PreSpawn,
     InGame,
-    /// Session closed
     Disconnected,
 }
 
@@ -89,6 +147,11 @@ pub enum OutgoingPacket {
     Text(TextPacket),
     SetTitle(SetTitlePacket),
     Transfer(TransferPacket),
+    AddPlayer(AddPlayerPacket),
+    PlayerList(PlayerListPacket),
+    SetActorData(SetActorDataPacket),
+    MoveActorAbsolute(MoveActorAbsolutePacket),
+    RemoveActor(RemoveActorPacket),
     RawWire(Vec<u8>),
 }
 
@@ -111,6 +174,11 @@ impl OutgoingPacket {
             Self::Text(p) => p.packet_id(),
             Self::SetTitle(p) => p.packet_id(),
             Self::Transfer(p) => p.packet_id(),
+            Self::AddPlayer(p) => p.packet_id(),
+            Self::PlayerList(p) => p.packet_id(),
+            Self::SetActorData(p) => p.packet_id(),
+            Self::MoveActorAbsolute(p) => p.packet_id(),
+            Self::RemoveActor(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
                 reader.read_var_u32().unwrap_or(0) & 0x3FF
@@ -136,6 +204,11 @@ impl OutgoingPacket {
             Self::Text(p) => p.encode(writer),
             Self::SetTitle(p) => p.encode(writer),
             Self::Transfer(p) => p.encode(writer),
+            Self::AddPlayer(p) => p.encode(writer),
+            Self::PlayerList(p) => p.encode(writer),
+            Self::SetActorData(p) => p.encode(writer),
+            Self::MoveActorAbsolute(p) => p.encode(writer),
+            Self::RemoveActor(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
                 Ok(())
@@ -181,6 +254,37 @@ pub struct PlayerSession {
     pub registry: Option<Arc<PlayerRegistry>>,
     /// Operators, used when building player snapshots.
     pub ops: Arc<RwLock<HashSet<String>>>,
+    /// Bedrock UUID used in AddPlayer / PlayerList.
+    pub uuid: [u8; 16],
+    /// PLAYER_SPAWN has been sent and doFirstSpawn completed.
+    pub spawned: bool,
+    /// When PreSpawn was entered (`pub` for tests); `None` once spawned.
+    pub prespawn_started_at: Option<std::time::Instant>,
+    /// A move happened and must be broadcast to viewers by the manager.
+    pub pending_move_broadcast: bool,
+    /// Entity flags changed and must be broadcast to viewers by the manager.
+    pub pending_data_broadcast: bool,
+    /// A first spawn happened and must be broadcast by the manager.
+    pub pending_spawn_broadcast: bool,
+    /// Sessions that have spawned this player (Entity::hasSpawned).
+    pub viewers: HashSet<u64>,
+    /// Players this session hides (Player::hiddenPlayers -> canSee).
+    pub hidden_players: HashSet<u64>,
+    /// Movement toggles driven by PlayerAuthInputFlags.
+    pub is_sneaking: bool,
+    pub is_sprinting: bool,
+    pub is_swimming: bool,
+    pub is_gliding: bool,
+    /// Last decoded PlayerAuthInput flag mask, for edge detection.
+    pub last_input_flags: u128,
+    /// Hunger (0..20) and saturation (0..20), HungerManager.
+    pub food: f32,
+    pub saturation: f32,
+    /// Experience level/progress, ExperienceManager.
+    pub xp_level: i32,
+    pub xp_progress: f32,
+    /// Breath ticks, Living::breathTicks (max 300).
+    pub air: i16,
     /// Actions emitted by plugins while handling the current packet.
     pub pending_actions: Vec<PluginAction>,
     /// Packets queued asynchronously (broadcasts, plugin actions).
@@ -212,6 +316,10 @@ pub struct PlayerSession {
     pub data_dir: Option<std::path::PathBuf>,
     /// A saved position was loaded and must not be replaced by the generator.
     pub has_saved_data: bool,
+    /// `Player::getFirstPlayed()` (0.0 = never played, loaded from JSON v2).
+    pub first_played: f64,
+    /// `Player::getLastPlayed()` (0.0 = never played, loaded from JSON v2).
+    pub last_played: f64,
     /// Tick sampler, shared with the server tick loop (`/tps`).
     pub metrics: Option<Arc<crate::metrics::TickMetrics>>,
     /// Permission registry and this player's attachments.
@@ -273,6 +381,24 @@ impl PlayerSession {
             plugins: None,
             registry: None,
             ops: Arc::new(RwLock::new(HashSet::new())),
+            uuid: derive_uuid_for_session(session_id, &format!("Player_{}", session_id)),
+            spawned: false,
+            prespawn_started_at: None,
+            pending_move_broadcast: false,
+            pending_data_broadcast: false,
+            pending_spawn_broadcast: false,
+            viewers: HashSet::new(),
+            hidden_players: HashSet::new(),
+            is_sneaking: false,
+            is_sprinting: false,
+            is_swimming: false,
+            is_gliding: false,
+            last_input_flags: 0,
+            food: 20.0,
+            saturation: 20.0,
+            xp_level: 0,
+            xp_progress: 0.0,
+            air: 300,
             pending_actions: Vec::new(),
             pending_outgoing: Vec::new(),
             pending_broadcasts: Vec::new(),
@@ -289,6 +415,8 @@ impl PlayerSession {
             access: Arc::new(crate::access::AccessList::new()),
             data_dir: None,
             has_saved_data: false,
+            first_played: 0.0,
+            last_played: 0.0,
             metrics: None,
             permissions: None,
         }
@@ -332,10 +460,28 @@ impl PlayerSession {
         )
     }
 
-    /// Writes position, rotation, gamemode, health and spawn point.
+    /// `Player::hasPlayedBefore(): bool`: data existed before this session
+    /// (`has_saved_data` from load) or `last_played` exceeds `first_played`
+    /// by more than 1ms (axolotl threshold).
+    pub fn has_played_before(&self) -> bool {
+        self.has_saved_data
+            || (self.first_played > 0.0 && self.last_played > self.first_played + 0.001)
+    }
+
+    /// Epoch seconds with sub-second precision (`microtime(true)` in PHP).
+    pub fn now_played_secs() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Writes JSON v2 (26 campos) directly to `players/<name>.json`.
     ///
     /// PocketMine uses `players/<name>.dat` (NBT); JSON keeps the same data
-    /// without an NBT serializer.
+    /// without an NBT serializer. `y` is canonical Bedrock world Y (never
+    /// legacy `y+64`). Virtual (Java) saves write this exact object to the
+    /// same path via `player.save` — no staging file.
     pub fn save_player_data(&self) -> std::io::Result<()> {
         let Some(path) = self.player_data_path() else {
             return Ok(());
@@ -343,23 +489,34 @@ impl PlayerSession {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let value = serde_json::json!({
-            "name": self.username,
-            "x": self.position.x as f64,
-            "y": self.position.y as f64,
-            "z": self.position.z as f64,
-            "yaw": self.yaw,
-            "pitch": self.pitch,
-            "gamemode": self.gamemode,
-            "health": self.health,
-            "spawn_point": self.spawn_point.map(|(x, y, z)| vec![x, y, z]),
-        });
+        let now = Self::now_played_secs();
+        // Preserve previously saved first/last when this session never
+        // loaded them (e.g. autosave before login finished).
+        let existing_first_last = if self.first_played <= 0.0 {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        } else {
+            None
+        };
+        let first_played = if self.first_played > 0.0 {
+            self.first_played
+        } else if let Some(existing) = existing_first_last.as_ref() {
+            existing.get("first_played").and_then(|entry| entry.as_f64()).filter(|v| *v > 0.0).unwrap_or(now)
+        } else {
+            now
+        };
+        let mut snapshot = self.player_context();
+        snapshot.first_played = first_played;
+        snapshot.last_played = now;
+        let value = snapshot.to_save_json();
         let bytes = serde_json::to_vec(&value)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
         std::fs::write(path, bytes)
     }
 
     /// Restores a snapshot written by [`PlayerSession::save_player_data`].
+    /// Old files (8-field v1) load with defaults for the new fields.
     pub fn load_player_data(&mut self) -> bool {
         let Some(path) = self.player_data_path() else {
             return false;
@@ -371,6 +528,12 @@ impl PlayerSession {
             return false;
         };
         let number = |key: &str| value.get(key).and_then(|entry| entry.as_f64());
+        let first_number = |keys: &[&str]| keys.iter().filter_map(|key| number(key)).next();
+        let first_bool = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|key| value.get(*key).and_then(|entry| entry.as_bool()))
+                .next()
+        };
 
         if let (Some(x), Some(y), Some(z)) = (number("x"), number("y"), number("z")) {
             self.position = Vector3f::new(x as f32, y as f32, z as f32);
@@ -388,7 +551,59 @@ impl PlayerSession {
         if let Some(health) = number("health") {
             self.health = health as f32;
         }
-        if let Some(point) = value.get("spawn_point").and_then(|entry| entry.as_array()) {
+        if let Some(max_health) = first_number(&["max_health", "maxHealth"]) {
+            self.max_health = max_health.max(1.0) as f32;
+        }
+        if let Some(food) = number("food") {
+            self.food = food as f32;
+        }
+        if let Some(saturation) = number("saturation") {
+            self.saturation = saturation as f32;
+        }
+        if let Some(xp) = number("xp") {
+            self.xp_progress = xp as f32;
+        }
+        if let Some(level) = value
+            .get("xp_level")
+            .or_else(|| value.get("xpLevel"))
+            .and_then(|entry| entry.as_i64())
+        {
+            self.xp_level = level as i32;
+        }
+        if let Some(air) = value.get("air").and_then(|entry| entry.as_i64()) {
+            self.air = air as i16;
+        }
+        if let Some(flying) = first_bool(&["flying", "is_flying", "isFlying"]) {
+            self.is_flying = flying;
+        }
+        if let Some(v) = first_bool(&["sneaking", "is_sneaking", "isSneaking"]) {
+            self.is_sneaking = v;
+        }
+        if let Some(v) = first_bool(&["sprinting", "is_sprinting", "isSprinting"]) {
+            self.is_sprinting = v;
+        }
+        if let Some(v) = first_bool(&["swimming", "is_swimming", "isSwimming"]) {
+            self.is_swimming = v;
+        }
+        if let Some(v) = first_bool(&["gliding", "is_gliding", "isGliding"]) {
+            self.is_gliding = v;
+        }
+        if let Some(xuid) = value.get("xuid").and_then(|entry| entry.as_str()) {
+            if !xuid.is_empty() {
+                self.xuid = xuid.to_string();
+            }
+        }
+        if let Some(first) = first_number(&["first_played", "firstPlayed"]) {
+            self.first_played = first;
+        }
+        if let Some(last) = first_number(&["last_played", "lastPlayed"]) {
+            self.last_played = last;
+        }
+        if let Some(point) = value
+            .get("spawn_point")
+            .or_else(|| value.get("spawnPoint"))
+            .and_then(|entry| entry.as_array())
+        {
             let coords: Vec<f64> = point
                 .iter()
                 .filter_map(|entry| entry.as_f64())
@@ -423,6 +638,21 @@ impl PlayerSession {
             health: self.health,
             max_health: self.max_health,
             is_op: self.is_op(),
+            is_virtual: false,
+            xuid: self.xuid.clone(),
+            first_played: self.first_played,
+            last_played: self.last_played,
+            food: self.food,
+            saturation: self.saturation,
+            xp: self.xp_progress,
+            xp_level: self.xp_level,
+            air: self.air,
+            is_flying: self.is_flying,
+            spawn_point: self.spawn_point.map(|(x, y, z)| [x, y, z]),
+            is_sneaking: self.is_sneaking,
+            is_sprinting: self.is_sprinting,
+            is_swimming: self.is_swimming,
+            is_gliding: self.is_gliding,
         }
     }
 
@@ -525,10 +755,19 @@ impl PlayerSession {
         // position until the client confirms the server's position.
         // Matches PocketMine's forceMoveSync.
         self.force_move_sync = true;
+        // Viewers must see the same teleport as a MoveActorAbsolute.
+        self.pending_move_broadcast = true;
     }
 
     fn register_self(&self) {
         if let Some(registry) = &self.registry {
+            // A virtual player already owns this name: do not downgrade the
+            // entry to Bedrock (keeps /list counting it exactly once).
+            if let Some(existing) = registry.get(&self.username) {
+                if existing.is_virtual {
+                    return;
+                }
+            }
             registry.upsert(self.player_context());
         }
     }
@@ -551,7 +790,103 @@ impl PlayerSession {
     }
 
     pub fn is_in_game(&self) -> bool {
-        self.state == SessionState::InGame
+        self.state == SessionState::InGame || self.state == SessionState::PreSpawn
+    }
+
+    pub fn is_spawned(&self) -> bool {
+        self.spawned
+    }
+
+    /// Time since PreSpawn was entered, when still waiting for `0x71`.
+    pub fn prespawn_elapsed(&self) -> Option<std::time::Duration> {
+        self.prespawn_started_at.map(|t| t.elapsed())
+    }
+
+    /// True when this session is stuck in PreSpawn past `threshold` without
+    /// `0x71` and must be force-spawned (chunk-radius / input / timeout fallback).
+    pub fn is_prespawn_timed_out(&self, threshold: std::time::Duration) -> bool {
+        self.state == SessionState::PreSpawn
+            && !self.spawned
+            && self
+                .prespawn_started_at
+                .map(|t| t.elapsed() >= threshold)
+                .unwrap_or(false)
+    }
+
+    pub fn feet_position(&self) -> Vector3f {
+        self.position
+    }
+
+    pub fn eye_position(&self) -> Vector3f {
+        Vector3f::new(self.position.x, self.position.y + EYE_HEIGHT, self.position.z)
+    }
+
+    pub fn can_see(&self, other_session_id: u64) -> bool {
+        !self.hidden_players.contains(&other_session_id)
+    }
+
+    pub fn hide_player(&mut self, other_session_id: u64) -> bool {
+        self.hidden_players.insert(other_session_id)
+    }
+
+    pub fn show_player(&mut self, other_session_id: u64) -> bool {
+        self.hidden_players.remove(&other_session_id)
+    }
+
+    pub fn data_flags(&self) -> i64 {
+        let mut flags: i64 = FLAG_HAS_COLLISION | FLAG_AFFECTED_BY_GRAVITY | FLAG_CAN_CLIMB;
+        if self.is_sneaking {
+            flags |= FLAG_SNEAKING;
+        }
+        if self.is_sprinting {
+            flags |= FLAG_SPRINTING;
+        }
+        if self.is_swimming {
+            flags |= FLAG_SWIMMING;
+        }
+        if self.is_gliding {
+            flags |= FLAG_GLIDING;
+        }
+        flags
+    }
+
+    pub fn add_player_packet(&self) -> AddPlayerPacket {
+        let metadata = vec![
+            MetadataEntry::new(0, MetadataValue::Long(self.data_flags())),
+            MetadataEntry::new(4, MetadataValue::String(self.username.clone())),
+            MetadataEntry::new(7, MetadataValue::Short(self.air)),
+            MetadataEntry::new(42, MetadataValue::Short(self.air)),
+            MetadataEntry::new(38, MetadataValue::Float(1.0)),
+            MetadataEntry::new(53, MetadataValue::Float(0.6)),
+            MetadataEntry::new(54, MetadataValue::Float(1.8)),
+        ];
+        AddPlayerPacket::new(
+            self.uuid,
+            self.username.clone(),
+            self.entity_runtime_id,
+            self.feet_position(),
+            self.pitch,
+            self.yaw,
+            self.yaw,
+            self.inventory.held_item(),
+            self.gamemode,
+            metadata,
+            bedrock_protocol::AbilitiesData::visitor(self.entity_unique_id),
+        )
+    }
+
+    pub fn skin_data(&self) -> SkinData {
+        SkinData::default_for(&self.uuid)
+    }
+
+    pub fn player_list_addition(&self) -> PlayerListEntry {
+        PlayerListEntry::addition(
+            self.uuid,
+            self.entity_unique_id,
+            self.username.clone(),
+            self.skin_data(),
+            self.xuid.clone(),
+        )
     }
 
     pub fn is_disconnected(&self) -> bool {
@@ -593,6 +928,11 @@ impl PlayerSession {
                 let mut reader = Reader::new(payload);
                 let packet = PlayerAuthInputPacket::decode(&mut reader)?;
                 self.handle_player_auth_input(packet)
+            }
+            0x71 => {
+                let mut reader = Reader::new(payload);
+                let _runtime_id = reader.read_var_u64().ok();
+                self.handle_set_local_player_as_initialized()
             }
             0x09 => {
                 let mut reader = Reader::new(payload);
@@ -714,9 +1054,18 @@ impl PlayerSession {
         } else {
             self.entity_unique_id = identity.unique_id();
         }
-        info!(
+        self.uuid = uuid_from_str(&identity.uuid)
+            .unwrap_or_else(|| derive_uuid_for_session(self.session_id, &self.username));
+        debug!(
             "Session {} login attempt with protocol version {} as '{}' (xuid: {})",
             self.session_id, self.protocol_version, self.username, self.xuid
+        );
+        // `NetworkSession`: the name is known after login.
+        info!(
+            "{}",
+            crate::translations::Translator::english()
+                .fill_named("pocketmine.network.session.playerName", &[("playerName", &format!("\u{a7}b{}\u{a7}r", self.username))])
+                .unwrap_or_else(|| format!("Player: {}", self.username))
         );
 
         // Transition state to ResourcePacks
@@ -749,7 +1098,7 @@ impl PlayerSession {
     ) -> Result<Vec<OutgoingPacket>, SessionError> {
         match packet.response_status {
             0 => {
-                info!("Session {} refused resource packs; disconnecting.", self.session_id);
+                debug!("Session {} refused resource packs; disconnecting.", self.session_id);
                 self.state = SessionState::Disconnected;
                 Ok(vec![OutgoingPacket::Disconnect(DisconnectPacket {
                     reason: 0,
@@ -771,12 +1120,14 @@ impl PlayerSession {
                     experiments_previously_enabled: false,
                     has_editor_packs: false,
                 };
-                info!("Session {} accepted packs, sending ResourcePackStack", self.session_id);
+                debug!("Session {} accepted packs, sending ResourcePackStack", self.session_id);
                 Ok(vec![OutgoingPacket::ResourcePackStack(stack)])
             }
             3 | 4 if self.state == SessionState::ResourcePackStack || self.state == SessionState::ResourcePacks => {
-                self.state = SessionState::InGame;
-                info!("Session {} entered world (InGame) - sending pre-spawn declaration and world packets", self.session_id);
+                self.state = SessionState::PreSpawn;
+                self.spawned = false;
+                self.prespawn_started_at = Some(std::time::Instant::now());
+                debug!("Session {} entered world (InGame) - sending pre-spawn declaration and world packets", self.session_id);
 
                 let mut out = Vec::new();
 
@@ -795,15 +1146,21 @@ impl PlayerSession {
                     let (px, py, pz) = self.generator.player_position();
                     self.position = Vector3f::new(px, py, pz);
                 }
-                start_game.player_position = self.position;
-                start_game.level_settings.seed = 12345678;
-                let (sx, sy, sz) = self.world.spawn();
+                start_game.player_position = self.eye_position();
+                start_game.level_settings.seed = self.world.seed();
+                // Per-player spawn (`/spawnpoint`) wins over the world spawn,
+                // like `Player::getSpawn()` vs `World::getSpawnLocation()`.
+                let (sx, sy, sz) = match self.spawn_point {
+                    Some((x, y, z)) => (x.floor() as i32, y.floor() as i32, z.floor() as i32),
+                    None => self.world.spawn(),
+                };
                 start_game.level_settings.spawn_position = BlockPos::new(sx, sy, sz);
                 start_game.level_settings.generator_type = self.generator.generator_type();
                 start_game.level_settings.world_gamemode = self.gamemode;
-                start_game.level_settings.difficulty = 1;
+                start_game.level_settings.difficulty = self.world.difficulty();
+                start_game.level_settings.time = self.world.time();
                 start_game.level_settings.dimension = 0;
-                start_game.world_name = "PocketMine-Rust World".to_string();
+                start_game.world_name = "Axolotl-PM World".to_string();
                 out.push(OutgoingPacket::StartGame(start_game));
 
                 // 4. ItemRegistryPacket (0xA2 / 162) - Dynamic session item dictionary
@@ -824,9 +1181,9 @@ impl PlayerSession {
                 // 8b. SetHealthPacket (0x2A) and the 36-slot inventory, so the
                 // HUD and the item bar start from the server state.
                 out.push(OutgoingPacket::RawWire(set_health_wire(self.health)));
-                out.push(OutgoingPacket::RawWire(inventory_content_wire(
-                    &self.inventory.contents(),
-                )));
+                for window_wire in self.inventory_window_wires() {
+                    out.push(OutgoingPacket::RawWire(window_wire));
+                }
 
                 // 9. SetActorDataPacket (0x27 / 39) - Collision, gravity, scale, air=300
                 out.push(OutgoingPacket::RawWire(self.create_set_actor_data_packet()));
@@ -844,8 +1201,11 @@ impl PlayerSession {
                 // native commands so the client lists and autocompletes them.
                 out.push(OutgoingPacket::RawWire(available_commands_wire()));
 
-                // 10d. SetDifficultyPacket (0x3C / 60)
-                out.push(OutgoingPacket::RawWire(StaticPackets::SET_DIFFICULTY.to_vec()));
+                // 10d. SetDifficultyPacket (0x3C / 60): live value, not the
+                // captured static (easy) snapshot.
+                out.push(OutgoingPacket::RawWire(set_difficulty_wire(
+                    self.world.difficulty() as u32,
+                )));
 
                 // 10e. GameRulesChangedPacket (0x48 / 72)
                 out.push(OutgoingPacket::RawWire(StaticPackets::GAME_RULES_CHANGED.to_vec()));
@@ -886,26 +1246,22 @@ impl PlayerSession {
                     }
                 }
 
-                // 14. Confirm spawn to client (PLAYER_SPAWN = 3)
-                let play_status = PlayStatusPacket {
-                    status: PlayStatusPacket::PLAYER_SPAWN,
-                };
-                out.push(OutgoingPacket::PlayStatus(play_status));
+                // NOTE: PLAYER_SPAWN is intentionally NOT sent here. It is sent
+                // by handle_set_local_player_as_initialized once the client
+                // confirms it is initialized (0x71), or by the chunk-radius /
+                // auth-input / timeout fallback when `0x71` never arrives.
 
-                // 15. PlayerJoinEvent (fires plugin listeners once the client is
-                // actually in the world and can receive messages).
-                if !self.joined {
-                    self.joined = true;
-                    self.register_self();
-                    let mut event = PlayerJoinEvent::new(
-                        self.player_context(),
-                        format!("{} joined the game", self.username),
-                    );
-                    self.fire_event(&mut event);
-                    if !event.join_message.is_empty() {
-                        self.pending_broadcasts.push(event.join_message);
-                    }
-                }
+                // Visible at default log level so a silent login (StartGame
+                // queued but never acknowledged) is distinguishable from a
+                // malformed StartGame the client dropped.
+                info!(
+                    "Session {} sent StartGame (unique={}, runtime={}, gamemode={}) and entered PreSpawn (awaiting 0x71; chunk-radius/input and {:?} timeout will force spawn)",
+                    self.session_id,
+                    self.entity_unique_id,
+                    self.entity_runtime_id,
+                    self.gamemode,
+                    PRESPAWN_SPAWN_TIMEOUT,
+                );
 
                 Ok(out)
             }
@@ -916,21 +1272,115 @@ impl PlayerSession {
         }
     }
 
+    /// NetworkSession::onEnterWorld: syncs Time / Difficulty / Spawn.
+    fn on_enter_world_packets(&self) -> Vec<OutgoingPacket> {
+        let (sx, sy, sz) = self.world.spawn();
+        vec![
+            OutgoingPacket::RawWire(set_time_wire(self.world.time())),
+            OutgoingPacket::RawWire(set_difficulty_wire(self.world.difficulty() as u32)),
+            OutgoingPacket::SetSpawnPosition(SetSpawnPositionPacket::new_player_spawn(
+                BlockPos::new(sx, sy, sz),
+                0,
+            )),
+        ]
+    }
+
+    /// Player::doFirstSpawn equivalent: sends PLAYER_SPAWN, enters the
+    /// world and fires PlayerJoinEvent exactly once. Visibility
+    /// (spawnToAll) is performed by the manager after this returns.
+    pub fn handle_set_local_player_as_initialized(
+        &mut self,
+    ) -> Result<Vec<OutgoingPacket>, SessionError> {
+        if self.state != SessionState::PreSpawn && self.state != SessionState::InGame {
+            return Ok(Vec::new());
+        }
+        if self.spawned {
+            return Ok(Vec::new());
+        }
+        self.spawned = true;
+        self.prespawn_started_at = None;
+        self.state = SessionState::InGame;
+        self.pending_spawn_broadcast = true;
+        debug!(
+            "Session {} handle_set_local_player_as_initialized: PLAYER_SPAWN sent (InGame)",
+            self.session_id
+        );
+
+        let mut out = vec![OutgoingPacket::PlayStatus(PlayStatusPacket {
+            status: PlayStatusPacket::PLAYER_SPAWN,
+        })];
+
+        out.extend(self.on_enter_world_packets());
+
+        if !self.joined {
+            self.joined = true;
+            self.register_self();
+            let mut event = PlayerJoinEvent::new(
+                self.player_context(),
+                format!("{} joined the game", self.username),
+            );
+            self.fire_event(&mut event);
+            // `Server::addOnlinePlayer`: `pocketmine.player.logIn` (AQUA name).
+            {
+                let fmt_coord = |v: f64| -> String {
+                    let s = format!("{:.4}", v);
+                    let s = s.trim_end_matches('0').trim_end_matches('.');
+                    if s.is_empty() || s == "-0" { "0".to_string() } else { s.to_string() }
+                };
+                let name = format!("\u{a7}b{}\u{a7}r", self.username);
+                let ip = self.client_addr.ip().to_string();
+                let port = self.client_addr.port().to_string();
+                let id = self.entity_runtime_id.to_string();
+                let world = self.world.name.clone();
+                let x = fmt_coord(self.position.x as f64);
+                let y = fmt_coord(self.position.y as f64);
+                let z = fmt_coord(self.position.z as f64);
+                info!(
+                    "{}",
+                    crate::translations::Translator::english()
+                        .fill("pocketmine.player.logIn", &[&name, &ip, &port, &id, &world, &x, &y, &z])
+                        .unwrap_or_else(|| format!("{}[/{}:{}] logged in with entity id {} at ({}, {}, {}, {})", self.username, ip, port, id, world, x, y, z))
+                );
+            }
+            if !event.join_message.is_empty() {
+                self.pending_broadcasts.push(event.join_message);
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Handles RequestChunkRadiusPacket (0x45).
+    ///
+    /// Fallback: newer Bedrock clients send `RequestChunkRadius` right after
+    /// `StartGame` but never send `SetLocalPlayerAsInitialized` (`0x71`).
+    /// Waiting for `0x71` there left the session in PreSpawn forever
+    /// (no `PLAYER_SPAWN`, no `PlayerJoinEvent`, TestKit saw 0 online).
+    /// The first chunk-radius request therefore force-spawns, idempotently:
+    /// when `0x71` arrives later it is a no-op because `spawned` is set.
     pub fn handle_chunk_radius_request(
         &mut self,
         packet: RequestChunkRadiusPacket,
     ) -> Result<Vec<OutgoingPacket>, SessionError> {
-        if self.state != SessionState::InGame {
+        if !(self.state == SessionState::InGame || self.state == SessionState::PreSpawn) {
             return Err(SessionError::UnexpectedPacket {
                 state: self.state,
                 packet_id: 0x45,
             });
         }
 
+        let mut spawn_fallback: Vec<OutgoingPacket> = Vec::new();
+        if self.state == SessionState::PreSpawn && !self.spawned {
+            info!(
+                "Session {} RequestChunkRadius arrived before 0x71; forcing PLAYER_SPAWN fallback",
+                self.session_id
+            );
+            spawn_fallback = self.handle_set_local_player_as_initialized()?;
+        }
+
         let clamped_radius = packet.radius.clamp(4, self.max_view_distance);
         self.chunk_radius = clamped_radius;
-        tracing::info!(
+        debug!(
             "Session {} handle_chunk_radius_request: requested={}, clamped={}",
             self.session_id, packet.radius, clamped_radius
         );
@@ -943,12 +1393,11 @@ impl PlayerSession {
 
         let publisher_radius_blocks = (((clamped_radius as f64 * std::f64::consts::SQRT_2) + 2.0).ceil() as u32) * 16;
 
-        let mut out = vec![
-            OutgoingPacket::ChunkRadiusUpdated(ChunkRadiusUpdatedPacket::new(clamped_radius)),
-            OutgoingPacket::NetworkChunkPublisherUpdate(
-                NetworkChunkPublisherUpdatePacket::new(center_pos, publisher_radius_blocks),
-            ),
-        ];
+        let mut out = spawn_fallback;
+        out.push(OutgoingPacket::ChunkRadiusUpdated(ChunkRadiusUpdatedPacket::new(clamped_radius)));
+        out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
+            NetworkChunkPublisherUpdatePacket::new(center_pos, publisher_radius_blocks),
+        ));
 
         // Send all chunks in the square around player so all 360 degrees (North, South, East, West)
         // are 100% loaded immediately at spawn, avoiding directional starvation or blank horizons.
@@ -974,7 +1423,7 @@ impl PlayerSession {
         });
 
         let to_send = chunks_to_generate.len().min(MAX_CHUNKS_PER_RESPONSE);
-        tracing::info!(
+        debug!(
             "Session {} sending {} of {} pending chunks (radius={})",
             self.session_id, to_send, chunks_to_generate.len(), clamped_radius
         );
@@ -1016,25 +1465,75 @@ impl PlayerSession {
     }
 
     /// Handles PlayerAuthInputPacket (0x90).
+    /// Handles PlayerAuthInputPacket (0x90).
+    ///
+    /// Mirrors InGamePacketHandler::handlePlayerAuthInput:
+    /// - NaN/Inf in position/rotation is discarded,
+    /// - the client position is the eye (- 1.62 gives the feet),
+    /// - rotation is folded into [0, 360),
+    /// - sneak/sprint/swim/glide/fly toggles are edge-detected and flagged
+    ///   for a SetActorData broadcast by the manager.
     pub fn handle_player_auth_input(
         &mut self,
         packet: PlayerAuthInputPacket,
     ) -> Result<Vec<OutgoingPacket>, SessionError> {
-        if self.state != SessionState::InGame {
+        if !(self.state == SessionState::InGame || self.state == SessionState::PreSpawn) {
             return Ok(Vec::new());
         }
+        // Same `0x71`-missing fallback as `RequestChunkRadius`: a client that
+        // starts sending movement inputs has clearly received `StartGame`
+        // but will never confirm init, so spawn it now instead of dropping
+        // every input forever.
+        let mut spawn_fallback: Vec<OutgoingPacket> = Vec::new();
+        if self.state == SessionState::PreSpawn && !self.spawned {
+            info!(
+                "Session {} PlayerAuthInput arrived before 0x71; forcing PLAYER_SPAWN fallback",
+                self.session_id
+            );
+            spawn_fallback = self.handle_set_local_player_as_initialized()?;
+        }
+        for component in [
+            packet.position.x,
+            packet.position.y,
+            packet.position.z,
+            packet.pitch,
+            packet.yaw,
+            packet.head_yaw,
+            packet.move_vec_x,
+            packet.move_vec_z,
+        ] {
+            if !component.is_finite() {
+                return Ok(spawn_fallback);
+            }
+        }
+        let raw_eye = packet.position;
+        let raw_yaw = packet.yaw;
+        let raw_pitch = packet.pitch;
+        let mut yaw = raw_yaw % 360.0;
+        if yaw < 0.0 {
+            yaw += 360.0;
+        }
+        let mut pitch = raw_pitch % 360.0;
+        if pitch < 0.0 {
+            pitch += 360.0;
+        }
+        let new_feet = Vector3f::new(
+            (raw_eye.x * 10_000.0).round() / 10_000.0,
+            ((raw_eye.y - EYE_HEIGHT) * 10_000.0).round() / 10_000.0,
+            (raw_eye.z * 10_000.0).round() / 10_000.0,
+        );
 
         // If a teleport is pending (force_move_sync), ignore the client's
         // reported position until it matches the server's position. This
         // matches PocketMine's forceMoveSync and prevents desync after /tp.
         if self.force_move_sync {
-            let client_pos = packet.position;
-            let server_pos = self.position;
-            let dx = (client_pos.x - server_pos.x).abs();
-            let dy = (client_pos.y - server_pos.y).abs();
-            let dz = (client_pos.z - server_pos.z).abs();
-            // Client has confirmed the teleported position.
-            if dx < 0.5 && dy < 0.5 && dz < 0.5 {
+            let dx = new_feet.x - self.position.x;
+            let dy = new_feet.y - self.position.y;
+            let dz = new_feet.z - self.position.z;
+            let distance_sq = dx * dx + dy * dy + dz * dz;
+            // Client has confirmed the teleported position (PM tolerates 1
+            // block for client-side physics at spawn).
+            if distance_sq <= 1.0 {
                 self.force_move_sync = false;
                 // Fall through to normal handling with server position.
             } else {
@@ -1045,7 +1544,7 @@ impl PlayerSession {
                 // for a position it hasn't reached yet and disconnects.
                 let packet = self.create_move_player_packet(2, None, None);
                 self.pending_outgoing.push(OutgoingPacket::RawWire(packet));
-                return Ok(Vec::new());
+                return Ok(spawn_fallback);
             }
         }
 
@@ -1057,11 +1556,12 @@ impl PlayerSession {
             self.position.y as f64,
             self.position.z as f64,
         );
-        let to = (
-            packet.position.x as f64,
-            packet.position.y as f64,
-            packet.position.z as f64,
-        );
+        let to = (new_feet.x as f64, new_feet.y as f64, new_feet.z as f64);
+        let has_moved_for_move = (from.0 - to.0).abs() > 0.0001
+            || (from.1 - to.1).abs() > 0.0001
+            || (from.2 - to.2).abs() > 0.0001
+            || (self.yaw - yaw).abs() > 0.0001
+            || (self.pitch - pitch).abs() > 0.0001;
 
         // PlayerMoveEvent is only dispatched when a plugin actually listens to
         // it, and throttled to every other input to keep the IPC round-trips
@@ -1071,29 +1571,81 @@ impl PlayerSession {
             .as_ref()
             .map(|plugins| plugins.has_listeners("PlayerMoveEvent"))
             .unwrap_or(false)
-            && ((from.0 - to.0).abs() > 0.0001
-                || (from.1 - to.1).abs() > 0.0001
-                || (from.2 - to.2).abs() > 0.0001)
+            && has_moved_for_move
         {
             self.move_events = self.move_events.wrapping_add(1);
             if self.move_events % 2 == 0 {
                 let mut event = PlayerMoveEvent::new(self.player_context(), from, to);
                 self.fire_event(&mut event);
                 if event.cancelled {
-                    return Ok(Vec::new());
+                    return Ok(spawn_fallback);
                 }
             }
         }
 
-        // Only accept client position if teleport is not pending, or if the
-        // client has already confirmed the server's position (force_move_sync
-        // was cleared above). Otherwise keep the server's teleported position.
-        if !self.force_move_sync {
-            self.position = packet.position;
-            self.pitch = packet.pitch;
-            self.yaw = packet.yaw;
+        // Rotation is always accepted; position follows PM's
+        // if (!$this->forceMoveSync && $hasMoved).
+        let position_changed = !self.force_move_sync && has_moved_for_move;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        if position_changed {
+            self.position = new_feet;
+            self.pending_move_broadcast = true;
         }
         self.register_self();
+
+        // Movement toggles (PlayerAuthInputFlags -> Living flags).
+        let flags = parse_input_flags(&packet.input_data);
+        if flags != self.last_input_flags {
+            let mut data_changed = false;
+            if has_input_flag(flags, INPUT_FLAG_START_SNEAKING) && !self.is_sneaking {
+                self.is_sneaking = true;
+                data_changed = true;
+            } else if has_input_flag(flags, INPUT_FLAG_STOP_SNEAKING) && self.is_sneaking {
+                self.is_sneaking = false;
+                data_changed = true;
+            }
+            if has_input_flag(flags, INPUT_FLAG_START_SPRINTING) && !self.is_sprinting {
+                self.is_sprinting = true;
+                data_changed = true;
+            } else if has_input_flag(flags, INPUT_FLAG_STOP_SPRINTING) && self.is_sprinting {
+                self.is_sprinting = false;
+                data_changed = true;
+            }
+            if has_input_flag(flags, INPUT_FLAG_START_SWIMMING) && !self.is_swimming {
+                self.is_swimming = true;
+                data_changed = true;
+            } else if has_input_flag(flags, INPUT_FLAG_STOP_SWIMMING) && self.is_swimming {
+                self.is_swimming = false;
+                data_changed = true;
+            }
+            if has_input_flag(flags, INPUT_FLAG_START_GLIDING) && !self.is_gliding {
+                self.is_gliding = true;
+                data_changed = true;
+            } else if has_input_flag(flags, INPUT_FLAG_STOP_GLIDING) && self.is_gliding {
+                self.is_gliding = false;
+                data_changed = true;
+            }
+            if has_input_flag(flags, INPUT_FLAG_START_FLYING) {
+                if self.gamemode == 1 && !self.is_flying {
+                    self.is_flying = true;
+                    self.pending_outgoing
+                        .push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
+                }
+            } else if has_input_flag(flags, INPUT_FLAG_STOP_FLYING) {
+                if self.is_flying {
+                    self.is_flying = false;
+                    self.pending_outgoing
+                        .push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
+                }
+            }
+            let _ = has_input_flag(flags, INPUT_FLAG_START_JUMPING);
+            let _ = has_input_flag(flags, INPUT_FLAG_MISSED_SWING);
+            if data_changed {
+                self.pending_data_broadcast = true;
+            }
+            self.last_input_flags = flags;
+        }
 
         let radius = self.chunk_radius;
         let curr_cx = (self.position.x.floor() as i32) >> 4;
@@ -1110,7 +1662,7 @@ impl PlayerSession {
             });
         }
 
-        let mut out = Vec::new();
+        let mut out = spawn_fallback;
         let max_chunks_per_packet = 8;
 
         let mut chunks_to_generate = Vec::new();
@@ -1128,7 +1680,7 @@ impl PlayerSession {
         });
 
         if moved || !chunks_to_generate.is_empty() {
-            tracing::info!(
+            debug!(
                 "Session {} AuthInput: pos=({:.1}, {:.1}, {:.1}) chunk=({}, {}) old=({}, {}) radius={} chunks_to_gen={} sent_count={}",
                 self.session_id, packet.position.x, packet.position.y, packet.position.z,
                 curr_cx, curr_cz, old_cx, old_cz, radius,
@@ -1189,18 +1741,13 @@ impl PlayerSession {
         // Block break / interact actions ride in the input_data tail behind
         // the movement fields. Handling runs after chunk streaming so a
         // cancelled break can resend its chunk without it being regenerated
-        // above. Parsing is best-effort and never affects movement.
-        if self
-            .plugins
-            .as_ref()
-            .map(|plugins| {
-                plugins.has_listeners("BlockBreakEvent")
-                    || plugins.has_listeners("PlayerInteractEvent")
-            })
-            .unwrap_or(false)
-        {
-            self.handle_block_actions(&packet.input_data);
-        }
+        // above. Parsing is best-effort and never affects movement. It is
+        // NOT gated on plugin listeners: vanilla break/place must edit the
+        // world even when no plugin listens (Fase 1/2 sync Bedrock -> Java).
+        // `handle_block_actions` itself fires the cancellable events only
+        // when a plugin manager is installed (`fire_event` is a no-op
+        // otherwise) and queues the authoritative `SetBlock` either way.
+        self.handle_block_actions(&packet.input_data);
 
         Ok(out)
     }
@@ -1212,11 +1759,15 @@ impl PlayerSession {
     /// - `PREDICT_DESTROY_BLOCK` fires a cancellable `BlockBreakEvent` with
     ///   the current block id. When not cancelled the break is applied
     ///   authoritatively (air edit queued as a manager-level `SetBlock` so
-    ///   every viewer gets the chunk refresh); when cancelled the chunk is
+    ///   every viewer gets the change); when cancelled the chunk is
     ///   resent to this session to undo the client's prediction.
-    /// - `BlockPlaceEvent` is intentionally not fired here: placement
-    ///   travels in `InventoryTransactionPacket`, which this server does not
-    ///   decode yet.
+    ///   That `SetBlock` goes through `apply_actions` -> `world.set_block`,
+    ///   which is what enqueues the edit for Fase 1 (Java
+    ///   `world.take_block_changes`) and Fase 2 (`poll_block_changes`
+    ///   broadcasts the `UpdateBlockPacket` to chunk viewers).
+    /// - `BlockPlaceEvent` is NOT fired here: placement travels in
+    ///   `InventoryTransactionPacket` (`UseItem` CLICK_BLOCK) and is applied
+    ///   by [`Self::handle_use_item_place`], not by block actions.
     fn handle_block_actions(&mut self, input_data: &[u8]) {
         let actions = parse_block_actions(input_data);
         if actions.is_empty() {
@@ -1383,16 +1934,38 @@ impl PlayerSession {
         (self.position.x, self.position.y, self.position.z)
     }
 
-    /// Sends the current health to the client.
+    /// Sends health + full attributes to the client.
     pub fn sync_health(&mut self) {
         self.pending_outgoing
             .push(OutgoingPacket::RawWire(set_health_wire(self.health)));
+        self.pending_outgoing
+            .push(OutgoingPacket::RawWire(self.create_update_attributes_packet()));
     }
 
-    /// Sends the whole 36-slot inventory to the client.
+    /// Sends every inventory window (main, armor, offhand, cursor).
     pub fn sync_inventory(&mut self) {
-        let packet = inventory_content_wire(&self.inventory.contents());
-        self.pending_outgoing.push(OutgoingPacket::RawWire(packet));
+        for wire in self.inventory_window_wires() {
+            self.pending_outgoing.push(OutgoingPacket::RawWire(wire));
+        }
+    }
+
+    /// InventoryContentPacket wire bytes for every modelled window.
+    pub fn inventory_window_wires(&self) -> Vec<Vec<u8>> {
+        let mut wires = Vec::new();
+        for (window_id, items) in self.inventory.windows() {
+            let mut writer = Writer::new();
+            writer.write_var_u32(InventoryContentPacket::PACKET_ID);
+            InventoryContentPacket {
+                window_id,
+                items,
+                container_id: 0,
+                dynamic_container_id: None,
+                storage: ItemStack::empty(),
+            }
+            .encode_payload(&mut writer);
+            wires.push(writer.into_bytes().to_vec());
+        }
+        wires
     }
 
     /// Handles InventoryTransactionPacket (0x1E): applies the container actions
@@ -1449,7 +2022,97 @@ impl PlayerSession {
             }
         }
 
+        // Bedrock block placement (Fase 1/2 sync): a `UseItem` CLICK_BLOCK
+        // transaction places `item_in_hand.block_runtime_id` against the
+        // clicked block. Without this the Java bridge never saw Bedrock
+        // placements (only breaks via `PREDICT_DESTROY_BLOCK` arrived).
+        if let TransactionData::UseItem(use_item) = &packet.data {
+            self.handle_use_item_place(use_item);
+        }
+
         out
+    }
+
+    /// Authoritative Bedrock block placement from a `UseItem` transaction.
+    ///
+    /// Mirrors `handle_block_actions` for breaks and the Java bridge's
+    /// `placeBlock()`: the target cell is `block_position + face offset`
+    /// (0 abajo, 1 arriba, 2 norte, 3 sur, 4 oeste, 5 este), it must be
+    /// empty (air, like Java's `isEmpty` gate) and inside world Y bounds,
+    /// and the placed id is the held block's runtime id
+    /// (`item_in_hand.block_runtime_id`, the same FNV-1a hash `world.set_block`
+    /// accepts). `data.block_runtime_id` is the clicked block's own id
+    /// (prediction/validation), NOT the block to place.
+    ///
+    /// When a plugin listens to `BlockPlaceEvent`, the event is cancellable:
+    /// cancellation resends the affected `LevelChunk` to this session alone
+    /// so the client's predicted placement is undone. The edit itself is
+    /// queued as a `PluginAction::SetBlock` so the manager broadcasts the
+    /// `UpdateBlockPacket` (0x15) to chunk viewers (Fase 2) and the Java
+    /// queue is filled (Fase 1) exactly like a break.
+    fn handle_use_item_place(&mut self, use_item: &UseItemData) {
+        if use_item.action_type != ACTION_CLICK_BLOCK {
+            return;
+        }
+        let block_id = use_item.item_in_hand.block_runtime_id;
+        if block_id == 0 {
+            return;
+        }
+        let (bx, by, bz) = use_item.block_position;
+        let offset: (i32, i32, i32) = match use_item.face {
+            0 => (0, -1, 0),
+            1 => (0, 1, 0),
+            2 => (0, 0, -1),
+            3 => (0, 0, 1),
+            4 => (-1, 0, 0),
+            5 => (1, 0, 0),
+            _ => return,
+        };
+        let (x, y, z) = (bx + offset.0, by + offset.1, bz + offset.2);
+        if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
+            return;
+        }
+        // Only place into an empty cell, like `JavaServer::placeBlock()`.
+        if self.world.block_at(x, y, z) != AIR {
+            return;
+        }
+
+        // Cancellable plugin hook when a listener exists. `fire_event` is a
+        // no-op without a plugin manager, so vanilla placement also works
+        // with no plugins (unlike the old listener-gated break path).
+        let has_place_listeners = self
+            .plugins
+            .as_ref()
+            .map(|plugins| plugins.has_listeners("BlockPlaceEvent"))
+            .unwrap_or(false);
+        if has_place_listeners {
+            let mut event = BlockPlaceEvent::new(
+                self.player_context(),
+                self.world.name.clone(),
+                x,
+                y,
+                z,
+                block_id,
+            );
+            self.fire_event(&mut event);
+            if event.cancelled {
+                let chunk = (x >> 4, z >> 4);
+                if self.sent_chunks.remove(&chunk) {
+                    self.pending_outgoing.push(OutgoingPacket::LevelChunk(
+                        self.create_chunk_packet(chunk.0, chunk.1),
+                    ));
+                }
+                return;
+            }
+        }
+
+        self.pending_actions.push(PluginAction::SetBlock {
+            world: self.world.name.clone(),
+            x,
+            y,
+            z,
+            block_id,
+        });
     }
 
     /// Sends every modelled window so client and server agree again.
@@ -1480,6 +2143,24 @@ impl PlayerSession {
     /// Kills the player: health drops to zero, the death animation plays and
     /// the client is told to look for a spawn (0x2D state 0), like BDS does.
     pub fn kill_player(&mut self) {
+        // `PlayerDeathEvent` (simplified bridge payload: player + message).
+        // Only fired when a plugin listens, so death-message broadcasting
+        // stays opt-in (see EVENT_TRIGGERS.md).
+        if self
+            .plugins
+            .as_ref()
+            .map(|plugins| plugins.has_listeners("PlayerDeathEvent"))
+            .unwrap_or(false)
+        {
+            let mut event = PlayerDeathEvent::new(
+                self.player_context(),
+                format!("{} died", self.username),
+            );
+            self.fire_event(&mut event);
+            if !event.death_message.is_empty() {
+                self.pending_broadcasts.push(event.death_message);
+            }
+        }
         self.health = 0.0;
         self.is_dead = true;
 
@@ -1506,8 +2187,6 @@ impl PlayerSession {
         if !self.is_dead {
             return Vec::new();
         }
-        self.is_dead = false;
-        self.health = self.max_health;
 
         let (spawn_x, spawn_y, spawn_z) = match self.spawn_point {
             Some(position) => position,
@@ -1516,7 +2195,31 @@ impl PlayerSession {
                 (x as f64 + 0.5, y as f64, z as f64 + 0.5)
             }
         };
-        self.teleport(spawn_x, spawn_y, spawn_z, None, None);
+
+        // `PlayerRespawnEvent` (bridge: cancellable, position mutable). PM
+        // upstream is not cancellable; the bridge keeps the flag so plugins
+        // can veto the respawn. Fired only when a plugin listens.
+        if self
+            .plugins
+            .as_ref()
+            .map(|plugins| plugins.has_listeners("PlayerRespawnEvent"))
+            .unwrap_or(false)
+        {
+            let mut event =
+                PlayerRespawnEvent::new(self.player_context(), (spawn_x, spawn_y, spawn_z));
+            self.fire_event(&mut event);
+            if event.cancelled {
+                return Vec::new();
+            }
+            let (spawn_x, spawn_y, spawn_z) = event.position;
+            self.is_dead = false;
+            self.health = self.max_health;
+            self.teleport(spawn_x, spawn_y, spawn_z, None, None);
+        } else {
+            self.is_dead = false;
+            self.health = self.max_health;
+            self.teleport(spawn_x, spawn_y, spawn_z, None, None);
+        }
         self.register_self();
 
         let mut out = vec![
@@ -1546,8 +2249,8 @@ impl PlayerSession {
             OutgoingPacket::SetPlayerGameType(packet),
             OutgoingPacket::RawWire(self.create_update_abilities_packet()),
             OutgoingPacket::Text(TextPacket::raw(format!(
-                "§aModo de juego cambiado a {}",
-                if self.gamemode == 1 { "Creativo" } else { "Supervivencia" }
+                "§aGame mode changed to {}",
+                crate::command::gamemode_translatable(self.gamemode)
             ))),
         ];
         Ok(out)
@@ -1586,102 +2289,59 @@ impl PlayerSession {
         )
     }
 
-    /// Creates a SetActorDataPacket (0x27) setting collision, gravity, scale, and air supply.
+    /// Creates a SetActorDataPacket (0x27) - data flags (incl. sneak/sprint/
+    /// swim/glide), nametag, scale, bounding box and air.
     pub fn create_set_actor_data_packet(&self) -> Vec<u8> {
+        let packet = SetActorDataPacket::new(
+            self.entity_runtime_id,
+            vec![
+                MetadataEntry::new(0, MetadataValue::Long(self.data_flags())),
+                MetadataEntry::new(4, MetadataValue::String(self.username.clone())),
+                MetadataEntry::new(7, MetadataValue::Short(self.air)),
+                MetadataEntry::new(42, MetadataValue::Short(self.air)),
+                MetadataEntry::new(38, MetadataValue::Float(1.0)),
+                MetadataEntry::new(53, MetadataValue::Float(0.6)),
+                MetadataEntry::new(54, MetadataValue::Float(1.8)),
+            ],
+            bedrock_protocol::PropertySyncData::empty(),
+            0,
+        );
         let mut writer = Writer::new();
-        writer.write_var_u32(0x27); // SetActorData packet ID
-        writer.write_var_u64(self.entity_runtime_id);
-        // Metadata count: 6 entries
-        writer.write_var_u32(6);
-
-        // 1. FLAGS (0) -> type: long (7), legacy_type: 7
-        writer.write_var_u32(0);
-        writer.write_var_u32(7);
-        writer.write_byte(7);
-        // has_collision (bit 48) | affected_by_gravity (bit 49)
-        let flags: i64 = (1i64 << 48) | (1i64 << 49);
-        writer.write_var_i64(flags);
-
-        // 2. AIR (7) -> type: short (1), legacy_type: 1 -> 400
-        writer.write_var_u32(7);
-        writer.write_var_u32(1);
-        writer.write_byte(1);
-        writer.write_i16_le(400);
-
-        // 3. MAX_AIR (42) -> type: short (1), legacy_type: 1 -> 400
-        writer.write_var_u32(42);
-        writer.write_var_u32(1);
-        writer.write_byte(1);
-        writer.write_i16_le(400);
-
-        // 4. SCALE (38) -> type: float (3), legacy_type: 3 -> 1.0
-        writer.write_var_u32(38);
-        writer.write_var_u32(3);
-        writer.write_byte(3);
-        writer.write_f32_le(1.0);
-
-        // 5. BOUNDING_BOX_WIDTH (53) -> type: float (3), legacy_type: 3 -> 0.6
-        writer.write_var_u32(53);
-        writer.write_var_u32(3);
-        writer.write_byte(3);
-        writer.write_f32_le(0.6);
-
-        // 6. BOUNDING_BOX_HEIGHT (54) -> type: float (3), legacy_type: 3 -> 1.8
-        writer.write_var_u32(54);
-        writer.write_var_u32(3);
-        writer.write_byte(3);
-        writer.write_f32_le(1.8);
-
-        // EntityProperties (ints: 0, floats: 0)
-        writer.write_var_u32(0);
-        writer.write_var_u32(0);
-        // Tick: 0
-        writer.write_var_u64(0);
-
+        writer.write_var_u32(SetActorDataPacket::PACKET_ID);
+        packet.encode_payload(&mut writer);
         writer.into_bytes().to_vec()
     }
 
-    /// Creates an UpdateAttributesPacket (0x1D) setting player attributes (health, hunger, movement speed, etc.).
+    /// Creates an UpdateAttributesPacket (0x1D) with the player set: health,
+    /// hunger, saturation, movement, xp level and xp progress.
+    ///
+    /// Ranges mirror AttributeFactory (health/hunger/saturation 0..20,
+    /// xp level 0..24791, xp progress 0..1). There is no `minecraft:air`
+    /// attribute: BDS syncs breath via `SetActorData` metadata 7/42
+    /// (`create_set_actor_data_packet`), and sending an unknown attribute
+    /// id makes the client log `Cannot find attribute minecraft:air`.
     pub fn create_update_attributes_packet(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.write_var_u32(0x1d); // UpdateAttributes packet ID
+        writer.write_var_u32(0x1d);
         writer.write_var_u64(self.entity_runtime_id);
-        // 3 attributes: health, movement, player.hunger
-        writer.write_var_u32(3);
-
-        // 1. minecraft:health with the player's current value.
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(self.max_health);
-        writer.write_f32_le(self.health);
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(self.max_health);
-        writer.write_f32_le(self.max_health);
-        writer.write_string("minecraft:health");
-        writer.write_var_u32(0); // modifier count: 0
-
-        // 2. minecraft:movement (min: 0.0, max: f32::MAX, val: 0.1, def_min: 0.0, def_max: f32::MAX, def: 0.1)
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(f32::MAX);
-        writer.write_f32_le(0.1);
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(f32::MAX);
-        writer.write_f32_le(0.1);
-        writer.write_string("minecraft:movement");
-        writer.write_var_u32(0); // modifier count: 0
-
-        // 3. minecraft:player.hunger (min: 0.0, max: 20.0, val: 20.0, def_min: 0.0, def_max: 20.0, def: 20.0)
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(20.0);
-        writer.write_f32_le(20.0);
-        writer.write_f32_le(0.0);
-        writer.write_f32_le(20.0);
-        writer.write_f32_le(20.0);
-        writer.write_string("minecraft:player.hunger");
-        writer.write_var_u32(0); // modifier count: 0
-
-        // tick: 0
+        writer.write_var_u32(6);
+        let write_attr = |writer: &mut Writer, min: f32, max: f32, value: f32, def_min: f32, def_max: f32, def: f32, id: &str| {
+            writer.write_f32_le(min);
+            writer.write_f32_le(max);
+            writer.write_f32_le(value);
+            writer.write_f32_le(def_min);
+            writer.write_f32_le(def_max);
+            writer.write_f32_le(def);
+            writer.write_string(id);
+            writer.write_var_u32(0);
+        };
+        write_attr(&mut writer, 0.0, self.max_health, self.health, 0.0, self.max_health, self.max_health, "minecraft:health");
+        write_attr(&mut writer, 0.0, 20.0, self.food, 0.0, 20.0, 20.0, "minecraft:player.hunger");
+        write_attr(&mut writer, 0.0, 20.0, self.saturation, 0.0, 20.0, 20.0, "minecraft:player.saturation");
+        write_attr(&mut writer, 0.0, f32::MAX, 0.1, 0.0, f32::MAX, 0.1, "minecraft:movement");
+        write_attr(&mut writer, 0.0, 24791.0, self.xp_level as f32, 0.0, 24791.0, 0.0, "minecraft:player.level");
+        write_attr(&mut writer, 0.0, 1.0, self.xp_progress, 0.0, 1.0, 0.0, "minecraft:player.experience");
         writer.write_var_u64(0);
-
         writer.into_bytes().to_vec()
     }
 
@@ -1731,35 +2391,48 @@ impl PlayerSession {
         writer.into_bytes().to_vec()
     }
 
-    /// Builds a MovePlayerPacket (0x12) to teleport the local player.
+    /// Builds a MovePlayerPacket (0x13) to move/teleport the local player.
     ///
     /// Mode 2 is `Teleport`, which is accepted even when the client predicts a
     /// different position. If `yaw`/`pitch` are provided they override the
     /// session's current values, matching PocketMine's `/tp x y z yaw pitch`.
+    ///
+    /// The wire format comes from `MovePlayerPacket` in bedrock-protocol
+    /// (axolotl `MovePlayerPacket.php`, protocol 2225): header `0x13` — not
+    /// `0x12`, which is MoveActorAbsolute and made Bedrock clients disconnect
+    /// with `BinaryStream read() incomplete / packetId: 18` on `/tp` — then
+    /// actor VarUInt64, eye Vector3, pitch/yaw/headYaw f32, mode as a single
+    /// byte, onGround, riding VarUInt64, the optional telemetry bool plus
+    /// (for teleports) cause/source as u32 LE, and the tick VarUInt64.
+    /// The position is the eye position, matching PocketMine's
+    /// `Human::getOffsetPosition()` (+1.62) in `NetworkSession::syncMovement()`.
     pub fn create_move_player_packet(
         &self,
         mode: u32,
         yaw_override: Option<f32>,
         pitch_override: Option<f32>,
     ) -> Vec<u8> {
+        let yaw = yaw_override.unwrap_or(self.yaw);
+        let pitch = pitch_override.unwrap_or(self.pitch);
+        let packet = MovePlayerPacket::simple(
+            self.entity_runtime_id,
+            self.eye_position(),
+            pitch,
+            yaw,
+            yaw, // headYaw: PocketMine sends yaw here too (TODO upstream)
+            mode as u8,
+            true, // onGround: session has no ground tracking; a valid bool,
+            // not the cause of the /tp disconnect. Client physics resolves it.
+            0,    // ridingActorRuntimeId
+            0,    // tick (PocketMine also sends 0 here, TODO upstream)
+        );
         let mut writer = Writer::new();
-        writer.write_var_u32(0x12);
-        writer.write_var_u64(self.entity_runtime_id);
-        writer.write_f32_le(self.position.x);
-        writer.write_f32_le(self.position.y);
-        writer.write_f32_le(self.position.z);
-        writer.write_f32_le(pitch_override.unwrap_or(self.pitch));
-        writer.write_f32_le(yaw_override.unwrap_or(self.yaw));
-        writer.write_f32_le(yaw_override.unwrap_or(self.yaw));
-        writer.write_var_u32(mode);
-        writer.write_bool(true); // on_ground
-        writer.write_var_u64(0); // ridden_runtime_id
-        if mode == 2 {
-            // Teleport extras: cause, source entity type, tick.
-            writer.write_i32_le(0);
-            writer.write_var_u32(0);
-            writer.write_var_u64(0);
-        }
+        writer.write_var_u32(packet.packet_id());
+        // Encoding a MovePlayerPacket cannot fail: every field is a plain
+        // numeric/bool/vector write.
+        packet
+            .encode(&mut writer)
+            .expect("MovePlayerPacket encode is infallible");
         writer.into_bytes().to_vec()
     }
 
@@ -1790,6 +2463,128 @@ impl PlayerSession {
 }
 
 /// Thread-safe player session manager.
+/// Bedrock-visible view of a virtual (Java bridge) player.
+///
+/// Virtual players have no `PlayerSession`, so they are not in the sessions
+/// map that `spawn_to_locked` walks. This table keeps their Bedrock entity
+/// identity (deterministic UUID, allocated runtime/unique ids) plus the set
+/// of Bedrock viewers that already received `PlayerList` + `AddPlayer`, so
+/// [`SessionManager::sync_virtuals_locked`] can emit spawn / move / despawn
+/// packets for them exactly like Bedrock players.
+#[derive(Debug, Clone)]
+struct VirtualEntity {
+    name: String,
+    uuid: [u8; 16],
+    unique_id: i64,
+    runtime_id: u64,
+    /// Sessions that received `AddPlayerPacket` for this entity.
+    viewers: HashSet<u64>,
+    /// Sessions that received the `PlayerListPacket` addition for this entity.
+    listed_to: HashSet<u64>,
+    /// Feet position (`PlayerContext` stores feet, like Bedrock sessions).
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f64,
+    pitch: f64,
+    gamemode: i32,
+    /// Last position/rotation broadcast as `MoveActorAbsolutePacket`.
+    sent_x: f64,
+    sent_y: f64,
+    sent_z: f64,
+    sent_yaw: f64,
+    sent_pitch: f64,
+}
+
+impl VirtualEntity {
+    fn new(name: String, runtime_id: u64, snapshot: &PlayerContext) -> Self {
+        Self {
+            uuid: virtual_uuid_for(&name),
+            unique_id: runtime_id as i64,
+            runtime_id,
+            viewers: HashSet::new(),
+            listed_to: HashSet::new(),
+            name,
+            x: snapshot.x,
+            y: snapshot.y,
+            z: snapshot.z,
+            yaw: snapshot.yaw,
+            pitch: snapshot.pitch,
+            gamemode: snapshot.gamemode as i32,
+            sent_x: snapshot.x,
+            sent_y: snapshot.y,
+            sent_z: snapshot.z,
+            sent_yaw: snapshot.yaw,
+            sent_pitch: snapshot.pitch,
+        }
+    }
+
+    fn feet_position(&self) -> Vector3f {
+        Vector3f::new(self.x as f32, self.y as f32, self.z as f32)
+    }
+
+    fn eye_position(&self) -> Vector3f {
+        Vector3f::new(
+            self.x as f32,
+            self.y as f32 + EYE_HEIGHT,
+            self.z as f32,
+        )
+    }
+
+    /// Mirrors [`PlayerSession::add_player_packet`] for a virtual snapshot.
+    fn add_player_packet(&self) -> AddPlayerPacket {
+        let flags: i64 = FLAG_HAS_COLLISION | FLAG_AFFECTED_BY_GRAVITY | FLAG_CAN_CLIMB;
+        let metadata = vec![
+            MetadataEntry::new(0, MetadataValue::Long(flags)),
+            MetadataEntry::new(4, MetadataValue::String(self.name.clone())),
+            MetadataEntry::new(7, MetadataValue::Short(300)),
+            MetadataEntry::new(42, MetadataValue::Short(300)),
+            MetadataEntry::new(38, MetadataValue::Float(1.0)),
+            MetadataEntry::new(53, MetadataValue::Float(0.6)),
+            MetadataEntry::new(54, MetadataValue::Float(1.8)),
+        ];
+        AddPlayerPacket::new(
+            self.uuid,
+            self.name.clone(),
+            self.runtime_id,
+            self.feet_position(),
+            self.pitch as f32,
+            self.yaw as f32,
+            self.yaw as f32,
+            ItemStack::empty(),
+            self.gamemode,
+            metadata,
+            bedrock_protocol::AbilitiesData::visitor(self.unique_id),
+        )
+    }
+
+    fn player_list_addition(&self) -> PlayerListEntry {
+        PlayerListEntry::addition(
+            self.uuid,
+            self.unique_id,
+            self.name.clone(),
+            SkinData::default_for(&self.uuid),
+            String::new(),
+        )
+    }
+
+    fn moved_since_sent(&self) -> bool {
+        (self.x - self.sent_x).abs() > 0.0001
+            || (self.y - self.sent_y).abs() > 0.0001
+            || (self.z - self.sent_z).abs() > 0.0001
+            || (self.yaw - self.sent_yaw).abs() > 0.0001
+            || (self.pitch - self.sent_pitch).abs() > 0.0001
+    }
+
+    fn mark_sent(&mut self) {
+        self.sent_x = self.x;
+        self.sent_y = self.y;
+        self.sent_z = self.z;
+        self.sent_yaw = self.yaw;
+        self.sent_pitch = self.pitch;
+    }
+}
+
 pub struct SessionManager {
     sessions: RwLock<HashMap<u64, PlayerSession>>,
     next_session_id: AtomicU64,
@@ -1808,6 +2603,15 @@ pub struct SessionManager {
     data_dir: RwLock<Option<std::path::PathBuf>>,
     metrics: Arc<crate::metrics::TickMetrics>,
     permissions: Arc<crate::permission::PermissionManager>,
+    virtuals: RwLock<HashMap<String, VirtualEntity>>,
+    next_virtual_runtime: AtomicU64,
+    /// Ticks since the last periodic `SetTime` broadcast
+    /// (`tick_world_time`); reset on every broadcast.
+    time_tick_counter: std::sync::atomic::AtomicI32,
+    /// World time of the last `SetTime` broadcast, or -1 before the
+    /// first one. Used to spot jumps (`/time set`, plugin
+    /// `world.set_time`) that differ from normal +1/tick progression.
+    last_time_broadcast: std::sync::atomic::AtomicI32,
 }
 
 impl Default for SessionManager {
@@ -1853,6 +2657,12 @@ impl SessionManager {
             data_dir: RwLock::new(None),
             metrics: Arc::new(crate::metrics::TickMetrics::new()),
             permissions: Arc::new(crate::permission::PermissionManager::new()),
+            virtuals: RwLock::new(HashMap::new()),
+            // Bedrock runtime ids are session ids (small ints); keep virtual
+            // runtime ids in a disjoint range so packets never confuse them.
+            next_virtual_runtime: AtomicU64::new(10_000_000),
+            time_tick_counter: std::sync::atomic::AtomicI32::new(0),
+            last_time_broadcast: std::sync::atomic::AtomicI32::new(-1),
         }
     }
 
@@ -1900,6 +2710,12 @@ impl SessionManager {
     }
 
     fn new_session(&self, id: u64, addr: SocketAddr) -> PlayerSession {
+        // `NetworkSession::onSessionStart`: "Session opened".
+        info!(
+            "{}",
+            crate::translations::Translator::english()
+                .translate("pocketmine.network.session.open", &[])
+        );
         let mut session = PlayerSession::with_generator_and_gamemode(
             id,
             addr,
@@ -1972,18 +2788,51 @@ impl SessionManager {
     fn finalize_session(&self, session: &mut PlayerSession, reason: &str) -> Vec<PluginAction> {
         let _ = session.save_player_data();
         if let Some(registry) = &session.registry {
-            registry.remove(&session.username);
+            // Only drop the entry we own; a virtual player with the same
+            // name must survive a Bedrock disconnect.
+            registry.remove_if_bedrock(&session.username);
         }
 
-        if !session.joined {
+        if !session.joined && !session.spawned {
+            session.joined = false;
+            session.spawned = false;
+            self.forget_viewer(session.session_id);
+            // `NetworkSession::close`: "Session closed: {%reason}".
+            info!(
+                "{}",
+                crate::translations::Translator::english()
+                    .fill_named("pocketmine.network.session.close", &[("reason", reason)])
+                    .unwrap_or_else(|| format!("Session closed: {reason}"))
+            );
             return Vec::new();
         }
         session.joined = false;
+        session.spawned = false;
+
+        // Despawn the entity + player-list removal for every viewer
+        // (despawnFromAll + onPlayerRemoved).
+        let (uuid, unique_id, quitter_id, viewers) = (
+            session.uuid,
+            session.entity_unique_id,
+            session.session_id,
+            session.viewers.clone(),
+        );
+        session.viewers.clear();
+        self.broadcast_remove_actor_snapshot(uuid, unique_id, quitter_id, &viewers);
+        // The quitter no longer views virtual (Java) entities either.
+        self.forget_viewer(quitter_id);
 
         let mut event = PlayerQuitEvent::new(
             session.player_context(),
             format!("{} left the game", session.username),
             reason,
+        );
+        // `NetworkSession::close`: "Session closed: {%reason}".
+        info!(
+            "{}",
+            crate::translations::Translator::english()
+                .fill_named("pocketmine.network.session.close", &[("reason", reason)])
+                .unwrap_or_else(|| format!("Session closed: {reason}"))
         );
         let actions = session.fire_event(&mut event);
         if !event.quit_message.is_empty() {
@@ -2011,6 +2860,20 @@ impl SessionManager {
 
     fn queue_packet(&self, name: &str, packet: OutgoingPacket) {
         let Some(id) = self.session_id_for(name) else {
+            // Virtual players (Java bridge) have no Bedrock session: their
+            // chat lines wait in the registry inbox for `player.take_messages`.
+            if let OutgoingPacket::Text(text) = &packet {
+                let chat_like = matches!(
+                    text.text_type,
+                    TextPacket::TYPE_RAW
+                        | TextPacket::TYPE_CHAT
+                        | TextPacket::TYPE_SYSTEM
+                        | TextPacket::TYPE_WHISPER
+                );
+                if chat_like && self.registry.get(name).is_some() {
+                    self.registry.push_message(name, &text.message);
+                }
+            }
             return;
         };
         if let Some(session) = self.sessions.write().get_mut(&id) {
@@ -2020,10 +2883,26 @@ impl SessionManager {
 
     pub fn broadcast_text(&self, message: &str) {
         let packet = OutgoingPacket::Text(TextPacket::raw(message));
-        let mut map = self.sessions.write();
-        for session in map.values_mut() {
-            if session.joined {
-                session.pending_outgoing.push(packet.clone());
+        // Any live session (joined or not) means a Bedrock client will read
+        // the packet; only names without one are virtual players.
+        let live: HashSet<String> = {
+            let mut map = self.sessions.write();
+            let live = map
+                .values()
+                .map(|session| session.username.to_lowercase())
+                .collect();
+            for session in map.values_mut() {
+                if session.joined {
+                    session.pending_outgoing.push(packet.clone());
+                }
+            }
+            live
+        };
+        // Virtual players (Java bridge) have no session for the packet; their
+        // copy waits in the registry inbox instead.
+        for name in self.registry.names() {
+            if !live.contains(&name) {
+                self.registry.push_message(&name, message);
             }
         }
     }
@@ -2043,6 +2922,505 @@ impl SessionManager {
             return;
         }
         self.queue_packet(target, packet);
+    }
+
+    /// Entity::spawnTo: spawns target_id for viewer_id (idempotent).
+    fn spawn_to_locked(map: &mut HashMap<u64, PlayerSession>, viewer_id: u64, target_id: u64) -> bool {
+        if viewer_id == target_id {
+            return false;
+        }
+        let (viewer_spawned, target_spawned, viewer_dead, target_dead, can_see, already) = {
+            let Some(viewer) = map.get(&viewer_id) else {
+                return false;
+            };
+            let Some(target) = map.get(&target_id) else {
+                return false;
+            };
+            (
+                viewer.spawned && viewer.joined,
+                target.spawned && target.joined,
+                viewer.is_dead,
+                target.is_dead,
+                viewer.can_see(target_id),
+                target.viewers.contains(&viewer_id),
+            )
+        };
+        if !viewer_spawned || !target_spawned || viewer_dead || target_dead || !can_see || already {
+            return false;
+        }
+        let add_packet = {
+            let target = map.get(&target_id).expect("checked above");
+            target.add_player_packet()
+        };
+        if let Some(target) = map.get_mut(&target_id) {
+            target.viewers.insert(viewer_id);
+        }
+        if let Some(viewer) = map.get_mut(&viewer_id) {
+            viewer
+                .pending_outgoing
+                .push(OutgoingPacket::AddPlayer(add_packet));
+        }
+        true
+    }
+
+    /// Entity::despawnFrom: despawns target_id for viewer_id (idempotent).
+    fn despawn_from_locked(
+        map: &mut HashMap<u64, PlayerSession>,
+        viewer_id: u64,
+        target_id: u64,
+    ) -> bool {
+        if viewer_id == target_id {
+            return false;
+        }
+        let unique_id = {
+            let Some(target) = map.get(&target_id) else {
+                return false;
+            };
+            if !target.viewers.contains(&viewer_id) {
+                return false;
+            }
+            target.entity_unique_id
+        };
+        if let Some(target) = map.get_mut(&target_id) {
+            target.viewers.remove(&viewer_id);
+        }
+        if let Some(viewer) = map.get_mut(&viewer_id) {
+            viewer
+                .pending_outgoing
+                .push(OutgoingPacket::RemoveActor(RemoveActorPacket::new(unique_id)));
+        }
+        true
+    }
+
+    fn broadcast_add_player_locked(&self, map: &mut HashMap<u64, PlayerSession>, player_id: u64) {
+        let others: Vec<u64> = map
+            .values()
+            .filter(|s| s.session_id != player_id && s.joined && s.spawned)
+            .map(|s| s.session_id)
+            .collect();
+        let addition = {
+            let Some(target) = map.get(&player_id) else {
+                return;
+            };
+            target.player_list_addition()
+        };
+        let other_entries: Vec<PlayerListEntry> = others
+            .iter()
+            .filter_map(|id| map.get(id).map(|s| s.player_list_addition()))
+            .collect();
+        if let Some(newbie) = map.get_mut(&player_id) {
+            if !other_entries.is_empty() {
+                let packet = PlayerListPacket::with_additions(other_entries);
+                newbie.pending_outgoing.push(OutgoingPacket::PlayerList(packet));
+            }
+        }
+        for other_id in &others {
+            if let Some(viewer) = map.get_mut(other_id) {
+                let packet = PlayerListPacket::addition(addition.clone());
+                viewer.pending_outgoing.push(OutgoingPacket::PlayerList(packet));
+            }
+        }
+        for other_id in others {
+            Self::spawn_to_locked(map, other_id, player_id);
+            Self::spawn_to_locked(map, player_id, other_id);
+        }
+        // Virtual (Java bridge) players have no session, so the loop above
+        // never spots them: sync them here so a Bedrock newbie immediately
+        // sees every Java body (spawn + player-list) and the other Bedrock
+        // viewers learn about any Java player that registered earlier.
+        self.sync_virtuals_locked(map);
+    }
+
+    /// Reconciles Bedrock visibility of virtual (Java bridge) players.
+    ///
+    /// The shared registry is the source of truth: every virtual snapshot
+    /// (`is_virtual`) becomes a Bedrock entity for every live Bedrock viewer
+    /// (spawned + joined + not dead, same gate as [`Self::spawn_to_locked`]).
+    /// New snapshots emit `PlayerListPacket` addition + `AddPlayerPacket`
+    /// (feet position, like `PlayerSession::add_player_packet`), position
+    /// changes emit `MoveActorAbsolutePacket` (eye position), and vanished
+    /// snapshots emit `RemoveActorPacket` + `PlayerListPacket` removal
+    /// (`player.unregister`).
+    ///
+    /// Snapshots whose name is owned by a live Bedrock session are skipped
+    /// so one name never renders twice. Returns how many packets were
+    /// queued. Caller must hold the sessions write lock.
+    fn sync_virtuals_locked(&self, map: &mut HashMap<u64, PlayerSession>) -> usize {
+        let snapshots = self.registry.all();
+        let bedrock_names: HashSet<String> = map
+            .values()
+            .map(|s| s.username.to_lowercase())
+            .collect();
+        let mut current: HashMap<String, PlayerContext> = HashMap::new();
+        for snapshot in snapshots {
+            if !snapshot.is_virtual || snapshot.name.is_empty() {
+                continue;
+            }
+            let lower = snapshot.name.to_lowercase();
+            if bedrock_names.contains(&lower) {
+                continue;
+            }
+            current.insert(lower, snapshot);
+        }
+
+        let mut queued = 0usize;
+        let mut virtuals = self.virtuals.write();
+
+        // Despawn: virtuals that left the registry (`player.unregister`).
+        let removed: Vec<String> = virtuals
+            .keys()
+            .filter(|key| !current.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in removed {
+            if let Some(entity) = virtuals.remove(&key) {
+                let recipients: HashSet<u64> = entity
+                    .listed_to
+                    .union(&entity.viewers)
+                    .copied()
+                    .collect();
+                for viewer_id in recipients {
+                    if let Some(viewer) = map.get_mut(&viewer_id) {
+                        viewer.pending_outgoing.push(OutgoingPacket::RemoveActor(
+                            RemoveActorPacket::new(entity.unique_id),
+                        ));
+                        viewer.pending_outgoing.push(OutgoingPacket::PlayerList(
+                            PlayerListPacket::removal(entity.uuid),
+                        ));
+                        queued += 2;
+                    }
+                }
+            }
+        }
+
+        // Spawn / move: every current virtual for every eligible viewer.
+        for (lower, snapshot) in &current {
+            let runtime_id = match virtuals.get(lower) {
+                Some(existing) => existing.runtime_id,
+                None => self.next_virtual_runtime.fetch_add(1, Ordering::SeqCst),
+            };
+            let entity = virtuals
+                .entry(lower.clone())
+                .or_insert_with(|| VirtualEntity::new(snapshot.name.clone(), runtime_id, snapshot));
+            entity.name = snapshot.name.clone();
+            entity.x = snapshot.x;
+            entity.y = snapshot.y;
+            entity.z = snapshot.z;
+            entity.yaw = snapshot.yaw;
+            entity.pitch = snapshot.pitch;
+            entity.gamemode = snapshot.gamemode as i32;
+
+            let viewers: Vec<u64> = map
+                .values()
+                .filter(|s| {
+                    s.spawned && s.joined && !s.is_dead && s.username.to_lowercase() != *lower
+                })
+                .map(|s| s.session_id)
+                .collect();
+
+            // `moved` is decided once for the whole entity, before the
+            // viewer loop: `mark_sent` must not run per-viewer, or only
+            // the first Bedrock viewer would ever receive the move and
+            // every later viewer would keep seeing a frozen body.
+            let moved = entity.moved_since_sent();
+            let mut moved_packets = 0;
+
+            for viewer_id in viewers {
+                if !entity.viewers.contains(&viewer_id) {
+                    if !entity.listed_to.contains(&viewer_id) {
+                        if let Some(viewer) = map.get_mut(&viewer_id) {
+                            viewer.pending_outgoing.push(OutgoingPacket::PlayerList(
+                                PlayerListPacket::addition(entity.player_list_addition()),
+                            ));
+                            queued += 1;
+                        }
+                        entity.listed_to.insert(viewer_id);
+                    }
+                    if let Some(viewer) = map.get_mut(&viewer_id) {
+                        viewer
+                            .pending_outgoing
+                            .push(OutgoingPacket::AddPlayer(entity.add_player_packet()));
+                        queued += 1;
+                    }
+                    entity.viewers.insert(viewer_id);
+                } else if moved {
+                    // Java `player.update_position` publishes x/y/z/yaw/pitch;
+                    // Bedrock viewers see them as `MoveActorAbsolutePacket`
+                    // on the eye position, like Bedrock players.
+                    let packet = MoveActorAbsolutePacket::new(
+                        entity.runtime_id as i64,
+                        entity.eye_position(),
+                        entity.pitch as f32,
+                        entity.yaw as f32,
+                        entity.yaw as f32,
+                        0,
+                    );
+                    if let Some(viewer) = map.get_mut(&viewer_id) {
+                        viewer
+                            .pending_outgoing
+                            .push(OutgoingPacket::MoveActorAbsolute(packet.clone()));
+                        queued += 1;
+                        moved_packets += 1;
+                    }
+                }
+            }
+
+            if moved {
+                if moved_packets > 0 {
+                    debug!(
+                        "Virtual player {} moved to ({:.2}, {:.2}, {:.2}); queued MoveActorAbsolute for {} Bedrock viewer(s)",
+                        entity.name,
+                        entity.x,
+                        entity.y,
+                        entity.z,
+                        moved_packets,
+                    );
+                }
+                entity.mark_sent();
+            }
+
+            // Drop viewers that disconnected while this entity was visible.
+            entity.viewers.retain(|id| map.contains_key(id));
+            entity.listed_to.retain(|id| map.contains_key(id));
+        }
+
+        queued
+    }
+
+    /// Public entry for virtual sync, usable from the tick loop and from the
+    /// `ServerPluginHost` virtual notify callback (which runs on the PHP
+    /// worker thread). Uses a non-blocking lock so a host call running
+    /// inside a session dispatch can never deadlock on the sessions lock;
+    /// a missed cycle is retried by the next poll (`poll_prespawn_timeouts`).
+    pub fn poll_virtual_players(&self) -> usize {
+        let Some(mut map) = self.sessions.try_write() else {
+            return 0;
+        };
+        self.sync_virtuals_locked(&mut map)
+    }
+
+    /// Forgets a disconnected Bedrock session as a virtual viewer.
+    fn forget_viewer(&self, viewer_id: u64) {
+        let mut virtuals = self.virtuals.write();
+        for entity in virtuals.values_mut() {
+            entity.viewers.remove(&viewer_id);
+            entity.listed_to.remove(&viewer_id);
+        }
+    }
+
+    fn broadcast_remove_actor_locked(
+        &self,
+        map: &mut HashMap<u64, PlayerSession>,
+        uuid: [u8; 16],
+        unique_id: i64,
+        viewers: &HashSet<u64>,
+    ) {
+        for viewer_id in viewers {
+            if let Some(viewer) = map.get_mut(viewer_id) {
+                viewer
+                    .pending_outgoing
+                    .push(OutgoingPacket::RemoveActor(RemoveActorPacket::new(unique_id)));
+                viewer
+                    .pending_outgoing
+                    .push(OutgoingPacket::PlayerList(PlayerListPacket::removal(uuid)));
+            }
+        }
+    }
+
+    fn broadcast_move_actor_locked(&self, map: &mut HashMap<u64, PlayerSession>, player_id: u64) {
+        let (runtime_id, eye, pitch, yaw, viewers) = {
+            let Some(target) = map.get(&player_id) else {
+                return;
+            };
+            (
+                target.entity_runtime_id as i64,
+                target.eye_position(),
+                target.pitch,
+                target.yaw,
+                target.viewers.clone(),
+            )
+        };
+        let packet = MoveActorAbsolutePacket::new(runtime_id, eye, pitch, yaw, yaw, 0);
+        for viewer_id in viewers {
+            if viewer_id == player_id {
+                continue;
+            }
+            if let Some(viewer) = map.get_mut(&viewer_id) {
+                if !viewer.can_see(player_id) {
+                    continue;
+                }
+                viewer
+                    .pending_outgoing
+                    .push(OutgoingPacket::MoveActorAbsolute(packet.clone()));
+            }
+        }
+    }
+
+    fn broadcast_actor_data_locked(&self, map: &mut HashMap<u64, PlayerSession>, player_id: u64) {
+        let (packet, viewers) = {
+            let Some(target) = map.get(&player_id) else {
+                return;
+            };
+            let data = SetActorDataPacket::new(
+                target.entity_runtime_id,
+                vec![
+                    MetadataEntry::new(0, MetadataValue::Long(target.data_flags())),
+                    MetadataEntry::new(4, MetadataValue::String(target.username.clone())),
+                    MetadataEntry::new(7, MetadataValue::Short(target.air)),
+                    MetadataEntry::new(42, MetadataValue::Short(target.air)),
+                    MetadataEntry::new(38, MetadataValue::Float(1.0)),
+                    MetadataEntry::new(53, MetadataValue::Float(0.6)),
+                    MetadataEntry::new(54, MetadataValue::Float(1.8)),
+                ],
+                bedrock_protocol::PropertySyncData::empty(),
+                0,
+            );
+            (data, target.viewers.clone())
+        };
+        for viewer_id in viewers {
+            if viewer_id == player_id {
+                continue;
+            }
+            if let Some(viewer) = map.get_mut(&viewer_id) {
+                if !viewer.can_see(player_id) {
+                    continue;
+                }
+                viewer
+                    .pending_outgoing
+                    .push(OutgoingPacket::SetActorData(packet.clone()));
+            }
+        }
+    }
+
+    fn drain_pending_broadcasts_locked(&self, map: &mut HashMap<u64, PlayerSession>, player_id: u64) {
+        let (spawn, move_, data) = {
+            let Some(session) = map.get(&player_id) else {
+                return;
+            };
+            (
+                session.pending_spawn_broadcast,
+                session.pending_move_broadcast,
+                session.pending_data_broadcast,
+            )
+        };
+        if spawn {
+            self.broadcast_add_player_locked(map, player_id);
+            if let Some(session) = map.get_mut(&player_id) {
+                session.pending_spawn_broadcast = false;
+            }
+        }
+        if move_ {
+            self.broadcast_move_actor_locked(map, player_id);
+            if let Some(session) = map.get_mut(&player_id) {
+                session.pending_move_broadcast = false;
+            }
+        }
+        if data {
+            self.broadcast_actor_data_locked(map, player_id);
+            if let Some(session) = map.get_mut(&player_id) {
+                session.pending_data_broadcast = false;
+            }
+        }
+    }
+
+    /// Spawns player_id for every other joined player and vice versa.
+    pub fn broadcast_add_player(&self, player_id: u64) {
+        let mut map = self.sessions.write();
+        self.broadcast_add_player_locked(&mut map, player_id);
+    }
+
+    /// Despawns player_id for every viewer and removes it from the player list.
+    pub fn broadcast_remove_actor(&self, player_id: u64) {
+        let mut map = self.sessions.write();
+        let Some(target) = map.get(&player_id) else {
+            return;
+        };
+        let (uuid, unique_id, viewers) =
+            (target.uuid, target.entity_unique_id, target.viewers.clone());
+        for (id, session) in map.iter_mut() {
+            if *id != player_id {
+                session.viewers.remove(&player_id);
+            }
+        }
+        self.broadcast_remove_actor_locked(&mut map, uuid, unique_id, &viewers);
+    }
+
+    /// Snapshot variant used when the session has already been removed.
+    pub fn broadcast_remove_actor_snapshot(
+        &self,
+        uuid: [u8; 16],
+        unique_id: i64,
+        quitter_id: u64,
+        viewers: &HashSet<u64>,
+    ) {
+        let mut map = self.sessions.write();
+        for (_, session) in map.iter_mut() {
+            session.viewers.remove(&quitter_id);
+            session.hidden_players.remove(&quitter_id);
+        }
+        self.broadcast_remove_actor_locked(&mut map, uuid, unique_id, viewers);
+    }
+
+    /// Broadcasts the current position/rotation to viewers.
+    pub fn broadcast_move_actor(&self, player_id: u64) {
+        let mut map = self.sessions.write();
+        self.broadcast_move_actor_locked(&mut map, player_id);
+    }
+
+    /// Broadcasts entity flags (sneak/sprint/swim/glide) to viewers.
+    pub fn broadcast_actor_data(&self, player_id: u64) {
+        let mut map = self.sessions.write();
+        self.broadcast_actor_data_locked(&mut map, player_id);
+    }
+
+    /// Player::canSee(viewer, target) exposed for the Java bridge.
+    pub fn can_see(&self, viewer: &str, target: &str) -> bool {
+        let (Some(viewer_id), Some(target_id)) =
+            (self.session_id_for(viewer), self.session_id_for(target))
+        else {
+            return false;
+        };
+        if viewer_id == target_id {
+            return true;
+        }
+        let map = self.sessions.read();
+        map.get(&viewer_id)
+            .map(|s| s.can_see(target_id))
+            .unwrap_or(true)
+    }
+
+    /// Player::hidePlayer(viewer, target) exposed for the Java bridge.
+    pub fn hide_player(&self, viewer: &str, target: &str) -> bool {
+        let (Some(viewer_id), Some(target_id)) =
+            (self.session_id_for(viewer), self.session_id_for(target))
+        else {
+            return false;
+        };
+        if viewer_id == target_id {
+            return false;
+        }
+        let mut map = self.sessions.write();
+        if let Some(session) = map.get_mut(&viewer_id) {
+            session.hide_player(target_id);
+        }
+        Self::despawn_from_locked(&mut map, viewer_id, target_id)
+    }
+
+    /// Player::showPlayer(viewer, target) exposed for the Java bridge.
+    pub fn show_player(&self, viewer: &str, target: &str) -> bool {
+        let (Some(viewer_id), Some(target_id)) =
+            (self.session_id_for(viewer), self.session_id_for(target))
+        else {
+            return false;
+        };
+        if viewer_id == target_id {
+            return false;
+        }
+        let mut map = self.sessions.write();
+        if let Some(session) = map.get_mut(&viewer_id) {
+            session.show_player(target_id);
+        }
+        Self::spawn_to_locked(&mut map, viewer_id, target_id)
     }
 
     /// Delivers a result line to the player who ran a command, or prints it to
@@ -2146,9 +3524,6 @@ impl SessionManager {
     }
 
     /// Routes a raw packet to a session and collects everything it queued.
-    ///
-    /// Transports own the session id, so this is the entry point for packets
-    /// addressed to a specific player.
     pub fn handle_session_packet(
         &self,
         session_id: u64,
@@ -2156,30 +3531,38 @@ impl SessionManager {
         payload: &[u8],
     ) -> Result<Vec<OutgoingPacket>, SessionError> {
         let mut map = self.sessions.write();
-        let Some(session) = map.get_mut(&session_id) else {
-            return Err(SessionError::Disconnected);
-        };
-        let mut out = session.handle_packet(packet_id, payload)?;
-
-        // PocketMine checks the bans and the whitelist right after login.
-        if packet_id == 0x01 && !session.username.is_empty() {
-            let is_op = session.is_op();
-            let ip = session.client_addr.ip().to_string();
-            if let Some(reason) = self.access.denial(&session.username, &ip, is_op) {
-                info!(
-                    "Refusing login for '{}' ({}): {}",
-                    session.username, ip, reason
-                );
-                session.state = SessionState::Disconnected;
-                out = vec![OutgoingPacket::Disconnect(DisconnectPacket {
-                    reason: 0,
-                    skip_message: false,
-                    message: Some(reason),
-                })];
+        let out_result = {
+            let Some(session) = map.get_mut(&session_id) else {
+                return Err(SessionError::Disconnected);
+            };
+            let result = session.handle_packet(packet_id, payload);
+            let mut out = match result {
+                Ok(out) => out,
+                Err(e) => return Err(e),
+            };
+            if packet_id == 0x01 && !session.username.is_empty() {
+                let is_op = session.is_op();
+                let ip = session.client_addr.ip().to_string();
+                if let Some(reason) = self.access.denial(&session.username, &ip, is_op) {
+                    debug!(
+                        "Refusing login for '{}' ({}): {}",
+                        session.username, ip, reason
+                    );
+                    session.state = SessionState::Disconnected;
+                    out = vec![OutgoingPacket::Disconnect(DisconnectPacket {
+                        reason: 0,
+                        skip_message: false,
+                        message: Some(reason),
+                    })];
+                }
             }
+            out
+        };
+        self.drain_pending_broadcasts_locked(&mut map, session_id);
+        let mut out = out_result;
+        if let Some(session) = map.get_mut(&session_id) {
+            out.append(&mut session.pending_outgoing);
         }
-
-        out.append(&mut session.pending_outgoing);
         Ok(out)
     }
 
@@ -2228,6 +3611,11 @@ impl SessionManager {
     }
 
     /// `Server::saveAll()`: player data plus the world snapshot.
+    ///
+    /// Virtual (Java) players in the registry are saved directly to
+    /// `players/<name>.json` with the same JSON v2 as Bedrock — no staging
+    /// file. `first_played`/`xuid` from disk win over empty live values so a
+    /// save never resets a returning player's timers.
     pub fn save_all(&self) -> std::io::Result<()> {
         let Some(dir) = self.data_dir.read().clone() else {
             return Ok(());
@@ -2237,6 +3625,46 @@ impl SessionManager {
             for session in map.values().filter(|session| session.joined) {
                 let _ = session.save_player_data();
             }
+        }
+        for player in self.registry.all() {
+            if !player.is_virtual {
+                continue;
+            }
+            let path = dir
+                .join("players")
+                .join(format!("{}.json", player.name.to_lowercase()));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let existing = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let now = PlayerSession::now_played_secs();
+            let mut merged = existing.clone().unwrap_or(serde_json::json!({"name": player.name}));
+            if let (Some(object), Some(snap)) = (merged.as_object_mut(), player.to_save_json().as_object()) {
+                for (key, value) in snap {
+                    object.insert(key.clone(), value.clone());
+                }
+                // Live empty times must not erase on-disk timers.
+                if player.first_played <= 0.0 {
+                    if let Some(existing_first) = existing.as_ref().and_then(|entry| entry.get("first_played").and_then(|entry| entry.as_f64())) {
+                        if existing_first > 0.0 {
+                            object.insert("first_played".to_string(), serde_json::json!(existing_first));
+                        }
+                    }
+                }
+                if player.xuid.is_empty() {
+                    if let Some(existing_xuid) = existing.as_ref().and_then(|entry| entry.get("xuid").and_then(|entry| entry.as_str())) {
+                        if !existing_xuid.is_empty() {
+                            object.insert("xuid".to_string(), serde_json::json!(existing_xuid));
+                        }
+                    }
+                }
+                object.insert("last_played".to_string(), serde_json::json!(now));
+                object.insert("name".to_string(), serde_json::json!(player.name));
+            }
+            let bytes = serde_json::to_vec(&merged).map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            std::fs::write(path, bytes)?;
         }
         self.world.save_to(&dir.join("world.json"))
     }
@@ -2279,6 +3707,78 @@ impl SessionManager {
         map.get(&id).map(|session| session.state)
     }
 
+    /// Forces `PLAYER_SPAWN` for sessions stuck in PreSpawn past
+    /// [`PRESPAWN_SPAWN_TIMEOUT`] without `0x71`.
+    ///
+    /// Spawn packets are queued as `pending_outgoing` and delivered on the
+    /// next client message (there is no server-initiated DataChannel push);
+    /// registration/join already happens here so plugins (TestKit heartbeat,
+    /// `/list`) see the player as online after the timeout even if the
+    /// client has gone silent. Returns how many sessions were forced.
+    pub fn poll_prespawn_timeouts(&self) -> usize {
+        // Fase 2 tick poll (main.rs already calls this every 20 ticks):
+        // Java edits made only via the `world.set_block` host call have no
+        // `apply_actions` of their own, so they are forwarded to Bedrock
+        // viewers here even when no Bedrock packet is in flight.
+        self.poll_block_changes();
+        // Virtual (Java bridge) players mutate the registry through host
+        // calls (`player.register` / `player.update_position` /
+        // `player.unregister`) without any Bedrock packet in flight. The
+        // host notify callback covers them immediately; this 20-tick poll
+        // is the safety net for anything missed (e.g. no notify wired).
+        self.poll_virtual_players();
+        let candidates: Vec<u64> = {
+            let map = self.sessions.read();
+            map.values()
+                .filter(|session| session.is_prespawn_timed_out(PRESPAWN_SPAWN_TIMEOUT))
+                .map(|session| session.session_id)
+                .collect()
+        };
+        let mut forced = 0usize;
+        for session_id in candidates {
+            let mut session = {
+                let mut map = self.sessions.write();
+                match map.remove(&session_id) {
+                    Some(session) => session,
+                    None => continue,
+                }
+            };
+            if !session.is_prespawn_timed_out(PRESPAWN_SPAWN_TIMEOUT) {
+                self.sessions.write().insert(session_id, session);
+                continue;
+            }
+            info!(
+                "Session {} prespawn timed out (> {:?} without 0x71); forcing PLAYER_SPAWN fallback",
+                session_id, PRESPAWN_SPAWN_TIMEOUT
+            );
+            match session.handle_set_local_player_as_initialized() {
+                Ok(packets) => {
+                    if !packets.is_empty() {
+                        forced += 1;
+                        session.pending_outgoing.extend(packets);
+                    }
+                }
+                Err(error) => {
+                    warn!("Prespawn timeout spawn failed for session {}: {}", session_id, error);
+                }
+            }
+            // Fire join broadcasts now so other players learn about the
+            // spawn even if this session never sends another packet.
+            let broadcasts = std::mem::take(&mut session.pending_broadcasts);
+            let actions = std::mem::take(&mut session.pending_actions);
+            self.sessions.write().insert(session_id, session);
+            {
+                let mut map = self.sessions.write();
+                self.drain_pending_broadcasts_locked(&mut map, session_id);
+            }
+            for message in broadcasts {
+                self.broadcast_text(&message);
+            }
+            self.apply_actions(&actions, 0);
+        }
+        forced
+    }
+
     /// Dispatches a raw Bedrock network message received over NetherNet WebRtc DataChannels
     pub fn dispatch_webrtc_packet(&self, peer: SocketAddr, raw: &[u8]) -> Vec<bytes::Bytes> {
         // Take the session out of the map so plugin IPC (which may call back
@@ -2311,6 +3811,19 @@ impl SessionManager {
         }
 
         let mut outgoing: Vec<OutgoingPacket> = std::mem::take(&mut session.pending_outgoing);
+
+        // Timeout fallback: if this session already sat in PreSpawn past the
+        // threshold, spawn it before processing the new batch so *any* next
+        // client packet (not just `0x45`/`0x90`) unblocks the login.
+        if session.is_prespawn_timed_out(PRESPAWN_SPAWN_TIMEOUT) {
+            info!(
+                "Session {} prespawn timed out (> {:?} without 0x71) on dispatch; forcing PLAYER_SPAWN fallback",
+                session_id, PRESPAWN_SPAWN_TIMEOUT
+            );
+            if let Ok(spawn_packets) = session.handle_set_local_player_as_initialized() {
+                outgoing.extend(spawn_packets);
+            }
+        }
 
         // Decompress batch or treat as raw uncompressed batch
         let decompressed = match PacketBatch::decompress(raw) {
@@ -2359,6 +3872,12 @@ impl SessionManager {
         session.compression_enabled = compression_enabled;
 
         self.sessions.write().insert(session_id, session);
+
+        // Visibility broadcasts for this peer (spawn/move/flags).
+        {
+            let mut map = self.sessions.write();
+            self.drain_pending_broadcasts_locked(&mut map, session_id);
+        }
 
         for message in broadcasts {
             self.broadcast_text(&message);
@@ -2494,21 +4013,29 @@ impl SessionManager {
                     z,
                     world,
                 } => {
-                    let Some(id) = self.session_id_for(target_player) else {
-                        continue;
-                    };
-                    let mut map = self.sessions.write();
-                    if let Some(session) = map.get_mut(&id) {
-                        if let Some(world) = world {
-                            if !world.is_empty() {
-                                session.world = Arc::new(WorldState::new(
-                                    world.clone(),
-                                    Arc::clone(&session.generator),
-                                ));
+                    if let Some(id) = self.session_id_for(target_player) {
+                        let mut map = self.sessions.write();
+                        if let Some(session) = map.get_mut(&id) {
+                            if let Some(world) = world {
+                                if !world.is_empty() {
+                                    session.world = Arc::new(WorldState::new(
+                                        world.clone(),
+                                        Arc::clone(&session.generator),
+                                    ));
+                                }
                             }
+                            session.teleport(*x, *y, *z, None, None);
+                            registry_upsert(&self.registry, session);
                         }
-                        session.teleport(*x, *y, *z, None, None);
-                        registry_upsert(&self.registry, session);
+                        self.drain_pending_broadcasts_locked(&mut map, id);
+                    } else if let Some(mut player) = self.registry.get(target_player) {
+                        // Virtual Java player (bridge): no Bedrock session,
+                        // keep the shared snapshot so the bridge polls it
+                        // and sends the Java position/teleport packet.
+                        player.apply_position(*x, *y, *z, player.yaw, player.pitch);
+                        self.registry.upsert(player);
+                        // Bedrock viewers see the teleport as a move.
+                        self.poll_virtual_players();
                     }
                 }
                 PluginAction::SetBlock {
@@ -2521,9 +4048,14 @@ impl SessionManager {
                     if !world.is_empty() && !world.eq_ignore_ascii_case(&self.world.name) {
                         continue;
                     }
-                    if self.world.set_block(*x, *y, *z, *block_id) {
-                        self.refresh_chunk_at(*x, *z);
-                    }
+                    // `set_block` enqueues the edit for both sync
+                    // directions (Fase 1: Java `take_block_changes`; Fase
+                    // 2: Bedrock broadcast queue). The Bedrock side is
+                    // delivered by the `poll_block_changes` at the end of
+                    // `apply_actions` as a single `UpdateBlockPacket`
+                    // (0x15) per viewer holding the chunk — not by
+                    // resending a whole `LevelChunk` as before.
+                    let _ = self.world.set_block(*x, *y, *z, *block_id);
                 }
                 PluginAction::DispatchCommand { command, sender } => {
                     let plugins = self.plugin_manager();
@@ -2645,18 +4177,105 @@ impl SessionManager {
                     gamemode,
                 } => {
                     let gamemode = *gamemode as i32;
+                    if let Some(id) = self.session_id_for(target_player) {
+                        let mut map = self.sessions.write();
+                        if let Some(session) = map.get_mut(&id) {
+                            session.gamemode = gamemode;
+                            session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
+                                SetPlayerGameTypePacket::new(gamemode),
+                            ));
+                            let abilities = session.create_update_abilities_packet();
+                            session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
+                            registry_upsert(&self.registry, session);
+                        }
+                    } else if let Some(mut player) = self.registry.get(target_player) {
+                        // Virtual Java player: no Bedrock session, keep the
+                        // shared snapshot so the bridge polls it and sends
+                        // the Java gamemode packet (player_info_update /
+                        // player_info) to the client.
+                        player.gamemode = gamemode.max(0) as u32;
+                        self.registry.upsert(player);
+                    }
+                }
+                // ---- Fase A1 (Server+Player API): acceso Server/Player ----
+                PluginAction::SetHealth {
+                    target_player,
+                    health,
+                    max_health,
+                } => {
                     let Some(id) = self.session_id_for(target_player) else {
                         continue;
                     };
                     let mut map = self.sessions.write();
                     if let Some(session) = map.get_mut(&id) {
-                        session.gamemode = gamemode;
-                        session.pending_outgoing.push(OutgoingPacket::SetPlayerGameType(
-                            SetPlayerGameTypePacket::new(gamemode),
-                        ));
-                        let abilities = session.create_update_abilities_packet();
-                        session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
+                        if let Some(max) = max_health {
+                            session.max_health = max.max(1.0);
+                        }
+                        if session.health > session.max_health && session.health > 0.0 {
+                            // `Living::setMaxHealth` clamps current health.
+                            session.health = session.max_health;
+                        }
+                        session.health = health.clamp(0.0, session.max_health);
+                        if session.health <= 0.0 {
+                            session.is_dead = true;
+                        } else if session.is_dead && session.health > 0.0 {
+                            session.is_dead = false;
+                        }
+                        session
+                            .pending_outgoing
+                            .push(OutgoingPacket::RawWire(set_health_wire(session.health)));
+                        let attributes = session.create_update_attributes_packet();
+                        session
+                            .pending_outgoing
+                            .push(OutgoingPacket::RawWire(attributes));
+                        registry_upsert(&self.registry, session);
                     }
+                }
+                PluginAction::SetXp {
+                    target_player,
+                    xp,
+                    level,
+                } => {
+                    let Some(id) = self.session_id_for(target_player) else {
+                        continue;
+                    };
+                    let mut map = self.sessions.write();
+                    if let Some(session) = map.get_mut(&id) {
+                        session.xp_progress = xp.clamp(0.0, 1.0);
+                        if let Some(lvl) = level {
+                            session.xp_level = (*lvl).max(0);
+                        }
+                        let attributes = session.create_update_attributes_packet();
+                        session
+                            .pending_outgoing
+                            .push(OutgoingPacket::RawWire(attributes));
+                    }
+                }
+                PluginAction::HidePlayer { viewer, target } => {
+                    self.hide_player(viewer, target);
+                }
+                PluginAction::ShowPlayer { viewer, target } => {
+                    self.show_player(viewer, target);
+                }
+                PluginAction::SendSubTitle {
+                    target_player,
+                    subtitle,
+                } => {
+                    self.queue_packet(
+                        target_player,
+                        OutgoingPacket::SetTitle(SetTitlePacket::subtitle(subtitle.clone())),
+                    );
+                }
+                PluginAction::SendActionBar {
+                    target_player,
+                    message,
+                } => {
+                    self.queue_packet(
+                        target_player,
+                        OutgoingPacket::SetTitle(SetTitlePacket::action_bar_message(
+                            message.clone(),
+                        )),
+                    );
                 }
             }
         }
@@ -2665,6 +4284,15 @@ impl SessionManager {
             let nested = self.apply_actions(&follow_up, depth + 1);
             follow_up.extend(nested);
         }
+
+        // Fase 2: forward every queued block change (Bedrock breaks via
+        // `PluginAction::SetBlock` above, plus Java edits made through the
+        // `world.set_block` host call since the last poll) to Bedrock
+        // viewers as `UpdateBlockPacket`s. Polling here, once per
+        // `apply_actions`, is what makes the `dispatch_webrtc_packet` /
+        // plugin-tick paths deliver in the same dispatch; a no-change
+        // poll is an empty drain plus an empty session scan.
+        self.poll_block_changes();
 
         follow_up
     }
@@ -2693,23 +4321,40 @@ impl SessionManager {
         Some(output.feedback)
     }
 
-    /// Authoritative list of players in the world, taken from the live
-    /// sessions (the plugin registry may lag behind or not exist at all).
+    /// Authoritative list of players in the world: live Bedrock sessions
+    /// plus every virtual (Java bridge) entry in the shared registry, so
+    /// console `/list` counts Procatin0-like players too.
     fn online_players_snapshot(&self) -> Vec<OnlinePlayer> {
-        self.sessions
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut players: Vec<OnlinePlayer> = self
+            .sessions
             .read()
             .values()
             .filter(|session| session.joined)
-            .map(|session| OnlinePlayer {
-                name: session.username.clone(),
-                position: (
-                    session.position.x as f64,
-                    session.position.y as f64,
-                    session.position.z as f64,
-                ),
-                gamemode: session.gamemode,
+            .map(|session| {
+                seen.insert(session.username.to_lowercase());
+                OnlinePlayer {
+                    name: session.username.clone(),
+                    position: (
+                        session.position.x as f64,
+                        session.position.y as f64,
+                        session.position.z as f64,
+                    ),
+                    gamemode: session.gamemode,
+                }
             })
-            .collect()
+            .collect();
+        for entry in self.registry.all() {
+            if seen.insert(entry.name.to_lowercase()) {
+                players.push(OnlinePlayer {
+                    name: entry.name,
+                    position: (entry.x, entry.y, entry.z),
+                    gamemode: entry.gamemode as i32,
+                });
+            }
+        }
+        players
     }
 
     /// Applies the side effects of native commands against the live sessions.
@@ -2722,10 +4367,7 @@ impl SessionManager {
                     message,
                     notify,
                 } => {
-                    let Some(session_id) = self.session_id_for(target) else {
-                        continue;
-                    };
-                    {
+                    if let Some(session_id) = self.session_id_for(target) {
                         let mut map = self.sessions.write();
                         let Some(session) = map.get_mut(&session_id) else {
                             continue;
@@ -2740,6 +4382,14 @@ impl SessionManager {
                         let abilities = session.create_update_abilities_packet();
                         session.pending_outgoing.push(OutgoingPacket::RawWire(abilities));
                         registry_upsert(&self.registry, session);
+                    } else if let Some(mut player) = self.registry.get(target) {
+                        // Virtual Java player (bridge): no Bedrock session.
+                        // Update the shared registry snapshot so the bridge
+                        // polls it and sends the Java gamemode packet.
+                        player.gamemode = (*gamemode).max(0) as u32;
+                        self.registry.upsert(player);
+                    } else {
+                        continue;
                     }
                     // Paper broadcasts verified command changes to operators and
                     // tells the affected player; PocketMine only messages the
@@ -2781,7 +4431,7 @@ impl SessionManager {
                             message: Some(reason.clone()),
                         }),
                     );
-                    info!("Kicked {}: {}", target, crate::logging::to_ansi(reason));
+                    debug!("Kicked {}: {}", target, crate::logging::to_ansi(reason));
                 }
                 CommandAction::SendTitle { target, action } => {
                     let packet = match action {
@@ -3185,6 +4835,152 @@ impl SessionManager {
                         self.registry.upsert(player);
                     }
                 }
+                CommandAction::SetTimeRunning {
+                    running,
+                    message,
+                    notify,
+                } => {
+                    if *running {
+                        self.world.start_time();
+                    } else {
+                        self.world.stop_time();
+                    }
+                    // Snap every client to the (now frozen / resumed)
+                    // time immediately; the periodic `tick_world_time`
+                    // broadcast would otherwise take up to 1 s, and a
+                    // frozen client would keep drifting locally.
+                    self.broadcast_time(self.world.time());
+                    self.broadcast_command_message(notify, message);
+                }
+                CommandAction::ApplyEffect {
+                    target,
+                    effect,
+                    duration_secs,
+                    amplifier,
+                    particles,
+                    remove,
+                    message,
+                    notify,
+                } => {
+                    // No MobEffect packet path yet: log + broadcast so the
+                    // command feedback is observable. The canonical effect
+                    // registry (`StringToEffectParser`) is still TODO.
+                    if *remove {
+                        debug!("Effect removed from {}: {}", target, effect);
+                    } else {
+                        debug!(
+                            "Effect {} * {} on {} ({}s, particles={})",
+                            effect,
+                            amplifier,
+                            target,
+                            duration_secs.map(|s| s.to_string()).unwrap_or_else(|| "infinite".into()),
+                            particles
+                        );
+                    }
+                    self.broadcast_command_message(notify, message);
+                }
+                CommandAction::Enchant {
+                    target,
+                    enchantment,
+                    level,
+                    message,
+                    notify,
+                } => {
+                    // Inventory enchantment NBT path is not implemented;
+                    // log the request (session owns the inventory).
+                    debug!("Enchant {} lvl {} on {}", enchantment, level, target);
+                    self.broadcast_command_message(notify, message);
+                }
+                CommandAction::AddXp {
+                    target,
+                    amount,
+                    is_levels,
+                    message,
+                    notify,
+                } => {
+                    // XP attribute path is not implemented; log the request.
+                    debug!(
+                        "XP {} {} on {}",
+                        if *is_levels { "levels" } else { "points" },
+                        amount,
+                        target
+                    );
+                    self.broadcast_command_message(notify, message);
+                }
+                CommandAction::SpawnParticle {
+                    name,
+                    position,
+                    delta,
+                    count,
+                    data,
+                    message,
+                } => {
+                    debug!(
+                        "Particle {} x{} at ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1}) data={:?}",
+                        name, count, position.0, position.1, position.2, delta.0, delta.1, delta.2, data
+                    );
+                    // The sender already got the success line as feedback;
+                    // particles have no broadcast in PM either.
+                    let _ = message;
+                }
+                CommandAction::Timings {
+                    mode,
+                    message,
+                    notify,
+                } => {
+                    debug!("Timings mode: {}", mode);
+                    self.broadcast_command_message(notify, message);
+                }
+                CommandAction::GarbageCollect { notify } => {
+                    // Chunk/entity unload counting needs the world manager;
+                    // report zeroes honestly until then.
+                    debug!("Garbage collection requested by {}", notify);
+                    self.notify_sender(
+                        notify,
+                        &crate::command::fill_named(
+                            crate::command::lang::GC_CHUNKS,
+                            &[("chunksCollected", "0")],
+                        ),
+                    );
+                    self.notify_sender(
+                        notify,
+                        &crate::command::fill_named(
+                            crate::command::lang::GC_ENTITIES,
+                            &[("entitiesCollected", "0")],
+                        ),
+                    );
+                    self.notify_sender(
+                        notify,
+                        &crate::command::fill_named(
+                            crate::command::lang::GC_CYCLES,
+                            &[("cyclesCollected", "0")],
+                        ),
+                    );
+                    self.notify_sender(
+                        notify,
+                        &crate::command::fill_named(
+                            crate::command::lang::GC_MEMORY_FREED,
+                            &[("memoryFreed", "0.00")],
+                        ),
+                    );
+                }
+                CommandAction::DumpMemory { path } => {
+                    let default_path = format!("memory_dumps/{}.txt", time_now_for_dump());
+                    let output = path.clone().unwrap_or(default_path);
+                    let _ = std::fs::create_dir_all(
+                        std::path::Path::new(&output).parent().unwrap_or(std::path::Path::new(".")),
+                    );
+                    let body = format!(
+                        "Axolotl-PM memory dump\nsessions: {}\nworld: {}\n",
+                        self.session_count(),
+                        self.world.name
+                    );
+                    if let Err(error) = std::fs::write(&output, body) {
+                        warn!("Could not write memory dump to {}: {}", output, error);
+                    } else {
+                        debug!("Memory dump written to {}", output);
+                    }
+                }
             }
         }
     }
@@ -3199,23 +4995,78 @@ impl SessionManager {
         yaw: Option<f32>,
         pitch: Option<f32>,
     ) -> bool {
-        let Some(session_id) = self.session_id_for(name) else {
-            return false;
-        };
-        let mut map = self.sessions.write();
-        let Some(session) = map.get_mut(&session_id) else {
-            return false;
-        };
-        session.teleport(x, y, z, yaw, pitch);
-        registry_upsert(&self.registry, session);
-        true
+        if let Some(session_id) = self.session_id_for(name) {
+            let mut map = self.sessions.write();
+            let Some(session) = map.get_mut(&session_id) else {
+                return false;
+            };
+            session.teleport(x, y, z, yaw, pitch);
+            registry_upsert(&self.registry, session);
+            self.drain_pending_broadcasts_locked(&mut map, session_id);
+            return true;
+        }
+        // Virtual Java player (bridge): no Bedrock session. Keep the shared
+        // registry snapshot in sync so the bridge polls it (via `player.get`)
+        // and sends the Java position/teleport packet to the client.
+        if let Some(mut player) = self.registry.get(name) {
+            player.apply_position(
+                x,
+                y,
+                z,
+                yaw.map(|v| v as f64).unwrap_or(player.yaw),
+                pitch.map(|v| v as f64).unwrap_or(player.pitch),
+            );
+            self.registry.upsert(player);
+            // Bedrock viewers see the teleport as a `MoveActorAbsolute`.
+            self.poll_virtual_players();
+            return true;
+        }
+        false
     }
 
     fn broadcast_time(&self, time: i32) {
+        self.last_time_broadcast
+            .store(time, std::sync::atomic::Ordering::Relaxed);
+        self.time_tick_counter
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.queue_all(OutgoingPacket::RawWire(set_time_wire(time)));
     }
 
+    /// Advances the world clock by one tick and broadcasts `SetTime`
+    /// to joined Bedrock sessions every
+    /// [`TIME_BROADCAST_INTERVAL_TICKS`] ticks (1 s), or immediately
+    /// when the time jumped by more than that interval since the last
+    /// broadcast (`/time set`/`add` via a plugin/`world.set_time`
+    /// host call, which does not go through `broadcast_time`).
+    ///
+    /// Called once per server tick from `main.rs`. Returns the
+    /// current world time. The Java bridge polls the same
+    /// `WorldState::time()` (via `world.get_time`) in its own tick,
+    /// so both platforms share this single clock and stay synced:
+    /// `/time set 6000` on Bedrock reaches Java within one Java tick
+    /// (jump detection there) and vice versa.
+    pub fn tick_world_time(&self) -> i32 {
+        let time = self.world.tick();
+        let elapsed = self
+            .time_tick_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let last = self
+            .last_time_broadcast
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let jumped = last >= 0 && (time - last).abs() > TIME_BROADCAST_INTERVAL_TICKS;
+        if elapsed >= TIME_BROADCAST_INTERVAL_TICKS || jumped {
+            self.broadcast_time(time);
+        }
+        time
+    }
+
     /// Resends a chunk to every session that already has it loaded.
+    ///
+    /// Kept as the `LevelChunk` fallback of
+    /// [`SessionManager::broadcast_block_change`]: a whole chunk is only
+    /// resent when the lightweight `UpdateBlockPacket` could not be
+    /// delivered; the normal single-block path never resends a chunk.
     fn refresh_chunk_at(&self, x: i32, z: i32) {
         let chunk = (x >> 4, z >> 4);
         let mut map = self.sessions.write();
@@ -3229,6 +5080,79 @@ impl SessionManager {
                 .push(OutgoingPacket::LevelChunk(session.create_chunk_packet(chunk.0, chunk.1)));
         }
     }
+
+    /// Fase 2 (Java -> Bedrock): queues a single-block
+    /// `UpdateBlockPacket` (0x15, [`UPDATE_BLOCK_PACKET_ID`]) for every
+    /// joined Bedrock session that already has the affected chunk in view
+    /// (`sent_chunks` contains `(x >> 4, z >> 4)`), via
+    /// `OutgoingPacket::RawWire`. Sessions without that chunk get nothing:
+    /// when they stream it, `chunk_payload` already includes the edit.
+    ///
+    /// Returns how many sessions received the packet. When nobody has the
+    /// chunk there is no stale client to fix, so the `LevelChunk` fallback
+    /// ([`SessionManager::refresh_chunk_at`], invoked by
+    /// [`SessionManager::poll_block_changes`]) is a no-op by construction;
+    /// a new viewer always gets a chunk generated from the edited world.
+    pub fn broadcast_block_change(&self, x: i32, y: i32, z: i32, block_id: u32) -> usize {
+        self.broadcast_block_change_ref(&BlockChange::new(x, y, z, block_id))
+    }
+
+    fn broadcast_block_change_ref(&self, change: &BlockChange) -> usize {
+        let chunk = (change.x >> 4, change.z >> 4);
+        let wire = update_block_wire(change.x, change.y, change.z, change.block_id);
+        let mut map = self.sessions.write();
+        let mut recipients = 0usize;
+        for session in map.values_mut() {
+            if !session.joined || !session.sent_chunks.contains(&chunk) {
+                continue;
+            }
+            session
+                .pending_outgoing
+                .push(OutgoingPacket::RawWire(wire.clone()));
+            recipients += 1;
+        }
+        recipients
+    }
+
+    /// Fase 2 poll: drains the Bedrock broadcast queue
+    /// ([`WorldState::take_broadcast_changes`]) and broadcasts every queued
+    /// change as an `UpdateBlockPacket` (see
+    /// [`SessionManager::broadcast_block_change`]). Changes with no viewer
+    /// holding the chunk fall back to a `LevelChunk` refresh attempt
+    /// ([`SessionManager::refresh_chunk_at`]), which is a no-op when, as
+    /// usual, no session has that chunk yet.
+    ///
+    /// Returns the number of changes that reached at least one viewer.
+    /// Safe to call when the queue is empty (the common case) and from the
+    /// existing tick/message paths: `apply_actions` polls at its end (so a
+    /// Bedrock break, a `PluginAction::SetBlock` or a core command is
+    /// forwarded in the same dispatch), and `poll_prespawn_timeouts`
+    /// polls them at the 20-tick cadence `main.rs` already drives — which
+    /// is also how a Java edit made purely through the
+    /// `world.set_block` host call (no plugin action) reaches Bedrock on
+    /// the next tick/packet. The Java queue
+    /// (`world.take_block_changes`) is independent and untouched here.
+    pub fn poll_block_changes(&self) -> usize {
+        let changes = self.world.take_broadcast_changes();
+        let mut delivered = 0usize;
+        for change in &changes {
+            if self.broadcast_block_change_ref(change) > 0 {
+                delivered += 1;
+            } else {
+                self.refresh_chunk_at(change.x, change.z);
+            }
+        }
+        delivered
+    }
+}
+
+/// `date("D_M_j-H.i.s-T_Y")` equivalent for `/dumpmemory` default path.
+fn time_now_for_dump() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("dump-{secs}")
 }
 
 /// InventorySlotPacket (0x32) wire bytes.
@@ -3273,14 +5197,6 @@ fn set_health_wire(health: f32) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.write_var_u32(SetHealthPacket::PACKET_ID);
     SetHealthPacket::new(health.round() as i32).encode_payload(&mut writer);
-    writer.into_bytes().to_vec()
-}
-
-/// InventoryContentPacket (0x31) with the player's 36 main slots.
-fn inventory_content_wire(items: &[ItemStack]) -> Vec<u8> {
-    let mut writer = Writer::new();
-    writer.write_var_u32(InventoryContentPacket::PACKET_ID);
-    InventoryContentPacket::inventory(items.to_vec()).encode_payload(&mut writer);
     writer.into_bytes().to_vec()
 }
 
@@ -3356,4 +5272,634 @@ fn text_with_type(text_type: u8, message: &str) -> TextPacket {
         xbox_user_id: String::new(),
         platform_chat_id: String::new(),
     }
+}
+
+#[cfg(test)]
+mod block_sync_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn joined_session(id: u64, chunks: &[(i32, i32)]) -> PlayerSession {
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(id, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.sent_chunks = chunks.iter().copied().collect();
+        session
+    }
+
+    #[test]
+    fn update_block_wire_is_0x15_blockpos_id_flags() {
+        let wire = update_block_wire(1, 64, -3, 0xDEAD_BEEF);
+        let mut reader = Reader::new(&wire);
+        assert_eq!(reader.read_var_u32().unwrap(), UPDATE_BLOCK_PACKET_ID);
+        // 0x15, not 0x0B (StartGame).
+        assert_eq!(UPDATE_BLOCK_PACKET_ID, 21);
+        assert_eq!(BlockPos::read(&mut reader).unwrap(), BlockPos::new(1, 64, -3));
+        assert_eq!(reader.read_var_i32().unwrap(), 0xDEAD_BEEF_u32 as i32);
+        assert_eq!(reader.read_byte().unwrap(), UPDATE_BLOCK_FLAGS_ALL);
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn broadcast_only_reaches_sessions_holding_the_chunk() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, &[(0, 0)]));
+        manager.add_session(joined_session(2, &[(9, 9)]));
+        manager.add_session(joined_session(3, &[]));
+
+        let recipients = manager.broadcast_block_change(1, 64, 2, 42);
+        assert_eq!(recipients, 1);
+
+        let map = manager.sessions.read();
+        let viewer = &map[&1];
+        assert_eq!(viewer.pending_outgoing.len(), 1);
+        assert_eq!(viewer.pending_outgoing[0].packet_id(), UPDATE_BLOCK_PACKET_ID);
+        let OutgoingPacket::RawWire(bytes) = &viewer.pending_outgoing[0] else {
+            panic!("expected RawWire UpdateBlockPacket");
+        };
+        assert_eq!(bytes, &update_block_wire(1, 64, 2, 42));
+        assert!(map[&2].pending_outgoing.is_empty());
+        assert!(map[&3].pending_outgoing.is_empty());
+    }
+
+    #[test]
+    fn poll_forwards_host_set_block_once_and_keeps_java_queue() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, &[(0, 0)]));
+
+        // Java -> world.set_block (host call path, no plugin action).
+        assert!(manager.world().set_block(2, 64, 3, 77));
+
+        assert_eq!(manager.poll_block_changes(), 1);
+        {
+            let map = manager.sessions.read();
+            assert_eq!(map[&1].pending_outgoing.len(), 1);
+            assert_eq!(
+                map[&1].pending_outgoing[0].packet_id(),
+                UPDATE_BLOCK_PACKET_ID
+            );
+        }
+        // Bedrock queue drained; a second poll sends nothing.
+        assert_eq!(manager.poll_block_changes(), 0);
+        // Fase 1 queue is independent: Java still gets the change.
+        assert_eq!(
+            manager.world().take_changes(),
+            vec![BlockChange::new(2, 64, 3, 77)]
+        );
+    }
+
+    #[test]
+    fn apply_actions_set_block_sends_update_block_not_level_chunk() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, &[(0, 0)]));
+
+        let actions = vec![PluginAction::SetBlock {
+            world: "world".to_string(),
+            x: 5,
+            y: 64,
+            z: 6,
+            block_id: 123,
+        }];
+        manager.apply_actions(&actions, 0);
+
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
+            assert_eq!(viewer.pending_outgoing.len(), 1);
+            assert!(matches!(
+                viewer.pending_outgoing[0],
+                OutgoingPacket::RawWire(_)
+            ));
+            assert_eq!(
+                viewer.pending_outgoing[0].packet_id(),
+                UPDATE_BLOCK_PACKET_ID
+            );
+        }
+        // Fase 1: the same edit is queued for Java.
+        assert_eq!(
+            manager.world().take_changes(),
+            vec![BlockChange::new(5, 64, 6, 123)]
+        );
+    }
+
+    #[test]
+    fn poll_with_no_viewers_falls_back_without_sending() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, &[(9, 9)]));
+
+        // Chunk (0,0) is held by nobody: UpdateBlock has no recipient and
+        // the LevelChunk fallback must not invent a chunk for session 1.
+        assert!(manager.world().set_block(1, 64, 1, 55));
+        assert_eq!(manager.poll_block_changes(), 0);
+        let map = manager.sessions.read();
+        assert!(map[&1].pending_outgoing.is_empty());
+        assert!(map[&1].sent_chunks.contains(&(9, 9)));
+    }
+
+    #[test]
+    fn bedrock_use_item_place_reaches_both_queues_with_real_id() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+        use bedrock_protocol::ItemStack;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        // Production shares one WorldState between the manager and every
+        // session (dispatch_webrtc_packet re-points session.world): the
+        // occupancy check needs the same world the manager edits.
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        // Clicked block (2,79,3) face 1 (up) -> target (2,80,3) in the sky,
+        // air in both worlds. Placed id 999 is deliberately NOT stone/air:
+        // both sync directions must forward the real id, never a fallback.
+        let mut held = ItemStack::new(1, 1);
+        held.block_runtime_id = 999;
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: (2, 79, 3),
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 123, // clicked block's id, not the placed one
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        let payload = writer.into_bytes().to_vec();
+        manager
+            .handle_session_packet(1, 0x1E, &payload)
+            .expect("use item");
+
+        // handle_session_packet holds the session lock and cannot apply
+        // actions inline (what dispatch_webrtc_packet does after releasing
+        // it): drain the queued SetBlock and apply it like dispatch does.
+        let actions: Vec<PluginAction> = {
+            let mut map = manager.sessions.write();
+            let session = map.get_mut(&1).expect("placer session");
+            std::mem::take(&mut session.pending_actions)
+        };
+        assert_eq!(
+            actions,
+            vec![PluginAction::SetBlock {
+                world: "world".to_string(),
+                x: 2,
+                y: 80,
+                z: 3,
+                block_id: 999,
+            }]
+        );
+        manager.apply_actions(&actions, 0);
+
+        // Manager world holds the real id.
+        assert_eq!(manager.world().block_at(2, 80, 3), 999);
+        // Fase 2 (Java -> Bedrock style, here Bedrock placer -> viewers):
+        // exactly one UpdateBlock 0x15 with the real id, payload byte-exact.
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
+            assert_eq!(viewer.pending_outgoing.len(), 1);
+            assert_eq!(
+                viewer.pending_outgoing[0],
+                OutgoingPacket::RawWire(update_block_wire(2, 80, 3, 999))
+            );
+        }
+        // Fase 1: the same real id is queued for the Java bridge.
+        assert_eq!(
+            manager.world().take_changes(),
+            vec![BlockChange::new(2, 80, 3, 999)]
+        );
+        // A second poll re-sends nothing (no echo duplication).
+        assert_eq!(manager.poll_block_changes(), 0);
+    }
+
+    #[test]
+    fn bedrock_use_item_place_into_occupied_cell_is_ignored() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+        use bedrock_protocol::ItemStack;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        // Occupy the target first (direct edit, both queues drained).
+        assert!(manager.world().set_block(2, 80, 3, 111));
+        assert_eq!(manager.poll_block_changes(), 1);
+        assert!(manager.world().take_changes().len() == 1);
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1).unwrap().pending_outgoing.clear();
+        }
+
+        let mut held = ItemStack::new(1, 1);
+        held.block_runtime_id = 999;
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: (2, 79, 3),
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 123,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        let payload = writer.into_bytes().to_vec();
+        manager
+            .handle_session_packet(1, 0x1E, &payload)
+            .expect("use item");
+
+        // Occupied -> no SetBlock queued, world keeps 111, no UpdateBlock.
+        let actions: Vec<PluginAction> = {
+            let mut map = manager.sessions.write();
+            let session = map.get_mut(&1).expect("placer session");
+            std::mem::take(&mut session.pending_actions)
+        };
+        assert!(actions.is_empty());
+        assert_eq!(manager.world().block_at(2, 80, 3), 111);
+        assert_eq!(manager.poll_block_changes(), 0);
+        assert!(manager.world().take_changes().is_empty());
+    }
+
+    #[test]
+    fn tick_world_time_advances_and_broadcasts_every_interval_and_on_jump() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, &[(0, 0)]));
+        let start = manager.world().time();
+
+        // No broadcast before the interval elapses.
+        for _ in 0..(TIME_BROADCAST_INTERVAL_TICKS - 1) {
+            manager.tick_world_time();
+        }
+        assert!(manager.sessions.read()[&1].pending_outgoing.is_empty());
+        assert_eq!(manager.world().time(), start + TIME_BROADCAST_INTERVAL_TICKS - 1);
+
+        // Interval reached: one SetTime (0x0A) with the current time.
+        let time = manager.tick_world_time();
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
+            assert_eq!(viewer.pending_outgoing.len(), 1);
+            assert_eq!(viewer.pending_outgoing[0].packet_id(), 0x0A);
+            let OutgoingPacket::RawWire(bytes) = &viewer.pending_outgoing[0] else {
+                panic!("expected RawWire SetTime");
+            };
+            assert_eq!(bytes, &set_time_wire(time));
+        }
+
+        // A jump (`/time set` via host/plugin) broadcasts on the next
+        // tick, without waiting for the interval.
+        manager.world().set_time(6_000);
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1).unwrap().pending_outgoing.clear();
+        }
+        let time = manager.tick_world_time();
+        assert_eq!(time, 6_001);
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
+            assert_eq!(viewer.pending_outgoing.len(), 1);
+            let OutgoingPacket::RawWire(bytes) = &viewer.pending_outgoing[0] else {
+                panic!("expected RawWire SetTime after jump");
+            };
+            assert_eq!(bytes, &set_time_wire(6_001));
+        }
+
+        // Stopped time does not advance, but the periodic broadcast
+        // still re-sends it (clients would otherwise drift locally).
+        manager.world().stop_time();
+        for _ in 0..TIME_BROADCAST_INTERVAL_TICKS {
+            assert_eq!(manager.tick_world_time(), 6_001);
+        }
+        let map = manager.sessions.read();
+        assert!(!map[&1].pending_outgoing.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod virtual_visibility_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn joined_session(id: u64, username: &str) -> PlayerSession {
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(id, addr);
+        session.username = username.to_string();
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.position = Vector3f::new(0.5, 63.0, 0.5);
+        session
+    }
+
+    fn register_virtual(manager: &SessionManager, name: &str, x: f64, y: f64, z: f64) {
+        let mut player =
+            PlayerContext::new(name, "127.0.0.1:25565".parse().unwrap());
+        player.is_virtual = true;
+        player.x = x;
+        player.y = y;
+        player.z = z;
+        manager.registry().upsert(player);
+    }
+
+    fn move_virtual(manager: &SessionManager, name: &str, x: f64, y: f64, z: f64) {
+        let mut player = manager.registry().get(name).expect("virtual registered");
+        player.apply_position(x, y, z, player.yaw, player.pitch);
+        manager.registry().upsert(player);
+    }
+
+    #[test]
+    fn virtual_spawn_emits_player_list_and_add_player() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, "Steve"));
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+
+        // PlayerList addition + AddPlayer for the single Bedrock viewer.
+        assert_eq!(manager.poll_virtual_players(), 2);
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
+            assert_eq!(viewer.pending_outgoing.len(), 2);
+            assert!(matches!(
+                &viewer.pending_outgoing[0],
+                OutgoingPacket::PlayerList(packet)
+                    if packet.entries.len() == 1
+                        && packet.entries[0].username == "Procatin0"
+            ));
+            let OutgoingPacket::AddPlayer(packet) = &viewer.pending_outgoing[1] else {
+                panic!("expected AddPlayer for virtual");
+            };
+            assert_eq!(packet.username, "Procatin0");
+            assert_eq!(packet.actor_runtime_id, 10_000_000);
+            // Feet position straight from the virtual snapshot.
+            assert_eq!(packet.position, Vector3f::new(2.5, 63.0, -1.5));
+            assert_eq!(packet.game_mode, 0);
+        }
+        // Idempotent: a second poll without changes queues nothing.
+        assert_eq!(manager.poll_virtual_players(), 0);
+    }
+
+    #[test]
+    fn virtual_move_emits_move_actor_absolute() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, "Steve"));
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+        assert_eq!(manager.poll_virtual_players(), 2);
+
+        move_virtual(&manager, "Procatin0", 4.5, 64.0, -1.5);
+        assert_eq!(manager.poll_virtual_players(), 1);
+        let map = manager.sessions.read();
+        let viewer = &map[&1];
+        let OutgoingPacket::MoveActorAbsolute(packet) = &viewer.pending_outgoing[2] else {
+            panic!("expected MoveActorAbsolute for virtual move");
+        };
+        assert_eq!(packet.actor_runtime_id, 10_000_000);
+        // Eye position (feet + 1.62), like Bedrock players.
+        assert_eq!(
+            packet.position,
+            Vector3f::new(4.5, 64.0 + EYE_HEIGHT, -1.5)
+        );
+        // No change, no packet.
+        assert_eq!(manager.poll_virtual_players(), 0);
+    }
+
+    #[test]
+    fn virtual_unregister_emits_remove_actor() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, "Steve"));
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+        assert_eq!(manager.poll_virtual_players(), 2);
+
+        // `player.unregister` drops the registry entry.
+        assert!(manager.registry().remove_if_virtual("Procatin0"));
+        assert_eq!(manager.poll_virtual_players(), 2);
+        let map = manager.sessions.read();
+        let viewer = &map[&1];
+        assert_eq!(viewer.pending_outgoing.len(), 4);
+        assert!(matches!(
+            &viewer.pending_outgoing[2],
+            OutgoingPacket::RemoveActor(packet)
+                if packet.actor_unique_id == 10_000_000
+        ));
+        assert!(matches!(
+            &viewer.pending_outgoing[3],
+            OutgoingPacket::PlayerList(packet)
+                if packet.entries.len() == 1
+                    && packet.entries[0].entry_type == PlayerListPacket::TYPE_REMOVE
+        ));
+        assert_eq!(manager.poll_virtual_players(), 0);
+    }
+
+    #[test]
+    fn bedrock_join_sees_existing_virtual_and_vice_versa() {
+        let manager = SessionManager::new();
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+        manager.add_session(joined_session(1, "Steve"));
+        // No other Bedrock player yet: Bedrock->Bedrock broadcast is empty,
+        // but the virtual sync inside it must spawn the Java body.
+        manager.broadcast_add_player(1);
+        let map = manager.sessions.read();
+        let viewer = &map[&1];
+        assert!(viewer
+            .pending_outgoing
+            .iter()
+            .any(|packet| matches!(packet, OutgoingPacket::PlayerList(_))));
+        assert!(viewer
+            .pending_outgoing
+            .iter()
+            .any(|packet| matches!(
+                packet,
+                OutgoingPacket::AddPlayer(packet) if packet.username == "Procatin0"
+            )));
+    }
+
+    #[test]
+    fn unspawned_viewer_gets_no_virtual_spawn() {
+        let manager = SessionManager::new();
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(1, addr);
+        session.username = "Steve".to_string();
+        session.state = SessionState::PreSpawn;
+        // joined/spawned stay false.
+        manager.add_session(session);
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+        assert_eq!(manager.poll_virtual_players(), 0);
+        assert!(manager.sessions.read()[&1].pending_outgoing.is_empty());
+    }
+
+    #[test]
+    fn same_name_bedrock_session_wins_over_virtual_snapshot() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, "Procatin0"));
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+        // One name, one entity: the live Bedrock session owns it.
+        assert_eq!(manager.poll_virtual_players(), 0);
+    }
+
+    #[test]
+    fn virtual_move_reaches_every_bedrock_viewer() {
+        let manager = SessionManager::new();
+        manager.add_session(joined_session(1, "Steve"));
+        manager.add_session(joined_session(2, "Alex"));
+        register_virtual(&manager, "Procatin0", 2.5, 63.0, -1.5);
+
+        // Two viewers: PlayerList + AddPlayer for each.
+        assert_eq!(manager.poll_virtual_players(), 4);
+        {
+            let map = manager.sessions.read();
+            for id in [1, 2] {
+                assert_eq!(map[&id].pending_outgoing.len(), 2, "spawn for viewer {id}");
+            }
+        }
+
+        // One Java move must emit one MoveActorAbsolute for EVERY viewer,
+        // not just the first one (`mark_sent` used to run per-viewer, so
+        // the second Bedrock client kept seeing a frozen Java body).
+        move_virtual(&manager, "Procatin0", 4.5, 64.0, -1.5);
+        assert_eq!(manager.poll_virtual_players(), 2);
+        let map = manager.sessions.read();
+        for id in [1, 2] {
+            let viewer = &map[&id];
+            assert_eq!(
+                viewer.pending_outgoing.len(),
+                3,
+                "viewer {id} must get exactly one move packet"
+            );
+            let OutgoingPacket::MoveActorAbsolute(packet) = &viewer.pending_outgoing[2] else {
+                panic!("expected MoveActorAbsolute for viewer {id}");
+            };
+            assert_eq!(packet.actor_runtime_id, 10_000_000);
+            assert_eq!(
+                packet.position,
+                Vector3f::new(4.5, 64.0 + EYE_HEIGHT, -1.5)
+            );
+        }
+        // Idempotent: the move was delivered to all viewers.
+        assert_eq!(manager.poll_virtual_players(), 0);
+    }
+}
+
+#[cfg(test)]
+mod attributes_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// Decodes the ids written by `create_update_attributes_packet`:
+    /// packet id, runtime id, count, then per attribute six f32s, id and
+    /// a trailing var_u32 flag.
+    fn attribute_ids(wire: &[u8]) -> Vec<String> {
+        let mut reader = Reader::new(wire);
+        assert_eq!(reader.read_var_u32().unwrap(), 0x1d);
+        reader.read_var_u64().unwrap();
+        let count = reader.read_var_u32().unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            for _ in 0..6 {
+                reader.read_f32_le().unwrap();
+            }
+            ids.push(reader.read_string().unwrap());
+            reader.read_var_u32().unwrap();
+        }
+        assert_eq!(reader.read_var_u64().unwrap(), 0);
+        assert_eq!(reader.remaining(), 0);
+        ids
+    }
+
+    #[test]
+    fn update_attributes_never_sends_air() {
+        // Regression: `minecraft:air` is not a Bedrock attribute (BDS syncs
+        // breath via SetActorData 7/42). Sending it made the client log
+        // `Cannot find attribute minecraft:air`.
+        let session = PlayerSession::new(7, "127.0.0.1:19132".parse::<SocketAddr>().unwrap());
+        let ids = attribute_ids(&session.create_update_attributes_packet());
+        assert_eq!(
+            ids,
+            vec![
+                "minecraft:health",
+                "minecraft:player.hunger",
+                "minecraft:player.saturation",
+                "minecraft:movement",
+                "minecraft:player.level",
+                "minecraft:player.experience",
+            ]
+        );
+        assert!(!ids.contains(&"minecraft:air".to_string()));
+        assert!(!ids.iter().any(|id| id.ends_with("air")));
+    }
+
+    #[test]
+    fn breaching_air_still_syncs_via_set_actor_data() {
+        // The breath value must keep reaching the client through metadata
+        // 7 (DATA_AIR) and 42 (max air) after dropping the attribute.
+        let session = PlayerSession::new(7, "127.0.0.1:19132".parse::<SocketAddr>().unwrap());
+        let wire = session.create_set_actor_data_packet();
+        let mut reader = Reader::new(&wire);
+        assert_eq!(reader.read_var_u32().unwrap(), SetActorDataPacket::PACKET_ID);
+        let packet = SetActorDataPacket::decode_payload(&mut reader).expect("decode");
+        let air = packet.metadata.iter().find(|entry| entry.key == 7).expect("air");
+        assert_eq!(air.value, MetadataValue::Short(session.air));
+        let max_air = packet
+            .metadata
+            .iter()
+            .find(|entry| entry.key == 42)
+            .expect("max air");
+        assert_eq!(max_air.value, MetadataValue::Short(session.air));
+        assert_eq!(reader.remaining(), 0);
+    }
+}
+
+/// Deterministic offline UUID for a session when the client did not send a
+/// parseable `identity` claim. Uses FNV-1a over `<session_id>:<name>` so the
+/// same name always yields the same UUID across restarts.
+fn derive_uuid_for_session(session_id: u64, name: &str) -> [u8; 16] {
+    let seed = format!("{}:{}", session_id, name);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in seed.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&hash.to_le_bytes());
+    let mut hash2 = hash ^ 0x9e3779b97f4a7c15;
+    // Second mix for the low half so both halves differ.
+    for byte in seed.as_bytes().iter().rev() {
+        hash2 ^= *byte as u64;
+        hash2 = hash2.wrapping_mul(0x100000001b3);
+    }
+    out[8..16].copy_from_slice(&hash2.to_le_bytes());
+    out
+}
+
+/// Deterministic UUID for a virtual (Java bridge) entity. The `virtual:`
+/// prefix keeps it disjoint from Bedrock session UUIDs derived from
+/// `<session_id>:<name>`.
+fn virtual_uuid_for(name: &str) -> [u8; 16] {
+    derive_uuid_for_session(0, &format!("virtual:{}", name.to_lowercase()))
 }
