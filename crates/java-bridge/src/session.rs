@@ -11,7 +11,7 @@
 //! (or [`JavaSession::poll_bytes`]) and drain [`JavaSession::take_out`].
 //! `server.rs` does that over Tokio; unit tests do it in memory. Periodic
 //! work mirrors `JavaClient::tick` + `JavaServer::tick*` gating:
-//! keep-alive every 10 s, `maybeUpdatePosition` throttled to ~2 ticks,
+//! keep-alive every 10 s, `maybeUpdatePosition` every tick on change,
 //! `deliverPluginMessages` every 5 ticks, gamemode/teleport sync staggered
 //! every 10 ticks, chunk streaming under a time budget.
 //!
@@ -60,6 +60,11 @@ pub struct SeenEntity {
     /// Java yaw/pitch (wire convention).
     pub yaw: f64,
     pub pitch: f64,
+    /// Java head yaw (wire convention); Bedrock `headYaw`, Java virtuals
+    /// report body yaw here.
+    pub head_yaw: f64,
+    /// Last sneak state sent in the metadata flags byte.
+    pub is_sneaking: bool,
     pub gamemode: i32,
 }
 
@@ -79,6 +84,10 @@ pub struct EntityTarget {
     pub z: f64,
     pub yaw: f64,
     pub pitch: f64,
+    /// Java head yaw; Bedrock `headYaw`, Java virtuals report body yaw here.
+    pub head_yaw: f64,
+    /// Sneak state, shown to Java viewers via the metadata flags byte.
+    pub is_sneaking: bool,
     pub gamemode: i32,
     pub ping: i32,
 }
@@ -105,6 +114,12 @@ pub struct JavaSession {
     /// Java yaw/pitch (wire convention).
     pub yaw: f64,
     pub pitch: f64,
+    /// Sneak state (`entity_action` / `player_input` shift bit), forwarded
+    /// to the registry so Bedrock viewers see the sneak flag.
+    pub is_sneaking: bool,
+    /// Sprint state (`entity_action` sprint / `player_input` sprint bit),
+    /// forwarded like sneak for Bedrock viewers.
+    pub is_sprinting: bool,
     pub gamemode: i32,
     pub health: f32,
     /// Chunks already sent (`sentChunks`).
@@ -129,6 +144,10 @@ pub struct JavaSession {
     pub seen_entities: HashMap<String, SeenEntity>,
     /// Players announced in this client's TAB (`tabListed`).
     pub tab_listed: HashMap<String, TabEntry>,
+    /// Play packet ids seen but not handled yet: logged once each so parity
+    /// gaps (e.g. a `block_dig` id mismatch) are visible in `server.log`
+    /// instead of silently dropped.
+    pub unhandled_ids: HashSet<i32>,
     in_buf: Vec<u8>,
     out_buf: Vec<u8>,
     pub closed: bool,
@@ -151,6 +170,8 @@ impl JavaSession {
             z: 0.5,
             yaw: 0.0,
             pitch: 0.0,
+            is_sneaking: false,
+            is_sprinting: false,
             gamemode: 0,
             health: 20.0,
             sent_chunks: HashSet::new(),
@@ -170,6 +191,7 @@ impl JavaSession {
             api_joined: false,
             seen_entities: HashMap::new(),
             tab_listed: HashMap::new(),
+            unhandled_ids: HashSet::new(),
             in_buf: Vec::new(),
             out_buf: Vec::new(),
             closed: false,
@@ -241,6 +263,14 @@ impl JavaSession {
             if self.tick_count % 5 == 1 {
                 self.deliver_plugin_messages(hooks);
             }
+            // apiBossBar Java side: queued `boss_bar` frames (already
+            // framed per protocol) are appended verbatim every tick,
+            // like plugin chat lines above.
+            self.deliver_bossbar_frames(hooks);
+            // Scoreboard Java side: same verbatim-frame drain for
+            // `scoreboard_objective`/`scoreboard_score`/
+            // `scoreboard_display_objective`/`reset_score`.
+            self.deliver_scoreboard_frames(hooks);
             if self.tick_count % 10 == 2 {
                 self.sync_gamemode(hooks);
             }
@@ -256,6 +286,14 @@ impl JavaSession {
     // ------------------------------------------------------------------
 
     fn handle_packet(&mut self, hooks: &dyn ServerHooks, packet_id: i32, payload: &[u8]) {
+        // Diagnostic: log every Java packet once per (state, id) to see where
+        // the client gets stuck (e.g. never reaching Play).
+        if self.unhandled_ids.insert(10000 + self.state as i32 * 1000 + packet_id) {
+            tracing::info!(
+                "Java {}: state={:?} packet_id={} len={}",
+                self.peer, self.state, packet_id, payload.len()
+            );
+        }
         match self.state {
             SessionState::Handshake => self.handle_handshake(hooks, packet_id, payload),
             SessionState::Status => self.handle_status(hooks, packet_id, payload),
@@ -439,6 +477,8 @@ impl JavaSession {
             z: self.z,
             yaw: wire::java_yaw_to_bedrock(self.yaw),
             pitch: self.pitch,
+            head_yaw: wire::java_yaw_to_bedrock(self.yaw),
+            is_sneaking: self.is_sneaking,
             gamemode: self.gamemode,
             ping: 0,
             is_virtual: true,
@@ -585,7 +625,82 @@ impl JavaSession {
         self.request_chunks(hooks);
     }
 
+    /// Applies a sneak toggle from `entity_action` / `player_input` and
+    /// forwards the edge to the registry (`PlayerContext.is_sneaking`),
+    /// so Bedrock viewers receive the `SetActorDataPacket` sneak flag.
+    fn set_sneaking(&mut self, hooks: &dyn ServerHooks, sneaking: bool) {
+        if self.is_sneaking == sneaking {
+            return;
+        }
+        self.is_sneaking = sneaking;
+        if let Some(name) = self.username.clone() {
+            hooks.update_virtual_sneak(&name, sneaking);
+        }
+    }
+
+    /// Applies a sprint toggle the same way as [`Self::set_sneaking`].
+    /// Only sneak is rendering-relevant today (`FLAG_SPRINTING` already
+    /// rides `PlayerSession::data_flags` for Bedrock players); the local
+    /// state is kept so the `player_input` sprint bit never goes stale.
+    fn set_sprinting(&mut self, _hooks: &dyn ServerHooks, sprinting: bool) {
+        self.is_sprinting = sprinting;
+    }
+
+    /// `entity_action` payload (legacy + modern 769/770): entityId +
+    /// actionId + jumpBoost as varints. Actions 0=start_sneaking,
+    /// 1=stop_sneaking, 3=start_sprinting, 4=stop_sprinting (1.21.9+
+    /// removed the sneak actions — there `player_input` shift is the
+    /// only sneak signal; the sprint actions are still valid).
+    fn handle_entity_action(&mut self, hooks: &dyn ServerHooks, payload: &[u8]) {
+        let mut r = wire::Reader::new(payload);
+        let (Some(entity_id), Some(action)) = (r.read_varint(), r.read_varint()) else {
+            return;
+        };
+        // The packet names the acting entity: only our own actions count.
+        // `entity_id` may not be assigned yet (pre-`enter_play`), in which
+        // case there is nothing to forward.
+        let own = self.own_entity_id;
+        let matches_own = own == Some(entity_id)
+            || (own.is_none()
+                && self
+                    .username
+                    .as_deref()
+                    .map(|name| hooks.entity_id_for(name) == entity_id)
+                    .unwrap_or(false));
+        if !matches_own {
+            return;
+        }
+        match action {
+            0 => self.set_sneaking(hooks, true),
+            1 => self.set_sneaking(hooks, false),
+            3 => self.set_sprinting(hooks, true),
+            4 => self.set_sprinting(hooks, false),
+            _ => {}
+        }
+    }
+
+    /// `player_input` payload (modern serverbound): one bitflags byte
+    /// (forward, backward, left, right, jump, shift, sprint). The shift
+    /// bit is the per-tick sneak state (the only sneak signal on
+    /// 1.21.9+); the sprint bit mirrors it.
+    fn handle_player_input(&mut self, hooks: &dyn ServerHooks, payload: &[u8]) {
+        let Some(&inputs) = payload.first() else {
+            return;
+        };
+        self.set_sneaking(hooks, inputs & wire::PLAYER_INPUT_SHIFT != 0);
+        self.set_sprinting(hooks, inputs & wire::PLAYER_INPUT_SPRINT != 0);
+    }
+
     fn handle_play(&mut self, hooks: &dyn ServerHooks, packet_id: i32, payload: &[u8]) {
+        // Resolve per-protocol ids instead of relying on `wire.rs` constants,
+        // which are correct only for one protocol version. On 775,
+        // `block_dig`=41 (not 0x14=20), `block_place`=42 (not 0x1F=31),
+        // `entity_action`=26 (not 0x1B=27). Using the wrong constant routes a
+        // different packet into the dig/place handler, producing garbage
+        // coordinates (e.g. z=61513 for a player at z≈19).
+        let block_dig_id = self.pid("block_dig");
+        let block_place_id = self.pid("block_place");
+        let entity_action_id = self.pid("entity_action");
         match packet_id {
             wire::C2S_KEEP_ALIVE
             | wire::C2S_TELEPORT_CONFIRM
@@ -623,8 +738,9 @@ impl JavaSession {
                     }
                 }
             }
-            wire::C2S_BLOCK_DIG => self.handle_block_dig(hooks, payload, true),
-            wire::C2S_BLOCK_PLACE => self.handle_block_place(hooks, payload, true),
+            id if id == block_dig_id => self.handle_block_dig(hooks, payload, true),
+            id if id == block_place_id => self.handle_block_place(hooks, payload, true),
+            id if id == entity_action_id => self.handle_entity_action(hooks, payload),
             wire::C2S_SETTINGS => {
                 let mut r = wire::Reader::new(payload);
                 let locale = r.read_string().unwrap_or_default();
@@ -644,7 +760,12 @@ impl JavaSession {
     }
 
     fn pid(&self, key: &str) -> i32 {
-        profile::packet_id(self.protocol, key).unwrap_or(-1)
+        profile::packet_id(self.protocol, key).unwrap_or_else(|| match key {
+            "block_dig" => wire::C2S_BLOCK_DIG,
+            "block_place" => wire::C2S_BLOCK_PLACE,
+            "entity_action" => wire::C2S_ENTITY_ACTION,
+            _ => -1,
+        })
     }
 
     fn handle_modern_play(&mut self, hooks: &dyn ServerHooks, packet_id: i32, payload: &[u8]) {
@@ -702,6 +823,21 @@ impl JavaSession {
             self.handle_block_dig(hooks, payload, false);
         } else if packet_id == self.pid("block_place") {
             self.handle_block_place(hooks, payload, false);
+        } else if packet_id == self.pid("entity_action") {
+            self.handle_entity_action(hooks, payload);
+        } else if packet_id == self.pid("player_input") {
+            self.handle_player_input(hooks, payload);
+        } else if self.unhandled_ids.insert(packet_id) {
+            // Visibility for parity gaps: an id we never route would
+            // otherwise vanish without a trace (this is how the block_dig
+            // mapping would hide a break bug).
+            hooks.log(format!(
+                "Java {}: paquete de juego no manejado id={} len={} (protocolo {})",
+                self.peer,
+                packet_id,
+                payload.len(),
+                self.protocol
+            ));
         }
     }
 
@@ -728,19 +864,42 @@ impl JavaSession {
     fn handle_block_dig(&mut self, hooks: &dyn ServerHooks, payload: &[u8], legacy: bool) {
         let mut r = wire::Reader::new(payload);
         let (Some(status), Some((x, y, z))) = (r.read_varint(), r.read_position()) else {
+            tracing::info!(
+                "java dig: payload no parseable (len={}, legacy={})",
+                payload.len(),
+                legacy
+            );
             return;
         };
-        if status != 2 {
+        // Java `PlayerAction` statuses: 0 = START_DESTROY_BLOCK,
+        // 1 = ABORT_DESTROY_BLOCK, 2 = STOP_DESTROY_BLOCK.
+        // Creative breaks on the *start* action (the block disappears
+        // instantly and the client never sends STOP), so requiring status 2
+        // silently dropped every creative break. Survival completes on
+        // status 2.
+        let creative_instant = status == 0 && self.gamemode == 1;
+        if status != 2 && !creative_instant {
+            tracing::info!(
+                "java dig: status={} (ignored) block=({},{},{}) gamemode={}",
+                status, x, y, z, self.gamemode
+            );
             return;
         }
         let canonical_y = if legacy { y - 64 } else { y };
-        if (x as f64 + 0.5 - self.x).abs() > 6.0
-            || (canonical_y as f64 + 0.5 - self.y).abs() > 6.0
-            || (z as f64 + 0.5 - self.z).abs() > 6.0
-        {
-            return;
-        }
-        if hooks.break_block(x, canonical_y, z) {
+        // NOTE: reach gate intentionally disabled while diagnosing why Java
+        // block_dig coordinates arrive garbage (observed z=65609 vs player
+        // z≈14). Re-enable once the wire mapping is confirmed.
+        tracing::info!(
+            "java dig: status={} block=({},{},{}) player=({:.2},{:.2},{:.2}) gamemode={} payload_hex={}",
+            status, x, canonical_y, z, self.x, self.y, self.z, self.gamemode,
+            payload.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+        );
+        let broke = hooks.break_block(x, canonical_y, z);
+        tracing::info!(
+            "java dig result: block=({},{},{}) broke={}",
+            x, canonical_y, z, broke
+        );
+        if broke {
             self.send_block_change(hooks, x, canonical_y, z, "air", None);
         } else {
             self.send_block_change(hooks, x, canonical_y, z, "", None);
@@ -821,9 +980,16 @@ impl JavaSession {
             }
             return;
         }
+        // Forward every tick the position changed (20 Hz), not every
+        // 2 ticks: Bedrock viewers render a virtual player from the
+        // registry via `MoveActorAbsolutePacket` and interpolate
+        // between updates, so a 10 Hz registry cadence shows up as
+        // visible stepping / 100 ms jumps. The registry write plus
+        // `poll_virtual_players` is microseconds (one player), so the
+        // extra 10 writes/sec cost nothing measurable.
         let chunk_changed = (last[0] / 16.0).floor() != (current[0] / 16.0).floor()
             || (last[2] / 16.0).floor() != (current[2] / 16.0).floor();
-        if chunk_changed || self.tick_count.saturating_sub(self.last_pos_update_tick) >= 2 {
+        if chunk_changed || self.tick_count.saturating_sub(self.last_pos_update_tick) >= 1 {
             if self.has_teleport_pending(hooks) {
                 return;
             }
@@ -914,6 +1080,37 @@ impl JavaSession {
             if !line.is_empty() {
                 self.send_chat(&line);
             }
+        }
+    }
+
+    /// apiBossBar Java side: drain and append queued `boss_bar` frames.
+    /// Frames arrive already framed for this session's protocol
+    /// (`take_bossbar_frames`), so they are appended verbatim (no
+    /// re-framing through `send`).
+    pub fn deliver_bossbar_frames(&mut self, hooks: &dyn ServerHooks) {
+        if self.closed {
+            return;
+        }
+        let Some(name) = self.username.clone() else {
+            return;
+        };
+        for queued in hooks.take_bossbar_frames(&name, self.protocol) {
+            self.out_buf.extend_from_slice(&queued.frame);
+        }
+    }
+
+    /// Scoreboard Java side: drain and append queued scoreboard
+    /// frames (`take_scoreboard_frames`), already framed for this
+    /// session's protocol, so they are appended verbatim.
+    pub fn deliver_scoreboard_frames(&mut self, hooks: &dyn ServerHooks) {
+        if self.closed {
+            return;
+        }
+        let Some(name) = self.username.clone() else {
+            return;
+        };
+        for queued in hooks.take_scoreboard_frames(&name, self.protocol) {
+            self.out_buf.extend_from_slice(&queued.frame);
         }
     }
 
@@ -1032,6 +1229,10 @@ impl JavaSession {
 
     // ------------------------------------------------------------------
     // TAB (player_info)
+    // Entries carry the Java-view *display* name (`crate::display`):
+    // Bedrock -> "." + raw (Floodgate `BedrockPrefix`), Java verbatim.
+    // The wire UUID (`offline_uuid(display)`), the `spawn_entity` UUID and
+    // the `entity_metadata` nametag all derive from this same display name.
     // ------------------------------------------------------------------
 
     fn modern_player_info_add_batch(entries: &[TabEntry]) -> Vec<u8> {
@@ -1289,6 +1490,16 @@ impl JavaSession {
     /// opened lazily so a `chunk_batch_start` never lacks its
     /// `chunk_batch_finished`; a column that cannot be built after 20
     /// attempts rotates to the end of the queue instead of blocking it.
+    ///
+    /// The tick path only ever consumes cache-warmed payloads
+    /// ([`ServerHooks::try_modern_chunk`] / `try_legacy_chunk`): a cold
+    /// column costs the generator (~18 ms), which used to land inside
+    /// this loop and produced the persistent "17 ms Java tick" during
+    /// the whole initial load. A not-yet-warm column is requeued at the
+    /// front and retried next tick while the background prefetch warms
+    /// it; only after 20 such waits (~1 s, e.g. a dead prefetch task)
+    /// does the tick fall back to one generating build so the player
+    /// can never stall forever on an unwarmable column.
     pub fn stream_chunks(&mut self, hooks: &dyn ServerHooks, deadline: Option<Instant>) {
         if self.last_chunk.is_none() {
             self.request_chunks(hooks);
@@ -1317,17 +1528,35 @@ impl JavaSession {
                 self.pending_attempts.remove(&(cx, cz));
                 continue;
             }
-            let built = self.build_chunk(hooks, cx, cz);
-            let Some(built) = built else {
-                let attempts = self.pending_attempts.get(&(cx, cz)).copied().unwrap_or(0) + 1;
-                if attempts >= 20 {
-                    self.pending_chunks.push_back((cx, cz));
-                    self.pending_attempts.insert((cx, cz), 0);
-                } else {
-                    self.pending_chunks.push_front((cx, cz));
-                    self.pending_attempts.insert((cx, cz), attempts);
+            let built = match self.build_chunk_cached_only(hooks, cx, cz) {
+                Some(built) => built,
+                None => {
+                    let attempts = self
+                        .pending_attempts
+                        .get(&(cx, cz))
+                        .copied()
+                        .unwrap_or(0)
+                        + 1;
+                    if attempts >= 20 {
+                        // Liveness fallback: the prefetch never warmed
+                        // this column in ~1 s; pay one generating build
+                        // here (the old behaviour) rather than stalling
+                        // the player forever. Rotates to the back on
+                        // failure.
+                        self.pending_attempts.insert((cx, cz), 0);
+                        match self.build_chunk(hooks, cx, cz) {
+                            Some(built) => built,
+                            None => {
+                                self.pending_chunks.push_back((cx, cz));
+                                break;
+                            }
+                        }
+                    } else {
+                        self.pending_chunks.push_front((cx, cz));
+                        self.pending_attempts.insert((cx, cz), attempts);
+                        break;
+                    }
                 }
-                break;
             };
             self.pending_attempts.remove(&(cx, cz));
             if self.is_modern() {
@@ -1367,7 +1596,36 @@ impl JavaSession {
         }
     }
 
+    /// Cache-only variant of [`Self::build_chunk`] for the tick path:
+    /// never runs the generator, so a cold column costs a cache lookup
+    /// instead of ~18 ms. See [`ServerHooks::try_modern_chunk`].
+    fn build_chunk_cached_only(
+        &self,
+        hooks: &dyn ServerHooks,
+        cx: i32,
+        cz: i32,
+    ) -> Option<BuiltChunk> {
+        if self.is_modern() {
+            let data = hooks.try_modern_chunk(self.protocol, cx, cz)?;
+            Some(BuiltChunk {
+                bitmap: 0,
+                data: data.data,
+                heightmaps: data.heightmaps,
+                light: data.light,
+            })
+        } else {
+            let chunk = hooks.try_legacy_chunk(cx, cz)?;
+            Some(BuiltChunk {
+                bitmap: chunk.bitmap,
+                data: chunk.data,
+                heightmaps: Vec::new(),
+                light: Vec::new(),
+            })
+        }
+    }
+
     /// Unified chunk build result (legacy bitmap/data or modern column).
+    /// Generating: only used as the stream_chunks liveness fallback.
     fn build_chunk(&self, hooks: &dyn ServerHooks, cx: i32, cz: i32) -> Option<BuiltChunk> {
         if self.is_modern() {
             let data = hooks.modern_chunk(self.protocol, cx, cz)?;
@@ -1447,6 +1705,10 @@ impl JavaSession {
             self.send(id, &self.modern_spawn_payload(entity, target));
             let id = self.pid("entity_metadata");
             self.send(id, &modern_nametag_payload(entity, &target.name));
+            if target.is_sneaking {
+                let id = self.pid("entity_metadata");
+                self.send(id, &modern_flags_payload(entity, true));
+            }
             self.seen_entities.insert(
                 key.to_string(),
                 SeenEntity {
@@ -1457,6 +1719,8 @@ impl JavaSession {
                     z: target.z,
                     yaw: target.yaw,
                     pitch: target.pitch,
+                    head_yaw: target.head_yaw,
+                    is_sneaking: target.is_sneaking,
                     gamemode: target.gamemode,
                 },
             );
@@ -1487,11 +1751,17 @@ impl JavaSession {
             let id = self.pid("entity_look");
             self.send(id, &look_payload(entity, target));
         }
-        if (target.yaw - prev.yaw).abs() > 0.01 {
+        if (target.yaw - prev.yaw).abs() > 0.01
+            || (target.head_yaw - prev.head_yaw).abs() > 0.01
+        {
             let id = self.pid("entity_head_rotation");
             let mut payload = wire::varint(entity);
-            payload.push(wire::angle(target.yaw) as u8);
+            payload.push(wire::angle(target.head_yaw) as u8);
             self.send(id, &payload);
+        }
+        if target.is_sneaking != prev.is_sneaking {
+            let id = self.pid("entity_metadata");
+            self.send(id, &modern_flags_payload(entity, target.is_sneaking));
         }
         self.seen_entities.insert(
             key.to_string(),
@@ -1503,6 +1773,8 @@ impl JavaSession {
                 z: target.z,
                 yaw: target.yaw,
                 pitch: target.pitch,
+                head_yaw: target.head_yaw,
+                is_sneaking: target.is_sneaking,
                 gamemode: target.gamemode,
             },
         );
@@ -1520,6 +1792,12 @@ impl JavaSession {
                 wire::S2C_ENTITY_METADATA,
                 &legacy_nametag_payload(entity, &target.name),
             );
+            if target.is_sneaking {
+                self.send(
+                    wire::S2C_ENTITY_METADATA,
+                    &legacy_flags_payload(entity, true),
+                );
+            }
             self.seen_entities.insert(
                 key.to_string(),
                 SeenEntity {
@@ -1530,6 +1808,8 @@ impl JavaSession {
                     z: target.z,
                     yaw: target.yaw,
                     pitch: target.pitch,
+                    head_yaw: target.head_yaw,
+                    is_sneaking: target.is_sneaking,
                     gamemode: target.gamemode,
                 },
             );
@@ -1569,10 +1849,18 @@ impl JavaSession {
         } else if rot_changed {
             self.send(wire::S2C_ENTITY_LOOK, &look_payload(entity, target));
         }
-        if (target.yaw - prev.yaw).abs() > 0.01 {
+        if (target.yaw - prev.yaw).abs() > 0.01
+            || (target.head_yaw - prev.head_yaw).abs() > 0.01
+        {
             let mut payload = wire::varint(entity);
-            payload.push(wire::angle(target.yaw) as u8);
+            payload.push(wire::angle(target.head_yaw) as u8);
             self.send(wire::S2C_ENTITY_HEAD_ROTATION, &payload);
+        }
+        if target.is_sneaking != prev.is_sneaking {
+            self.send(
+                wire::S2C_ENTITY_METADATA,
+                &legacy_flags_payload(entity, target.is_sneaking),
+            );
         }
         self.seen_entities.insert(
             key.to_string(),
@@ -1584,6 +1872,8 @@ impl JavaSession {
                 z: target.z,
                 yaw: target.yaw,
                 pitch: target.pitch,
+                head_yaw: target.head_yaw,
+                is_sneaking: target.is_sneaking,
                 gamemode: target.gamemode,
             },
         );
@@ -1674,8 +1964,8 @@ impl JavaSession {
         kind: &str,
         network_id: Option<u32>,
     ) {
-        if self.is_modern() {
-            let state = match network_id {
+        let state = if self.is_modern() {
+            match network_id {
                 Some(id) => hooks.modern_block_state(id, self.protocol),
                 None => {
                     if kind.is_empty() || kind == "air" {
@@ -1684,13 +1974,9 @@ impl JavaSession {
                         1
                     }
                 }
-            };
-            let id = self.pid("block_change");
-            let mut payload = wire::position(x, y, z);
-            payload.extend_from_slice(&wire::varint(state));
-            self.send(id, &payload);
+            }
         } else {
-            let state = match network_id {
+            match network_id {
                 Some(id) => hooks.legacy_block_state(id),
                 None => {
                     if kind == "air" {
@@ -1699,11 +1985,24 @@ impl JavaSession {
                         1
                     }
                 }
-            };
-            let mut payload = wire::position(x, y + 64, z);
-            payload.extend_from_slice(&wire::varint(state));
-            self.send(wire::S2C_BLOCK_CHANGE, &payload);
-        }
+            }
+        };
+        let id = if self.is_modern() {
+            self.pid("block_change")
+        } else {
+            wire::S2C_BLOCK_CHANGE
+        };
+        let mut payload = if self.is_modern() {
+            wire::position(x, y, z)
+        } else {
+            wire::position(x, y + 64, z)
+        };
+        payload.extend_from_slice(&wire::varint(state));
+        tracing::info!(
+            "send_block_change: session={} ({},{},{}) state={} kind={} id={} modern={}",
+            self.session_id, x, y, z, state, kind, id, self.is_modern()
+        );
+        self.send(id, &payload);
     }
 
     fn keep_alive(&mut self, now: Instant) {
@@ -1864,6 +2163,38 @@ fn modern_nametag_payload(entity: i32, name: &str) -> Vec<u8> {
     payload
 }
 
+/// Flags-only metadata (`entity_metadata` index 0, `byte` type 0):
+/// sneaking is `0x02` (see [`wire::ENTITY_FLAG_SNEAKING`]). Sent as its
+/// own packet so the nametag payloads keep their exact byte layout.
+fn modern_flags_payload(entity: i32, sneaking: bool) -> Vec<u8> {
+    let flags = if sneaking {
+        wire::ENTITY_FLAG_SNEAKING
+    } else {
+        0
+    };
+    let mut metadata = vec![0u8];
+    metadata.extend_from_slice(&wire::varint(0));
+    metadata.push(flags);
+    metadata.push(0xFF);
+    let mut payload = wire::varint(entity);
+    payload.extend_from_slice(&metadata);
+    payload
+}
+
+/// Legacy flags-only metadata (`entity_metadata` index 0, type 0 =
+/// byte, same `0x02` sneak bit as modern).
+fn legacy_flags_payload(entity: i32, sneaking: bool) -> Vec<u8> {
+    let flags = if sneaking {
+        wire::ENTITY_FLAG_SNEAKING
+    } else {
+        0
+    };
+    let metadata = vec![0u8, 0u8, flags, 0xFF];
+    let mut payload = wire::varint(entity);
+    payload.extend_from_slice(&metadata);
+    payload
+}
+
 fn legacy_nametag_payload(entity: i32, name: &str) -> Vec<u8> {
     let mut metadata = vec![2u8, 3u8];
     metadata.extend_from_slice(&wire::string(name));
@@ -1929,6 +2260,8 @@ mod tests {
                 z: 2.0,
                 yaw: 0.0,
                 pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
                 gamemode: 0,
                 ping: 0,
             };
@@ -1964,6 +2297,8 @@ mod tests {
                 z: 0.0,
                 yaw: 0.0,
                 pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
                 gamemode: 0,
                 ping: 0,
             }],
@@ -2025,6 +2360,8 @@ mod tests {
                 z: 0.0,
                 yaw: 0.0,
                 pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
                 gamemode: 0,
                 ping: 0,
             }],
@@ -2040,6 +2377,125 @@ mod tests {
         // Legacy: index 2, type 3 (string), name...
         assert_eq!(meta.1[wire::varint(1_000_000).len()], 2);
         assert_eq!(meta.1[wire::varint(1_000_000).len() + 1], 3);
+    }
+
+    /// Hooks that record position forwards and count generating chunk
+    /// builds, with cache-only lookups that report "not warm yet".
+    struct RecordingHooks {
+        snapshots: Vec<PlayerSnapshot>,
+        recorded: std::sync::Mutex<Vec<(String, f64, f64, f64)>>,
+        generating: std::sync::Mutex<usize>,
+    }
+
+    impl ServerHooks for RecordingHooks {
+        fn view_distance(&self) -> i32 {
+            1
+        }
+        fn spawn(&self) -> (f64, f64, f64) {
+            (0.5, 5.62, 0.5)
+        }
+        fn snapshots(&self) -> Vec<PlayerSnapshot> {
+            self.snapshots.clone()
+        }
+        fn update_virtual_position(
+            &self,
+            name: &str,
+            x: f64,
+            y: f64,
+            z: f64,
+            _yaw: f64,
+            _pitch: f64,
+        ) {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((name.to_string(), x, y, z));
+        }
+        fn modern_chunk(
+            &self,
+            _protocol: i32,
+            _cx: i32,
+            _cz: i32,
+        ) -> Option<crate::hooks::ModernChunkData> {
+            *self.generating.lock().unwrap() += 1;
+            Some(crate::hooks::ModernChunkData {
+                data: vec![1u8; 8],
+                heightmaps: Vec::new(),
+                light: Vec::new(),
+            })
+        }
+        fn try_modern_chunk(
+            &self,
+            _protocol: i32,
+            _cx: i32,
+            _cz: i32,
+        ) -> Option<crate::hooks::ModernChunkData> {
+            None
+        }
+    }
+
+    #[test]
+    fn position_forwards_on_the_first_tick_after_a_move() {
+        // Bedrock viewers interpolate between registry updates, so a
+        // Java move must reach the registry on the next tick, not
+        // after a 2-tick throttle (which showed up as 100 ms steps).
+        let hooks = RecordingHooks {
+            snapshots: vec![PlayerSnapshot {
+                name: "Steve".to_string(),
+                x: 0.5,
+                y: 64.0,
+                z: 0.5,
+                yaw: wire::java_yaw_to_bedrock(0.0),
+                pitch: 0.0,
+                head_yaw: wire::java_yaw_to_bedrock(0.0),
+                is_sneaking: false,
+                gamemode: 0,
+                ping: 0,
+                is_virtual: true,
+            }],
+            recorded: Default::default(),
+            generating: Default::default(),
+        };
+        let mut session = modern_session(775);
+        session.api_joined = true;
+        session.last_chunk = Some((0, 0));
+        session.last_sent_pos = Some([0.5, 64.0, 0.5, 0.0, 0.0]);
+        session.tick_count = 10;
+        session.last_pos_update_tick = 10;
+        session.x = 2.5; // walked 2 blocks since last forward
+        session.tick(&hooks, None);
+        let recorded = hooks.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "one forward on the first tick");
+        assert_eq!(recorded[0].1, 2.5);
+    }
+
+    #[test]
+    fn stream_chunks_waits_for_warm_payload_instead_of_generating() {
+        let hooks = RecordingHooks {
+            snapshots: vec![],
+            recorded: Default::default(),
+            generating: Default::default(),
+        };
+        let mut session = modern_session(775);
+        session.api_joined = true;
+        session.last_chunk = Some((0, 0));
+        session.pending_chunks.push_back((1, 1));
+        let deadline = Instant::now() + Duration::from_millis(10);
+        session.stream_chunks(&hooks, Some(deadline));
+        assert_eq!(*hooks.generating.lock().unwrap(), 0, "no generation on tick");
+        assert!(session.sent_chunks.is_empty());
+        assert_eq!(
+            session.pending_chunks.front(),
+            Some(&(1, 1)),
+            "cold column stays queued for the prefetch"
+        );
+        // Liveness: after ~20 waits (~1 s of ticks) the session falls
+        // back to one generating build instead of stalling forever.
+        for _ in 0..25 {
+            session.stream_chunks(&hooks, Some(Instant::now() + Duration::from_millis(10)));
+        }
+        assert_eq!(*hooks.generating.lock().unwrap(), 1);
+        assert!(session.sent_chunks.contains(&(1, 1)));
     }
 
     #[test]
@@ -2063,5 +2519,297 @@ mod tests {
             removed[0].0,
             profile::packet_id(769, "player_remove").unwrap()
         );
+    }
+
+    #[test]
+    fn bedrock_display_is_coherent_across_tab_spawn_uuid_and_nametag() {
+        // Production flow (`crate::server`): raw Bedrock snapshot ->
+        // display ".Alex" -> TAB + spawn + nametag all derive from that
+        // display name. UUIDs must match between `player_info_update`
+        // and `spawn_entity`, and the nametag must carry the same string.
+        use crate::server::{entity_targets_for, tab_targets};
+        let hooks = StubHooks {
+            snapshots: vec![PlayerSnapshot {
+                name: "Alex".to_string(),
+                x: 0.5,
+                y: 64.0,
+                z: 0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
+                gamemode: 0,
+                ping: 0,
+                is_virtual: false, // Bedrock
+            }],
+        };
+        let mut session = modern_session(775);
+        session.sent_chunks.insert((0, 0));
+        // TAB via `tab_targets`, entity via `entity_targets_for`.
+        let tabs = tab_targets(&hooks, None);
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].name, ".Alex");
+        session.sync_tab(&tabs);
+        let entities = entity_targets_for(&hooks, &session, &hooks.snapshots());
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, ".Alex");
+        session.sync_entities(&hooks, &entities);
+        let sent = frames(&mut session);
+        let expected_uuid = wire::offline_uuid(".Alex");
+        // player_info_update: flags + count + uuid + name + ...
+        let tab = sent
+            .iter()
+            .find(|(id, _)| *id == profile::packet_id(775, "player_info").unwrap())
+            .expect("player_info_update add");
+        let mut r = Reader::new(&tab.1);
+        let _flags = r.data[r.pos];
+        r.pos += 1;
+        let _count = r.read_varint();
+        let mut tab_uuid = [0u8; 16];
+        tab_uuid.copy_from_slice(&r.data[r.pos..r.pos + 16]);
+        r.pos += 16;
+        assert_eq!(tab_uuid, expected_uuid, "TAB UUID must be offline_uuid(.Alex)");
+        assert_eq!(r.read_string().as_deref(), Some(".Alex"));
+        // spawn_entity carries the same UUID.
+        let spawn = sent
+            .iter()
+            .find(|(id, _)| *id == profile::packet_id(775, "spawn_entity").unwrap())
+            .expect("spawn_entity");
+        let mut sr = Reader::new(&spawn.1);
+        let _entity = sr.read_varint();
+        let mut spawn_uuid = [0u8; 16];
+        spawn_uuid.copy_from_slice(&sr.data[sr.pos..sr.pos + 16]);
+        assert_eq!(spawn_uuid, expected_uuid, "spawn UUID must match TAB UUID");
+        assert_eq!(spawn_uuid, tab_uuid);
+        // Nametag carries the same display string.
+        let meta = sent
+            .iter()
+            .find(|(id, _)| *id == profile::packet_id(775, "entity_metadata").unwrap())
+            .expect("entity_metadata nametag");
+        assert!(
+            meta.1.windows(5).any(|w| w == b".Alex"),
+            "nametag must contain .Alex: {:?}",
+            meta.1
+        );
+        assert!(
+            session.seen_entities.contains_key(".alex"),
+            "seen key is the display name"
+        );
+        // Java snapshot in the same view stays verbatim (no dot).
+        let hooks_java = StubHooks {
+            snapshots: vec![PlayerSnapshot {
+                name: "Procatin0".to_string(),
+                x: 0.5,
+                y: 64.0,
+                z: 0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
+                gamemode: 0,
+                ping: 0,
+                is_virtual: true, // Java
+            }],
+        };
+        let tabs = tab_targets(&hooks_java, None);
+        assert_eq!(tabs[0].name, "Procatin0");
+        // Observer is Steve, so Procatin0 is a visible target here.
+        session.username = Some("Steve".to_string());
+        let entities = entity_targets_for(&hooks_java, &session, &hooks_java.snapshots());
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Procatin0");
+    }
+
+    /// Snapshots carry sneak for the Bedrock -> Java flags byte: a
+    /// sneaking target spawns with the flags packet and toggling emits
+    /// an `entity_metadata` frame carrying `0x02` / `0x00`.
+    #[test]
+    fn sneaking_target_emits_flags_metadata_modern() {
+        let hooks = StubHooks { snapshots: vec![] };
+        let mut session = modern_session(775);
+        let target = EntityTarget {
+            name: "Alex".to_string(),
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            is_sneaking: true,
+            gamemode: 0,
+            ping: 0,
+        };
+        session.sync_entities(&hooks, &[target.clone()]);
+        let sent = frames(&mut session);
+        let meta_id = profile::packet_id(775, "entity_metadata").unwrap();
+        let metas: Vec<_> = sent
+            .iter()
+            .filter(|(id, _)| *id == meta_id)
+            .collect();
+        // Nametag + flags-at-spawn.
+        assert_eq!(metas.len(), 2, "nametag + flags: {sent:?}");
+        let flags_payload = &metas[1].1;
+        let mut r = Reader::new(flags_payload);
+        let _entity = r.read_varint();
+        assert_eq!(r.data[r.pos], 0, "flags index 0");
+        r.pos += 1;
+        assert_eq!(r.read_varint(), Some(0), "byte type");
+        assert_eq!(r.data[r.pos], 0x02, "sneaking bit");
+
+        // Standing up: one flags packet with 0x00.
+        session.sync_entities(
+            &hooks,
+            &[EntityTarget {
+                is_sneaking: false,
+                ..target
+            }],
+        );
+        let sent = frames(&mut session);
+        assert_eq!(sent.len(), 1, "one flags update: {sent:?}");
+        assert_eq!(sent[0].0, meta_id);
+        let mut r = Reader::new(&sent[0].1);
+        let _entity = r.read_varint();
+        r.pos += 1;
+        let _type = r.read_varint();
+        assert_eq!(r.data[r.pos], 0x00);
+    }
+
+    /// Independent head yaw reaches the Java client as `EntityHeadRotation`.
+    #[test]
+    fn head_yaw_only_change_emits_head_rotation() {
+        let hooks = StubHooks { snapshots: vec![] };
+        let mut session = modern_session(775);
+        let base = EntityTarget {
+            name: "Alex".to_string(),
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            is_sneaking: false,
+            gamemode: 0,
+            ping: 0,
+        };
+        session.sync_entities(&hooks, &[base.clone()]);
+        session.take_out();
+        session.sync_entities(
+            &hooks,
+            &[EntityTarget {
+                head_yaw: 90.0,
+                ..base
+            }],
+        );
+        let sent = frames(&mut session);
+        assert_eq!(sent.len(), 1, "one head packet: {sent:?}");
+        assert_eq!(
+            sent[0].0,
+            profile::packet_id(775, "entity_head_rotation").unwrap()
+        );
+        let mut r = Reader::new(&sent[0].1);
+        let _entity = r.read_varint();
+        assert_eq!(r.data[r.pos] as i8, 64, "90 degrees -> step 64");
+    }
+
+    /// `player_input` shift bit (the 1.21.9+ sneak signal) and
+    /// `entity_action` start/stop sneaking (769/770) forward the edge to
+    /// the registry hook.
+    #[test]
+    fn player_input_shift_and_entity_action_forward_sneak() {
+        struct SneakHooks {
+            sneaks: std::sync::Mutex<Vec<(String, bool)>>,
+        }
+        impl ServerHooks for SneakHooks {
+            fn view_distance(&self) -> i32 {
+                1
+            }
+            fn spawn(&self) -> (f64, f64, f64) {
+                (0.5, 5.62, 0.5)
+            }
+            fn snapshots(&self) -> Vec<PlayerSnapshot> {
+                vec![]
+            }
+            fn update_virtual_sneak(&self, name: &str, sneaking: bool) {
+                self.sneaks
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), sneaking));
+            }
+        }
+        let hooks = SneakHooks {
+            sneaks: Default::default(),
+        };
+
+        let mut session = modern_session(775);
+        session.own_entity_id = Some(1_000_001);
+        // player_input: shift bit set -> sneak on; clear -> sneak off.
+        session.handle_player_input(&hooks, &[wire::PLAYER_INPUT_SHIFT]);
+        session.handle_player_input(&hooks, &[0x00]);
+        assert!(session.is_sneaking == false, "shift cleared last");
+        assert_eq!(
+            *hooks.sneaks.lock().unwrap(),
+            vec![
+                ("Steve".to_string(), true),
+                ("Steve".to_string(), false),
+            ]
+        );
+
+        let mut session = modern_session(769);
+        session.own_entity_id = Some(1_000_001);
+        let mut payload = wire::varint(1_000_001);
+        payload.extend_from_slice(&wire::varint(0)); // start_sneaking
+        payload.extend_from_slice(&wire::varint(0)); // jumpBoost
+        session.handle_entity_action(&hooks, &payload);
+        assert!(session.is_sneaking);
+    }
+
+    /// Vanilla creative breaking sends `START_DESTROY_BLOCK` (status 0) and
+    /// never a stop: the server must break immediately. Survival uses
+    /// status 2. Requiring status 2 dropped every creative break.
+    #[test]
+    fn creative_start_dig_breaks_immediately() {
+        struct DigHooks {
+            digs: std::sync::Mutex<Vec<(i32, i32, i32)>>,
+        }
+        impl ServerHooks for DigHooks {
+            fn view_distance(&self) -> i32 {
+                4
+            }
+            fn spawn(&self) -> (f64, f64, f64) {
+                (0.5, 5.62, 0.5)
+            }
+            fn snapshots(&self) -> Vec<PlayerSnapshot> {
+                Vec::new()
+            }
+            fn break_block(&self, x: i32, y: i32, z: i32) -> bool {
+                self.digs.lock().unwrap().push((x, y, z));
+                true
+            }
+            fn drain_block_changes(&self) -> Vec<crate::hooks::BlockChange> {
+                Vec::new()
+            }
+        }
+
+        for (gamemode, status, expected) in [(1, 0, 1usize), (1, 1, 0), (0, 0, 0), (0, 2, 1)] {
+            let hooks = DigHooks {
+                digs: std::sync::Mutex::new(Vec::new()),
+            };
+            let mut session = modern_session(775);
+            session.gamemode = gamemode;
+            session.x = 0.5;
+            session.y = 4.62;
+            session.z = 0.5;
+            let mut payload = wire::varint(status);
+            // Modern wire carries canonical block Y (no +64 offset).
+            payload.extend_from_slice(&wire::position(0, 4, 0));
+            payload.extend_from_slice(&[1u8]); // face
+            payload.extend_from_slice(&wire::varint(0)); // sequence
+            session.handle_block_dig(&hooks, &payload, false);
+            assert_eq!(
+                hooks.digs.lock().unwrap().len(),
+                expected,
+                "gamemode={gamemode} status={status}"
+            );
+        }
     }
 }

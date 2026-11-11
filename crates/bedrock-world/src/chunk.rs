@@ -1,8 +1,8 @@
 //! In-memory Bedrock Chunk (16x16 with 24 subchunks from index -4 to 19, Y = -64..319).
 
-use bedrock_protocol::Writer;
 use crate::block_id;
 use crate::subchunk::SubChunk;
+use bedrock_protocol::Writer;
 
 pub const MIN_SUBCHUNK_INDEX: i32 = -4;
 pub const MAX_SUBCHUNK_INDEX: i32 = 19;
@@ -82,6 +82,15 @@ impl Chunk {
     /// - 24 Overworld Biome Palettes
     /// - 0 border blocks
     /// - 0 block entities
+    ///
+    /// Mirrors `ChunkSerializer::serializeFullChunk` /
+    /// `ChunkSerializer::getSubChunkCount`: the count covers `-4` up to the
+    /// top non-empty subchunk, and a fully empty column reports `0` (no
+    /// subchunks are written, but the 24 biome palettes, 0 border blocks
+    /// and the empty tiles section still follow, exactly like the
+    /// reference). There is no minimum count; the old `.max(5)` floor is
+    /// removed because a flat-world column already reports 5 on its own
+    /// (subchunk 0 holds bedrock/dirt/grass).
     pub fn serialize_network_payload(&self, dominant_biome_id: u8) -> (u32, Vec<u8>) {
         let mut top_sc_idx = 0;
         let mut found_non_empty = false;
@@ -93,11 +102,10 @@ impl Chunk {
             }
         }
 
-        // Overworld subchunk count sent from -4 up to top non-empty subchunk
         let subchunk_count = if found_non_empty {
-            (top_sc_idx + 1).max(5) as u32
+            (top_sc_idx + 1) as u32
         } else {
-            5
+            0
         };
 
         let mut writer = Writer::new();
@@ -120,7 +128,36 @@ impl Chunk {
         // Border blocks: 0
         writer.write_byte(0);
 
-        // Tiles: none
+        // Tiles as byte array (empty = varu length 0, like `writeByteArray`)
+        writer.write_var_u32(0);
+
         (subchunk_count, writer.into_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_chunk_reports_zero_subchunks() {
+        // `ChunkSerializer::getSubChunkCount` returns 0 for a fully empty
+        // column; the payload still carries 24 biome palettes, the 0
+        // border-block byte and no tiles.
+        let chunk = Chunk::new(1);
+        let (count, payload) = chunk.serialize_network_payload(1);
+        assert_eq!(count, 0);
+        // 24 * (header byte + var_i32 biome) + 1 border byte.
+        assert_eq!(payload.len(), 24 * 2 + 1 + 1);
+    }
+
+    #[test]
+    fn flat_column_reports_five_subchunks() {
+        // Bedrock at Y=0 lives in subchunk 0 (index 4 from -4), so the
+        // overworld count is 4 + 1 = 5, like the PM flat generator.
+        let mut chunk = Chunk::new(1);
+        chunk.set_block(0, 0, 0, block_id::BEDROCK);
+        let (count, _) = chunk.serialize_network_payload(1);
+        assert_eq!(count, 5);
     }
 }

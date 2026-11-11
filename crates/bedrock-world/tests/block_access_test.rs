@@ -53,6 +53,7 @@ fn flat_payload_is_byte_identical_to_the_legacy_manual_serialization() {
         writer.write_var_i32(1); // Plains
     }
     writer.write_byte(0); // border blocks
+    writer.write_var_u32(0); // tiles count (0)
 
     let legacy_payload = writer.into_bytes().to_vec();
     let generator = FlatGenerator::new();
@@ -79,7 +80,10 @@ fn flat_edits_change_payload_but_not_block_at() {
     // chunk and is responsible for returning them from `world.get_block`.
     assert_eq!(generator.block_at(1, 4, 1), block_id::AIR);
     // And the generator is still stateless afterwards.
-    assert_eq!(generator.generate_chunk(0, 0), (base_subchunks, base_payload));
+    assert_eq!(
+        generator.generate_chunk(0, 0),
+        (base_subchunks, base_payload)
+    );
 }
 
 #[test]
@@ -132,11 +136,7 @@ fn normal_block_at_matches_the_generated_chunk() {
     // Local coherence: block_at(x, y, z) reads the same chunk cell as the
     // generated chunk at local coordinates.
     let chunk = generator.generate_chunk_internal(spawn_x >> 4, spawn_z >> 4);
-    let expected = chunk.get_block(
-        (spawn_x & 15) as usize,
-        spawn_y,
-        (spawn_z & 15) as usize,
-    );
+    let expected = chunk.get_block((spawn_x & 15) as usize, spawn_y, (spawn_z & 15) as usize);
     assert_eq!(spawn_block, expected);
 
     // Far-away chunks must also be queryable without panicking.
@@ -144,10 +144,7 @@ fn normal_block_at_matches_the_generated_chunk() {
     let far_z = -10000 * 16 + 5;
     let far_block = generator.block_at(far_x, 70, far_z);
     let far_chunk = generator.generate_chunk_internal(10000, -10000);
-    assert_eq!(
-        far_block,
-        far_chunk.get_block(3, 70, (far_z & 15) as usize)
-    );
+    assert_eq!(far_block, far_chunk.get_block(3, 70, (far_z & 15) as usize));
 }
 
 #[test]
