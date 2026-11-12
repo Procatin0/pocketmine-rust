@@ -1,2 +1,0 @@
-# Cada cuántos eventos PlayerMoveEvent se escribe una línea de log.
-movement-log-interval: 100

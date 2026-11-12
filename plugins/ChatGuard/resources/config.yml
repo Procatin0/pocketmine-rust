@@ -1,4 +1,0 @@
-# Palabras que ChatGuard reemplaza por *** (sin distinguir mayúsculas).
-blocked-words:
-  - badword
-  - spam

@@ -1,5 +1,0 @@
-# Saldo inicial de las cuentas nuevas.
-starting-money: 100
-
-# Símbolo mostrado en los mensajes.
-currency-symbol: "$"
