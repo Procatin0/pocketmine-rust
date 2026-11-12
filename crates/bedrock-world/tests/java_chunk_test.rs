@@ -12,14 +12,13 @@
 //! `world.get_chunk`.
 //!
 //! Chunks covered:
-//! - (0, 0): ocean, water surface at Y = 62, section 7 fluidCount 812
-//!   (`hasFluid() == true` in 26.1).
-//! - (29, 1): plains river chunk with its own water column.
+//! - (0, 0): river/forest column, water surface at Y = 62 (225 blocks),
+//!   section 7 fluidCount 812 (`hasFluid() == true` in 26.1).
+//! - (29, 1): plains chunk (212 plains + 44 ocean biome cells) with its
+//!   own water column: 66 blocks at Y = 62, section 7 fluidCount 424.
 
 use bedrock_world::block_id;
-use bedrock_world::java_chunk::{
-    ChunkBuilder, ModernChunk, ModernProfile, MIN_Y, SECTIONS,
-};
+use bedrock_world::java_chunk::{ChunkBuilder, ModernChunk, ModernProfile, MIN_Y, SECTIONS};
 use bedrock_world::{Chunk, NormalGenerator};
 
 /// One decoded Java section.
@@ -238,13 +237,15 @@ fn real_column_chunk_0_0_ocean_water_y62_fluidcount_812() {
 
     let sections = check_real_column(&chunk, &profile);
 
-    // Ocean: water at the sea level Y = 62 in the decoded column.
+    // Ocean-level water: surface at the sea level Y = 62 in the decoded
+    // column (225 water blocks at Y62 in Bedrock, seed 0).
     let truth = truth_blocks(&chunk);
     let water_y62: Vec<_> = truth
         .iter()
         .filter(|&&(_, y, _, id)| y == 62 && id == block_id::WATER)
         .collect();
     assert!(!water_y62.is_empty(), "chunk 0,0 debería tener agua en Y62");
+    assert_eq!(water_y62.len(), 225, "agua Bedrock en Y62 (0,0)");
     for &&(x, _, z, _) in &water_y62 {
         assert_eq!(
             java_state_at(&sections, x, 62, z),
@@ -272,16 +273,25 @@ fn real_column_chunk_29_1() {
 
     let sections = check_real_column(&chunk, &profile);
 
-    // This chunk also has water at Y62, with its own fluid counter.
+    // Plains-dominated column (dominant cell = PLAINS 1); the biome
+    // histogram also holds 44 ocean cells, which is where its water
+    // comes from.
+    assert_eq!(chunk.biomes[7 * 16 + 7], 1, "bioma dominante (29,1)");
+
+    // This chunk also has water at Y62 (66 blocks, seed 0), with its
+    // own 26.1 fluid counter — and no other section carries fluid.
     let truth = truth_blocks(&chunk);
-    assert!(
-        truth
-            .iter()
-            .any(|&(_, y, _, id)| y == 62 && id == block_id::WATER),
-        "chunk 29,1 debería tener agua en Y62"
-    );
-    assert!(sections[7].fluid_count > 0);
+    let water_y62 = truth
+        .iter()
+        .filter(|&&(_, y, _, id)| y == 62 && id == block_id::WATER)
+        .count();
+    assert_eq!(water_y62, 66, "agua Bedrock en Y62 (29,1)");
+    assert_eq!(sections[7].fluid_count, 424, "fluidCount sección 7 (29,1)");
     assert!(ModernChunk::has_fluid(sections[7].fluid_count));
+    assert!(sections
+        .iter()
+        .enumerate()
+        .all(|(s, _)| s == 7 || sections[s].fluid_count == 0));
 }
 
 #[test]
@@ -292,7 +302,11 @@ fn real_column_decodes_under_every_modern_profile() {
         let profile = ModernProfile::for_protocol(protocol).unwrap();
         let sections = check_real_column(&chunk, &profile);
         assert_eq!(sections[7].block_count, 3866, "protocolo {protocol}");
-        assert_eq!(sections[7].biome, profile.plains_biome(), "protocolo {protocol}");
+        assert_eq!(
+            sections[7].biome,
+            profile.plains_biome(),
+            "protocolo {protocol}"
+        );
     }
 }
 
@@ -355,7 +369,11 @@ fn decode_legacy(data: &[u8], mask: u16) -> Vec<Option<Vec<i32>>> {
         }
         let longs = read_var_int(data, &mut offset) as usize;
         let per_long = 64 / bits as usize;
-        let mask_bits = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask_bits = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         let mut entries = vec![0i32; 4096];
         for entry in 0..4096 {
             let word = u64::from_be_bytes(

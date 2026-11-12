@@ -17,7 +17,9 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let cx: i32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let cz: i32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let prefix = args.next().unwrap_or_else(|| format!("/tmp/column_{cx}_{cz}"));
+    let prefix = args
+        .next()
+        .unwrap_or_else(|| format!("/tmp/column_{cx}_{cz}"));
 
     let generator = NormalGenerator::new(12345678);
     let chunk = generator.generate_chunk_internal(cx, cz);
@@ -34,8 +36,15 @@ fn main() {
                 let id = chunk.get_block(x, y, z);
                 if id != 0 && id != block_id::AIR {
                     non_air += 1;
-                    writeln!(truth, "{} {} {} {}", cx * 16 + x as i32, y, cz * 16 + z as i32, id)
-                        .unwrap();
+                    writeln!(
+                        truth,
+                        "{} {} {} {}",
+                        cx * 16 + x as i32,
+                        y,
+                        cz * 16 + z as i32,
+                        id
+                    )
+                    .unwrap();
                 }
             }
         }

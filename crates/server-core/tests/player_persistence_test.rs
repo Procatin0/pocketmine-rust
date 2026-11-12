@@ -136,7 +136,7 @@ fn quit_save_writes_direct_json_v2_without_staging() {
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let object = saved.as_object().expect("v2 object");
-    assert_eq!(object.len(), 26, "JSON v2 = 26 campos: {:?}", object.keys().collect::<Vec<_>>());
+    assert_eq!(object.len(), 27, "JSON v2 = 27 campos: {:?}", object.keys().collect::<Vec<_>>());
     assert_eq!(saved["x"], 3.5);
     assert_eq!(saved["y"], 64.0);
 
@@ -254,7 +254,8 @@ fn save_all_persists_virtuals_directly() {
 
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("players/procatin0.json")).unwrap()).unwrap();
-    assert_eq!(saved.as_object().unwrap().len(), 26);
+    assert_eq!(saved.as_object().unwrap().len(), 27);
+    assert!(saved.get("head_yaw").is_some(), "head yaw persists");
     assert_eq!(saved["first_played"], 1700000000.5, "timers preserved");
     assert!(saved["last_played"].as_f64().unwrap() >= 1700000000.5);
 

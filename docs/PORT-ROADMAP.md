@@ -407,3 +407,13 @@ sin cambios en su código, y un plugin nuevo de PM 5 arranca sin adaptaciones.
 | Plugins PHP | Un plugin que use inventario/entidades falla | Fase 7; hoy el contrato lo excluye |
 | Persistencia | El mundo se regenera al reiniciar | Fase 6 |
 | Permisos | `allow-cheats` simula op para todo | Fase 3 con `PermissionManager` real |
+| Compatibilidad Java | Coexistencia multiversión Java | **Prioridad para la versión 26.1** (protocolo 775); luego se irá añadiendo soporte a las más antiguas |
+
+---
+
+## 7. Compatibilidad Minecraft: Java Edition
+
+La implementación del listener y protocolo de Minecraft: Java Edition (crates/java-bridge y crates/java-protocol) está **priorizada para la versión 26.1 (protocolo 775)** como versión principal y de desarrollo activo.
+
+- **Objetivo principal**: Paridad completa de juego (chunks, movimiento, rotura y colocación de bloques, scoreboard, chat, comandos e inventario) en la versión **26.1**.
+- **Versiones previas**: Una vez consolidada la versión 26.1, se irá ampliando y refinando progresivamente el soporte hacia versiones anteriores (1.21.11 / 774, 1.21.9 / 773, 1.21.5 / 770, 1.21.4 / 769 y legacy 1.12.2 / 340).

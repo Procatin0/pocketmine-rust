@@ -61,6 +61,10 @@ namespace pocketmine\player {
         private float $food = 20.0;
         private float $saturation = 20.0;
         private int $air = 300;
+        /** Scoreboard (Fase 7): `Player::getScoreboard()`, null until set. */
+        private ?\pocketmine\scoreboard\Scoreboard $scoreboard = null;
+        /** Cache de `getUniqueId()` (objeto Uuid sobre `uniqueId` crudo). */
+        private ?\pocketmine\uuid\Uuid $uuid = null;
 
         /** `Player::getFirstPlayed()`/`getLastPlayed()` (microtiempo float). */
         private float $firstPlayed = 0.0;
@@ -227,6 +231,26 @@ namespace pocketmine\player {
         public function getLocation(): Location
         {
             return new Location($this->x, $this->y, $this->z, $this->yaw, $this->pitch, $this->worldName);
+        }
+
+        /**
+         * PM `Entity::getEyeHeight(): float` (default size info: 1.62, the
+         * same `EYE_HEIGHT` the Rust core removes from the Bedrock eye
+         * position on `PlayerAuthInput`).
+         */
+        public function getEyeHeight(): float
+        {
+            return 1.62;
+        }
+
+        /**
+         * PM `Entity::getEyePos(): Vector3` — feet position + eye height.
+         * `getPosition()`/`getLocation()` (and `PlayerMoveEvent`'s
+         * `from`/`to`) are feet-based; this is the only eye-based accessor.
+         */
+        public function getEyePos(): Vector3
+        {
+            return new Vector3($this->x, $this->y + $this->getEyeHeight(), $this->z);
         }
 
         public function getWorld(): World
@@ -492,6 +516,40 @@ namespace pocketmine\player {
         }
 
         /**
+         * PM `Player::getScoreboard(): ?Scoreboard` (null until set).
+         * The PHP object is the source of truth; Rust mirrors it.
+         */
+        public function getScoreboard(): ?\pocketmine\scoreboard\Scoreboard
+        {
+            return $this->scoreboard;
+        }
+
+        /**
+         * PM `Player::setScoreboard(Scoreboard): void`. Installs the
+         * change emitter so every later objective/line mutation
+         * re-sends the full board (`set_scoreboard` action).
+         */
+        public function setScoreboard(\pocketmine\scoreboard\Scoreboard $scoreboard): void
+        {
+            $this->scoreboard = $scoreboard;
+            $name = $this->name;
+            $scoreboard->setOnChange(function (\pocketmine\scoreboard\Scoreboard $board) use ($name): void {
+                $this->addAction('set_scoreboard', [
+                    'target_player' => $name,
+                    'scoreboard' => $board->toArray(),
+                ]);
+            });
+            $scoreboard->notifyChange();
+        }
+
+        /** PM `Player::removeScoreboard(): void`. */
+        public function removeScoreboard(): void
+        {
+            $this->scoreboard = null;
+            $this->addAction('remove_scoreboard', ['target_player' => $this->name]);
+        }
+
+        /**
          * PM `Player::sendToastNotification(string, string): void`.
          * Stub documentado: sin paquete Toast en bridge/protocolo.
          * TODO(A1): `ToastNotificationPacket` + queue (maestro Bridge).
@@ -558,9 +616,21 @@ namespace pocketmine\player {
             return \pocketmine\Server::getInstance();
         }
 
-        public function getUniqueId(): int|string
+        /**
+         * PM `Player::getUniqueId(): UuidInterface`. Devuelve el shim
+         * `pocketmine\uuid\Uuid` (ver clase): los plugins PM encadenan
+         * `->toString()`/`->getBytes()` sobre él. La identidad canónica
+         * es el valor crudo (`unique_id` int XUID o nombre).
+         */
+        public function getUniqueId(): \pocketmine\uuid\Uuid
         {
-            return $this->uniqueId;
+            return $this->uuid ??= \pocketmine\uuid\Uuid::fromMixed($this->uniqueId);
+        }
+
+        /** PM `Entity::getId(): int` — id de entidad de la sesión. */
+        public function getId(): int
+        {
+            return (int)$this->runtimeId;
         }
 
         public function getXuid(): string
@@ -571,6 +641,59 @@ namespace pocketmine\player {
         public function getRuntimeId(): int
         {
             return (int)$this->runtimeId;
+        }
+
+        /**
+         * PM `Player::getNetworkSession(): NetworkSession`. Stub de solo
+         * lectura en el bridge: expone dirección/ping (ScoreHud lee tags
+         * `{scorehud.ip}`/`{scorehud.ping}`) y `sendDataPacket` no-op
+         * (la capa de paquetes vive en Rust; sin IPC de paquetes PHP).
+         */
+        public function getNetworkSession(): object
+        {
+            return new class($this->address, $this->port, $this->ping) {
+                public function __construct(
+                    private string $ip,
+                    private int $port,
+                    private int $ping,
+                ) {
+                }
+
+                public function getIp(): string
+                {
+                    return $this->ip;
+                }
+
+                public function getPort(): int
+                {
+                    return $this->port;
+                }
+
+                public function getPing(): int
+                {
+                    return $this->ping;
+                }
+
+                public function isConnected(): bool
+                {
+                    return true;
+                }
+
+                public function sendDataPacket(mixed $packet): void
+                {
+                    // No-op: el envío de paquetes PHP→Rust no existe (TODO).
+                }
+            };
+        }
+
+        /**
+         * PM `Player::getXpManager(): XpManager` (solo lectura: los tags
+         * XP de ScoreHud leen nivel/progreso). Base `xp`/`xp_level` del
+         * payload; el resto se deriva de forma aproximada.
+         */
+        public function getXpManager(): XpManager
+        {
+            return new XpManager((int)$this->xpLevel, $this->xp);
         }
 
         /** @return array<int, string> */
@@ -1059,6 +1182,115 @@ namespace pocketmine\player {
         public function __toString(): string
         {
             return $this->name;
+        }
+    }
+
+    /**
+     * PM `pocketmine\player\XpManager` (stub de solo lectura). ScoreHud
+     * y plugins de XP consultan `getY()` vía `Player::getXpManager()`.
+     * Nivel desde el payload (`xp_level`); progreso y total derivados
+     * del float `xp` del bridge (mejor esfuerzo, tags informativos).
+     */
+    final class XpManager
+    {
+        public function __construct(
+            private int $level = 0,
+            private float $totalXp = 0.0,
+        ) {
+        }
+
+        public function getXpLevel(): int
+        {
+            return $this->level;
+        }
+
+        public function getXpProgress(): float
+        {
+            return max(0.0, min(1.0, $this->totalXp - floor($this->totalXp)));
+        }
+
+        public function getRemainderXp(): int
+        {
+            return 0;
+        }
+
+        public function getCurrentTotalXp(): int
+        {
+            return (int)$this->totalXp;
+        }
+    }
+}
+
+namespace pocketmine\uuid {
+
+    /**
+     * Shim de `ramsey\uuid\UuidInterface` (lo que devolvía
+     * `Player::getUniqueId()` en PocketMine-MP upstream). Los plugins de
+     * PM (`ScoreHud`, etc.) hacen `$player->getUniqueId()->toString()` —
+     * el valor crudo llega de Rust como `unique_id` JSON **int** (XUID),
+     * de modo que devolver el escalar rompía la cadena:
+     * `Call to a member function toString() on int`. Este objeto devuelve
+     * la identidad del bridge con los métodos que el código PM espera.
+     *
+     * La representación canónica (y `__toString`) preserva el valor
+     * crudo tal cual (decimal XUID, o nombre cuando no hay UUID), para
+     * no romper la identidad que usan `getXuid()`, `toArray()` y el
+     * matching de `getPlayerByRawUUID`.
+     */
+    final class Uuid implements \Stringable
+    {
+        private function __construct(private string $canonical)
+        {
+        }
+
+        /** Factory. Acepta int|string (XUID decimal, hex UUID, nombre). */
+        public static function fromMixed(mixed $raw): self
+        {
+            if (is_bool($raw)) {
+                $raw = $raw ? '1' : '';
+            }
+            if (is_object($raw) || is_array($raw)) {
+                $raw = '';
+            }
+            return new self(is_scalar($raw) ? (string)$raw : '');
+        }
+
+        /** `UuidInterface::toString()` — identidad canónica del jugador. */
+        public function toString(): string
+        {
+            return $this->canonical;
+        }
+
+        /**
+         * `UuidInterface::getBytes()` — bytes binarios deterministas.
+         * XUID numérico -> pack de 8 bytes (padded a 16); hex de UUID 32
+         * chars -> bytes crudos; otro valor -> md5 determinista.
+         */
+        public function getBytes(): string
+        {
+            $raw = $this->canonical;
+            if (is_numeric($raw) && (string)(int)$raw === $raw) {
+                return str_pad(pack('J', (int)$raw), 16, "\0");
+            }
+            $hex = strtolower(str_replace('-', '', $raw));
+            if (preg_match('/^[0-9a-f]{32}$/', $hex) === 1) {
+                return pack('H*', $hex);
+            }
+            return md5('pocketmine-rust:' . $raw, true);
+        }
+
+        /** `UuidInterface::equals()` — compara contra Uuid u escalar. */
+        public function equals(mixed $other): bool
+        {
+            if ($other instanceof self) {
+                return $other->canonical === $this->canonical;
+            }
+            return is_scalar($other) ? (string)$other === $this->canonical : false;
+        }
+
+        public function __toString(): string
+        {
+            return $this->canonical;
         }
     }
 }

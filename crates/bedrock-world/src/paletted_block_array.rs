@@ -29,7 +29,10 @@ impl PalettedBlockArray {
         }
         let index = Self::get_index(x, y, z);
         let palette_index = self.read_word_bits(index);
-        self.palette.get(palette_index as usize).copied().unwrap_or(0)
+        self.palette
+            .get(palette_index as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn set(&mut self, x: usize, y: usize, z: usize, val: u32) {
@@ -121,7 +124,8 @@ impl PalettedBlockArray {
         let word_idx = index / blocks_per_word;
         let sub_idx = index % blocks_per_word;
         let mask = ((1 << bpb) - 1) << (sub_idx * bpb);
-        self.words[word_idx] = (self.words[word_idx] & !mask) | ((val & ((1 << bpb) - 1)) << (sub_idx * bpb));
+        self.words[word_idx] =
+            (self.words[word_idx] & !mask) | ((val & ((1 << bpb) - 1)) << (sub_idx * bpb));
     }
 
     pub fn bits_per_block(&self) -> u8 {

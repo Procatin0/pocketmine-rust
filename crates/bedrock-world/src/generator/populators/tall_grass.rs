@@ -28,7 +28,13 @@ impl TallGrassPopulator {
         self.base_amount = amount;
     }
 
-    pub fn populate<M: ChunkManager>(&self, world: &mut M, chunk_x: i32, chunk_z: i32, random: &mut Random) {
+    pub fn populate<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        chunk_x: i32,
+        chunk_z: i32,
+        random: &mut Random,
+    ) {
         let amount = random.next_range(0, self.random_amount) + self.base_amount;
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
@@ -39,6 +45,12 @@ impl TallGrassPopulator {
             let y = self.get_highest_workable_block(world, x, z);
 
             if y != -1 && self.can_tall_grass_stay(world, x, y, z) {
+                // Single-cell short grass: Bedrock 1.26.63 in hashes mode
+                // expects the FNV hash of `minecraft:short_grass`
+                // (-1467063515) here. The previous `TALL_GRASS` double
+                // block (upper_block_bit) with no upper half placed makes
+                // the client reject the chunk with `Block / ClientDisconnection-90`
+                // on a vanilla client.
                 world.set_block_at(x, y, z, block_id::SHORT_GRASS);
             }
         }

@@ -5,7 +5,14 @@ use crate::binary::{CodecError, Reader, Writer};
 /// Layout mirrors Axolotl's `CommonTypes::putItemStackWrapper`: i16 LE numeric
 /// item id (0 = empty), u16 LE count, varuint metadata, optional varint stack
 /// network id, varuint block runtime id and the raw NBT payload (varuint
-/// length).
+/// length). This is the INVENTORY wrapper and is faithful for it.
+///
+/// It is NOT the `ItemStackWithoutStackId` encoding used by `0x91`
+/// creative stacks (and `0x34` recipe outputs): those are `var_i32` signed
+/// id (data-driven items are negative), `u16` count, `var_u32` meta,
+/// `var_i32` signed block runtime hash (`ItemStackExtraData` string, 10-byte
+/// minimum, no stack id). `ItemStack::encode`/`decode` must never be reused
+/// for creative entries — see `creative_content.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemStack {
     pub network_id: i16,

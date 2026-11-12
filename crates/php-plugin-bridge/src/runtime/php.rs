@@ -791,6 +791,8 @@ fn normalize_phar_path(path: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| path.to_path_buf());
 
+    let stripped = strip_windows_extended_prefix(stripped);
+
     let absolute = if stripped.is_absolute() {
         stripped
     } else {
@@ -802,7 +804,32 @@ fn normalize_phar_path(path: &Path) -> PathBuf {
     // Canonicalize mirrors PHP `realpath()`: Windows paths become absolute
     // drive-letter paths and symlinks resolve, so `PluginSource::Phar`
     // addresses the same archive PHP opens via `phar://`.
-    std::fs::canonicalize(&absolute).unwrap_or(absolute)
+    let canonical = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    // ...but Rust's canonicalize returns the Windows extended-length form
+    // (`\\?\C:\...`), which PHP's `phar://` wrapper does not understand:
+    // `phar:////?/C:/...` fails to open the archive (ScoreHud main class
+    // not found). PHP `realpath()` returns the plain drive-letter path.
+    strip_windows_extended_prefix(canonical)
+}
+
+/// Strips the Windows extended-length prefix (`\\?\`, and its `//?/`
+/// forward-slash form) that `std::fs::canonicalize` produces, restoring
+/// the plain drive-letter path PHP's `realpath()` returns.
+fn strip_windows_extended_prefix(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix("//?/") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 /// A PHP-based PocketMine plugin managed via the IPC bridge.
@@ -995,6 +1022,20 @@ mod tests {
             .main_file("Acme\\Foo\\Main")
             .ends_with("Foo.phar/src/Acme/Foo/Main.php"));
         assert!(source.src_root().ends_with("Foo.phar/src"));
+    }
+
+    #[test]
+    fn phar_root_never_uses_windows_extended_prefix() {
+        // Regression: canonicalize() on Windows yields `\\?\C:\...`, which
+        // became `phar:////?/C:/...` and PHP could not open the archive.
+        let source = PluginSource::phar("plugins/scorehud-8.0.1.phar");
+        let root = source.root();
+        assert!(root.starts_with("phar://"), "root: {root}");
+        assert!(!root.contains("//?/"), "extended prefix leaked: {root}");
+        assert!(!root.contains(r"\\?\"), "extended prefix leaked: {root}");
+        // An already-broken extended URI input is repaired, not doubled.
+        let repaired = PluginSource::phar("phar:////?/C:/plugins/Foo.phar");
+        assert!(!repaired.root().contains("//?/"), "root: {}", repaired.root());
     }
 
     #[test]

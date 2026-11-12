@@ -198,6 +198,10 @@ Acciones obligatorias del milestone:
 | `broadcast_popup` | `message` |
 | `broadcast_title` | `title`, `subtitle`, `fade_in`, `stay`, `fade_out` |
 | `set_gamemode` | `target_player`, `gamemode` |
+| `set_scoreboard` | `target_player`, `scoreboard` (`title`, `objectives[{name, display_name, slot, sort_order, background[r,g,b], lines[{score, text}]}]`) |
+| `remove_scoreboard` | `target_player` |
+| `set_bossbar` | `bossbar` (`boss_id`, `diverse`, `title`, `subtitle`, `percentage`, `color`, `overlay`, `flags`, `entity`, `players[]`, `hidden[]`, `overrides[{player, title?, subtitle?, percentage?, color?}]`) — apiBossBar `BossBar`/`DiverseBossBar` (Bedrock `BossEventPacket` 0x4A + Java `boss_bar`) |
+| `remove_bossbar` | `boss_id` |
 
 `target_player` acepta el nombre exacto o `@all`/`@a` para todos.
 
@@ -222,7 +226,7 @@ Eventos del milestone y campos mutables:
 | `PlayerQuitEvent` | `player`, `quit_message`, `reason` | `quit_message` |
 | `PlayerChatEvent` | `player`, `message`, `format`, `recipients`, `cancelled` | `message`, `format`, `recipients` |
 | `PlayerCommandPreprocessEvent` | `player`, `message`, `cancelled` | `message` |
-| `PlayerMoveEvent` | `player`, `from`, `to`, `cancelled` | `to` |
+| `PlayerMoveEvent` | `player`, `from`, `to`, `cancelled` (`from`/`to` son `Location`: `x`, `y`, `z`, `yaw`, `pitch`, `world`) | `to` |
 | `BlockBreakEvent` | `player`, `world`, `x`, `y`, `z`, `block_id`, `cancelled` | cancelación |
 | `BlockPlaceEvent` | `player`, `world`, `x`, `y`, `z`, `block_id`, `cancelled` | cancelación |
 | `PlayerInteractEvent` | `player`, `world`, `x`, `y`, `z`, `action`, `cancelled` | cancelación |

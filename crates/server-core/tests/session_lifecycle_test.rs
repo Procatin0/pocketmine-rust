@@ -93,27 +93,28 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(session.state, SessionState::PreSpawn);
     assert!(session.is_in_game());
     assert!(responses.len() >= 3);
-    // PLAYER_SPAWN is NOT sent until the client confirms init.
+    // `PreSpawnPacketHandler::setUp()` sends no chunk packets, no publisher
+    // update and no PLAYER_SPAWN: chunks stream only after RequestChunkRadius.
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::LevelChunk(_))),
+        "setUp must not contain LevelChunk packets"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))),
+        "setUp must not contain NetworkChunkPublisherUpdate"
+    );
     assert!(
         !responses
             .iter()
             .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
-        "PLAYER_SPAWN must wait for 0x71"
+        "PLAYER_SPAWN must wait for terrain-ready chunks"
     );
-
-    // Client sends SetLocalPlayerAsInitializedPacket (0x71) with runtime id.
-    let mut writer = Writer::new();
-    writer.write_var_u64(42);
-    let spawn_responses = session
-        .handle_packet(0x71, &writer.into_bytes())
-        .expect("handle 0x71 should succeed");
-    assert_eq!(session.state, SessionState::InGame);
-    assert!(session.is_spawned());
-    let play_status = spawn_responses.iter().find_map(|r| match r {
-        OutgoingPacket::PlayStatus(p) => Some(p),
-        _ => None,
-    }).expect("Expected PLAYER_SPAWN after 0x71");
-    assert_eq!(play_status.status, PlayStatusPacket::PLAYER_SPAWN);
+    assert!(session.sent_chunks.is_empty());
+    assert!(!session.is_spawned());
 
     // Verify StartGamePacket is present
     let start_game = responses.iter().find_map(|r| match r {
@@ -125,27 +126,10 @@ fn test_session_full_login_lifecycle() {
     // FNV-1a("Player"), not the raw session id. The runtime id stays bound
     // to the session.
     assert_eq!(session.username, "Player");
-    assert_eq!(start_game.actor_unique_id, session.entity_unique_id);
+    assert_eq!(start_game.actor_unique_id, 42);
     assert_eq!(start_game.actor_runtime_id, 42);
     assert_eq!(start_game.player_gamemode, 0);
     assert_eq!(start_game.world_name, "Axolotl-PM World");
-
-    // Verify spawn LevelChunkPacket is present
-    let chunk = responses.iter().find_map(|r| match r {
-        OutgoingPacket::LevelChunk(c) if c.chunk_x == 0 && c.chunk_z == 0 => Some(c),
-        _ => None,
-    }).expect("Expected LevelChunk (0,0) in responses");
-    assert_eq!(chunk.chunk_x, 0);
-    assert_eq!(chunk.chunk_z, 0);
-    assert_eq!(chunk.sub_chunk_count, 5);
-    assert!(!chunk.payload.is_empty());
-
-    // Verify PlayStatusPacket (PLAYER_SPAWN) is present (after 0x71).
-    let play_status = spawn_responses.iter().find_map(|r| match r {
-        OutgoingPacket::PlayStatus(p) => Some(p),
-        _ => None,
-    }).expect("Expected PlayStatusPacket in responses");
-    assert_eq!(play_status.status, PlayStatusPacket::PLAYER_SPAWN);
 
     // Verify the native commands are advertised to the client (0x4C).
     let commands_packet = responses
@@ -157,7 +141,8 @@ fn test_session_full_login_lifecycle() {
         _ => unreachable!(),
     }
 
-    // Step 5: Client sends RequestChunkRadius (0x45)
+    // Step 5: Client sends RequestChunkRadius (0x45). In the reference this
+    // only calls `Player::setViewDistance()`: ChunkRadiusUpdated, nothing else.
     let radius_req = RequestChunkRadiusPacket::new(12, 16);
     let mut writer = Writer::new();
     radius_req.encode(&mut writer).unwrap();
@@ -166,13 +151,27 @@ fn test_session_full_login_lifecycle() {
         .expect("handle 0x45 should succeed");
 
     assert_eq!(session.chunk_radius, 12);
-    assert!(!responses.is_empty());
+    assert_eq!(responses.len(), 1);
     match &responses[0] {
         OutgoingPacket::ChunkRadiusUpdated(p) => {
             assert_eq!(p.radius, 12);
         }
         other => panic!("Expected ChunkRadiusUpdated, got {:?}", other),
     }
+    assert!(!session.is_spawned());
+    assert_eq!(session.state, SessionState::PreSpawn);
+    assert!(session.sent_chunks.is_empty());
+
+    // A 0x71 arriving before terrain-ready is ignored: the SpawnResponse
+    // handler does not exist yet in the reference.
+    let mut writer = Writer::new();
+    writer.write_var_u64(42);
+    let early = session
+        .handle_packet(0x71, &writer.into_bytes())
+        .expect("handle early 0x71 should succeed");
+    assert!(early.is_empty());
+    assert!(!session.is_spawned());
+    assert_eq!(session.state, SessionState::PreSpawn);
 
     // All outgoing packets should be serializable into bytes
     for resp in &responses {
@@ -180,8 +179,73 @@ fn test_session_full_login_lifecycle() {
         assert!(!bytes.is_empty());
     }
 
-    // Step 6: Client sends PlayerAuthInputPacket (0x90) with new position
+    // Step 6: chunks stream via `do_chunk_requests()` (`Player::doChunkRequests`,
+    // driven by `NetworkSession::tick()` in the reference): publisher update
+    // first, then up to 4 LevelChunks per pass. After `spawn_threshold`
+    // chunks, `notifyTerrainReady()` queues PLAYER_SPAWN right after the
+    // threshold chunk.
+    let mut streamed: Vec<OutgoingPacket> = Vec::new();
+    let mut spawn_count = 0usize;
+    for _ in 0..60 {
+        let batch = session.do_chunk_requests();
+        spawn_count += batch.iter().filter(|r| matches!(
+            r,
+            OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN
+        )).count();
+        streamed.extend(batch);
+        if spawn_count > 0 {
+            break;
+        }
+    }
+    assert_eq!(spawn_count, 1, "PLAYER_SPAWN must fire exactly once");
+    assert!(session.terrain_ready);
+    assert!(!session.is_spawned());
+    // The publisher update precedes the first LevelChunk.
+    let first_chunk = streamed
+        .iter()
+        .position(|r| matches!(r, OutgoingPacket::LevelChunk(_)))
+        .expect("expected streamed LevelChunks");
+    assert!(
+        streamed[..first_chunk]
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))),
+        "publisher update must precede chunks"
+    );
+    // Verify the spawn LevelChunkPacket (0,0) is present
+    let chunk = streamed.iter().find_map(|r| match r {
+        OutgoingPacket::LevelChunk(c) if c.chunk_x == 0 && c.chunk_z == 0 => Some(c),
+        _ => None,
+    }).expect("Expected LevelChunk (0,0) in streamed chunks");
+    assert_eq!(chunk.chunk_x, 0);
+    assert_eq!(chunk.chunk_z, 0);
+    assert_eq!(chunk.sub_chunk_count, 5);
+    assert!(!chunk.payload.is_empty());
+    for resp in &streamed {
+        let bytes = resp.to_bytes().expect("to_bytes should succeed");
+        assert!(!bytes.is_empty());
+    }
+
+    // Step 7: Client sends SetLocalPlayerAsInitializedPacket (0x71) with
+    // runtime id. This is `Player::doFirstSpawn()`: join, InGame, but the
+    // response carries NO PLAYER_SPAWN (already sent by notifyTerrainReady).
+    let mut writer = Writer::new();
+    writer.write_var_u64(42);
+    let spawn_responses = session
+        .handle_packet(0x71, &writer.into_bytes())
+        .expect("handle 0x71 should succeed");
+    assert_eq!(session.state, SessionState::InGame);
+    assert!(session.is_spawned());
+    assert!(
+        !spawn_responses.iter().any(|r| matches!(
+            r,
+            OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN
+        )),
+        "doFirstSpawn must not re-send PLAYER_SPAWN"
+    );
+
+    // Step 8: Client sends PlayerAuthInputPacket (0x90) with new position
     // Move to (320.0, 65.0, 0.0) -> chunk (20, 0), well outside the previous window.
+    // In InGame the input only moves the player; chunks stream via do_chunk_requests.
     let auth_input = PlayerAuthInputPacket::new(
         10.0,
         90.0,
@@ -200,19 +264,20 @@ fn test_session_full_login_lifecycle() {
     assert_eq!(session.position, Vector3f::new(320.0, 65.0 - 1.62, 0.0));
     assert_eq!(session.pitch, 10.0);
     assert_eq!(session.yaw, 90.0);
-    assert!(!move_responses.is_empty());
+    assert!(move_responses.is_empty(), "auth input alone sends no chunks");
 
-    let has_chunks = move_responses
+    let streamed = session.do_chunk_requests();
+    let has_chunks = streamed
         .iter()
         .any(|r| matches!(r, OutgoingPacket::LevelChunk(_)));
-    let has_pub_update = move_responses
+    let has_pub_update = streamed
         .iter()
         .any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_)));
     assert!(has_chunks);
     assert!(has_pub_update);
     assert!(session.sent_chunks.contains(&(20, 0)));
 
-    for resp in &move_responses {
+    for resp in &streamed {
         let bytes = resp.to_bytes().expect("to_bytes should succeed");
         assert!(!bytes.is_empty());
     }
@@ -264,8 +329,8 @@ fn test_auth_input_with_unparsable_tail_still_moves() {
         ResourcePackClientResponsePacket::STATUS_COMPLETED,
         Vec::new(),
     )).unwrap();
-    // Client confirms init before movement is accepted.
-    session.handle_set_local_player_as_initialized().unwrap();
+    // Client completes the faithful spawn sequence before movement is accepted.
+    drive_to_ingame(&mut session, 2);
     assert!(session.is_in_game());
     assert!(session.is_spawned());
     session.chunk_radius = 2;
@@ -589,7 +654,7 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
     let addr: SocketAddr = "127.0.0.1:54323".parse().unwrap();
     let mut session = PlayerSession::new(77, addr);
 
-    // Progress session to InGame
+    // Progress session to InGame via the faithful spawn pipeline.
     session.handle_login(LoginPacket::new(685, "test")).unwrap();
     session.handle_resource_pack_response(ResourcePackClientResponsePacket::new(
         ResourcePackClientResponsePacket::STATUS_HAVE_ALL_PACKS,
@@ -599,14 +664,24 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
         ResourcePackClientResponsePacket::STATUS_COMPLETED,
         Vec::new(),
     )).unwrap();
-    session.handle_set_local_player_as_initialized().unwrap();
+    // Radius 2 -> circle of 16 chunks around (0,0); threshold min(2,4)^2*pi = 12.
+    let streamed = drive_to_ingame(&mut session, 2);
 
     assert!(session.is_in_game());
     assert!(session.is_spawned());
-    assert_eq!(session.sent_chunks.len(), 25); // 5x5 initial spawn chunks
+    // PLAYER_SPAWN fired exactly once during the streamed passes.
+    assert_eq!(
+        streamed
+            .iter()
+            .filter(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN))
+            .count(),
+        1
+    );
+    let sent_at_spawn = session.sent_chunks.len();
+    assert_eq!(sent_at_spawn, 16);
 
-    // 1. Set radius to 2 (matching initial 5x5 spawn chunks) and move slightly within same chunk (0, 0)
-    session.chunk_radius = 2;
+    // 1. Move slightly within the same chunk (0, 0): the input only moves
+    // the player, no chunks stream and no re-ordering is scheduled.
     let move_same_chunk = PlayerAuthInputPacket::new(
         5.0,
         180.0,
@@ -616,13 +691,16 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
         180.0,
     );
     let responses = session.handle_player_auth_input(move_same_chunk).unwrap();
-    assert!(responses.is_empty(), "No new chunks should be sent within the already generated spawn area");
+    assert!(responses.is_empty(), "auth input alone sends no chunks");
+    assert!(session.do_chunk_requests().is_empty(), "same window: nothing missing");
     assert_eq!(session.position, Vector3f::new(2.0, 65.0 - 1.62, 2.0));
     assert_eq!(session.pitch, 5.0);
     assert_eq!(session.yaw, 180.0);
 
-    // 2. Move to chunk (10, 10) -> coordinate (160.0, 65.0, 160.0)
-    // Window: 8..=12, 8..=12 -> 5x5 = 25 chunks to generate
+    // 2. Move to chunk (10, 10) -> eye coordinate (160.0, 65.0, 160.0).
+    // Movement schedules orderChunks(); the next do_chunk_requests pass
+    // unloads the old window, emits the publisher update first, then
+    // CHUNK_SENDING_PER_TICK (4) LevelChunks nearest-first.
     let move_to_10_10 = PlayerAuthInputPacket::new(
         0.0,
         0.0,
@@ -631,33 +709,49 @@ fn test_dynamic_chunk_streaming_on_player_movement() {
         0.0,
         0.0,
     );
-    let responses_1 = session.handle_player_auth_input(move_to_10_10.clone()).unwrap();
+    let responses = session.handle_player_auth_input(move_to_10_10.clone()).unwrap();
+    assert!(responses.is_empty());
 
-    // 8 chunks per response, the cap that keeps the WebRTC channel alive.
-    let chunks_gen_1 = responses_1.iter().filter(|r| matches!(r, OutgoingPacket::LevelChunk(_))).count();
-    assert_eq!(chunks_gen_1, 8);
-    assert!(responses_1.iter().any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))));
-    assert_eq!(session.sent_chunks.len(), 25 + 8);
+    let first = session.do_chunk_requests();
+    assert!(matches!(
+        first[0],
+        OutgoingPacket::NetworkChunkPublisherUpdate(_)
+    ));
+    let chunks_gen_1 = first
+        .iter()
+        .filter(|r| matches!(r, OutgoingPacket::LevelChunk(_)))
+        .count();
+    assert_eq!(chunks_gen_1, 4);
+    assert!(session.sent_chunks.contains(&(10, 10)));
+    assert_eq!(session.sent_chunks.len(), 4);
 
-    // 3. Following auth inputs stream the rest of the 5x5 window, 8 at a time,
-    //    and go idle once all 25 chunks of the window are sent.
-    let mut sent = 25 + chunks_gen_1;
+    // 3. Following passes stream the rest of the 16-chunk window, 4 at a
+    // time, and go idle once the whole window is sent. Publisher updates
+    // only occur on ordering passes.
+    let mut sent = 4;
     for step in 0..8 {
-        let responses = session.handle_player_auth_input(move_to_10_10.clone()).unwrap();
-        let chunks = responses
+        let batch = session.do_chunk_requests();
+        let chunks = batch
             .iter()
             .filter(|r| matches!(r, OutgoingPacket::LevelChunk(_)))
             .count();
+        // No re-ordering happened, so no new publisher update.
+        assert!(
+            !batch
+                .iter()
+                .any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))),
+            "step {step} must not re-publish"
+        );
         if chunks == 0 {
-            assert!(responses.is_empty(), "step {step} should be idle");
+            assert!(batch.is_empty(), "step {step} should be idle");
             break;
         }
-        assert!(chunks <= 8, "step {step} sent {chunks} chunks");
-        assert!(responses.iter().any(|r| matches!(r, OutgoingPacket::NetworkChunkPublisherUpdate(_))));
+        assert!(chunks <= 4, "step {step} sent {chunks} chunks");
         sent += chunks;
     }
-    assert_eq!(sent, 25 + 25);
-    assert_eq!(session.sent_chunks.len(), 25 + 25);
+    assert_eq!(sent, 16);
+    assert_eq!(session.sent_chunks.len(), 16);
+    assert!(session.sent_chunks.contains(&(10, 10)));
 }
 
 fn drive_to_prespawn(session: &mut PlayerSession) {
@@ -679,10 +773,54 @@ fn drive_to_prespawn(session: &mut PlayerSession) {
     assert!(session.prespawn_started_at.is_some());
 }
 
+/// Drives a PreSpawn session through the faithful spawn pipeline:
+/// `RequestChunkRadius` (view distance only) -> `do_chunk_requests()`
+/// (terrain-ready `PLAYER_SPAWN`) -> `0x71` (`doFirstSpawn`).
+/// Returns every packet emitted by the chunk-streaming passes.
+fn drive_to_ingame(session: &mut PlayerSession, radius: u8) -> Vec<OutgoingPacket> {
+    let responses = session
+        .handle_chunk_radius_request(RequestChunkRadiusPacket::new(radius as i32, 16))
+        .unwrap();
+    assert_eq!(responses.len(), 1);
+    assert!(matches!(
+        responses[0],
+        OutgoingPacket::ChunkRadiusUpdated(_)
+    ));
+
+    let mut streamed: Vec<OutgoingPacket> = Vec::new();
+    for _ in 0..80 {
+        let batch = session.do_chunk_requests();
+        if batch.is_empty() {
+            break;
+        }
+        let spawned = batch
+            .iter()
+            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN));
+        streamed.extend(batch);
+        if spawned {
+            break;
+        }
+    }
+    assert!(session.terrain_ready, "terrain-ready must fire");
+
+    let spawn = session.handle_set_local_player_as_initialized().unwrap();
+    assert!(session.is_spawned());
+    assert!(session.is_in_game());
+    assert!(
+        !spawn.iter().any(|r| matches!(
+            r,
+            OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN
+        )),
+        "doFirstSpawn must not re-send PLAYER_SPAWN"
+    );
+    streamed
+}
+
 #[test]
-fn chunk_radius_forces_spawn_without_0x71() {
-    // Regression: Bedrock clients that send RequestChunkRadius but never
-    // 0x71 must still reach PLAYER_SPAWN + PlayerJoinEvent (joined).
+fn chunk_radius_alone_does_not_spawn() {
+    // Faithful pipeline: RequestChunkRadius only sets the view distance
+    // (`Player::setViewDistance`). PLAYER_SPAWN comes from the chunk
+    // threshold (`notifyTerrainReady`), 0x71 completes doFirstSpawn.
     let addr: SocketAddr = "127.0.0.1:54401".parse().unwrap();
     let mut session = PlayerSession::new(101, addr);
     drive_to_prespawn(&mut session);
@@ -690,20 +828,47 @@ fn chunk_radius_forces_spawn_without_0x71() {
     let radius_req = RequestChunkRadiusPacket::new(8, 16);
     let responses = session.handle_chunk_radius_request(radius_req).unwrap();
 
+    assert_eq!(responses.len(), 1);
+    assert!(matches!(
+        responses[0],
+        OutgoingPacket::ChunkRadiusUpdated(_)
+    ));
+    assert!(!session.is_spawned());
+    assert!(!session.joined);
+    assert_eq!(session.state, SessionState::PreSpawn);
+    assert!(!session.terrain_ready);
+
+    // Chunks stream from do_chunk_requests; PLAYER_SPAWN fires at the
+    // threshold, before any 0x71.
+    let mut spawn_seen = 0usize;
+    for _ in 0..80 {
+        let batch = session.do_chunk_requests();
+        spawn_seen += batch
+            .iter()
+            .filter(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN))
+            .count();
+        if spawn_seen > 0 {
+            break;
+        }
+    }
+    assert_eq!(spawn_seen, 1);
+    assert!(session.terrain_ready);
+    assert!(!session.is_spawned());
+
+    // 0x71 completes the spawn: joined, InGame, but no PLAYER_SPAWN re-send.
+    let responses = session.handle_set_local_player_as_initialized().unwrap();
     assert!(session.is_spawned());
     assert!(session.joined);
     assert_eq!(session.state, SessionState::InGame);
     assert!(session.prespawn_started_at.is_none());
     assert!(
-        responses
-            .iter()
-            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
-        "chunk radius fallback must emit PLAYER_SPAWN"
+        !responses.iter().any(|r| matches!(
+            r,
+            OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN
+        )),
+        "doFirstSpawn must not re-send PLAYER_SPAWN"
     );
-    assert!(responses
-        .iter()
-        .any(|r| matches!(r, OutgoingPacket::ChunkRadiusUpdated(_))));
-    // A late 0x71 is a no-op (spawned already).
+    // A duplicate 0x71 is a no-op.
     assert!(session
         .handle_set_local_player_as_initialized()
         .unwrap()
@@ -711,7 +876,10 @@ fn chunk_radius_forces_spawn_without_0x71() {
 }
 
 #[test]
-fn auth_input_forces_spawn_without_0x71() {
+fn auth_input_is_discarded_before_spawn() {
+    // `PreSpawnPacketHandler` / `SpawnResponsePacketHandler` silently
+    // discard PlayerAuthInput: in PreSpawn the input must neither spawn
+    // nor move the player.
     let addr: SocketAddr = "127.0.0.1:54402".parse().unwrap();
     let mut session = PlayerSession::new(102, addr);
     drive_to_prespawn(&mut session);
@@ -724,30 +892,33 @@ fn auth_input_forces_spawn_without_0x71() {
         0.0,
         0.0,
     );
+    let before = session.position;
     let responses = session.handle_player_auth_input(input).unwrap();
 
-    assert!(session.is_spawned());
-    assert!(session.joined);
-    assert!(
-        responses
-            .iter()
-            .any(|r| matches!(r, OutgoingPacket::PlayStatus(p) if p.status == PlayStatusPacket::PLAYER_SPAWN)),
-        "auth input fallback must emit PLAYER_SPAWN"
-    );
-    assert_eq!(session.position, Vector3f::new(0.5, 65.0 - 1.62, 0.5));
+    assert!(responses.is_empty());
+    assert!(!session.is_spawned());
+    assert!(!session.joined);
+    assert_eq!(session.position, before);
+    assert_eq!(session.state, SessionState::PreSpawn);
 }
 
 #[test]
-fn prespawn_timeout_forces_spawn_via_manager_poll() {
+fn prespawn_timeout_never_forces_spawn() {
+    // PocketMine has no prespawn-timeout spawn: the poll only forwards
+    // block/virtual updates and reports zero forced spawns.
     use std::time::{Duration, Instant};
-    // No 0x71, no chunk radius: after the timeout the manager must spawn
-    // so TestKit/plugins see 1 online.
+    // No 0x71, no chunk radius: the session simply awaits them.
     let addr: SocketAddr = "127.0.0.1:54403".parse().unwrap();
     let manager = SessionManager::new();
     let mut session = PlayerSession::new(103, addr);
     drive_to_prespawn(&mut session);
+    session.username = "TimedOut".to_string();
     session.prespawn_started_at = Some(Instant::now() - Duration::from_secs(11));
     manager.add_session(session);
-    assert_eq!(manager.poll_prespawn_timeouts(), 1);
     assert_eq!(manager.poll_prespawn_timeouts(), 0);
+    assert_eq!(manager.poll_prespawn_timeouts(), 0);
+    assert_eq!(
+        manager.session_state("TimedOut"),
+        Some(SessionState::PreSpawn)
+    );
 }

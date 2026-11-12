@@ -84,6 +84,8 @@ pub const COMMAND_SPAWNPOINT_SELF: &str = "pocketmine.command.spawnpoint.self";
 pub const COMMAND_SPAWNPOINT_OTHER: &str = "pocketmine.command.spawnpoint.other";
 pub const COMMAND_TITLE_SELF: &str = "pocketmine.command.title.self";
 pub const COMMAND_TITLE_OTHER: &str = "pocketmine.command.title.other";
+pub const COMMAND_SCOREBOARD_SELF: &str = "pocketmine.command.scoreboard.self";
+pub const COMMAND_SCOREBOARD_OTHER: &str = "pocketmine.command.scoreboard.other";
 pub const COMMAND_TRANSFERSERVER: &str = "pocketmine.command.transferserver";
 pub const COMMAND_DEFAULTGAMEMODE: &str = "pocketmine.command.defaultgamemode";
 pub const COMMAND_DIFFICULTY: &str = "pocketmine.command.difficulty";
@@ -229,6 +231,8 @@ impl PermissionManager {
         self.register(COMMAND_SPAWNPOINT_OTHER, Op, &[]);
         self.register(COMMAND_TITLE_SELF, Op, &[]);
         self.register(COMMAND_TITLE_OTHER, Op, &[]);
+        self.register(COMMAND_SCOREBOARD_SELF, True, &[]);
+        self.register(COMMAND_SCOREBOARD_OTHER, Op, &[]);
         self.register(COMMAND_TRANSFERSERVER, Op, &[]);
         self.register(COMMAND_DEFAULTGAMEMODE, Op, &[]);
         self.register(COMMAND_DIFFICULTY, Op, &[]);
@@ -323,6 +327,8 @@ impl PermissionManager {
             COMMAND_TIMINGS,
             COMMAND_TITLE_OTHER,
             COMMAND_TITLE_SELF,
+            COMMAND_SCOREBOARD_OTHER,
+            COMMAND_SCOREBOARD_SELF,
             COMMAND_TRANSFERSERVER,
             COMMAND_UNBAN_IP,
             COMMAND_UNBAN_PLAYER,

@@ -353,7 +353,12 @@ namespace pocketmine\command {
          * @param string $sender
          * @param array<int, string> $args
          */
-        abstract public function execute(CommandSender $sender, string $commandLabel, array $args): mixed;
+        /**
+         * PM5 declares no return type here (docblock `@return bool|mixed`):
+         * declaring `: mixed` fatals real plugins whose `execute()` omits it
+         * (e.g. ScoreHud's command).
+         */
+        abstract public function execute(CommandSender $sender, string $commandLabel, array $args);
     }
 
     class SimpleCommand extends Command
@@ -385,7 +390,7 @@ namespace pocketmine\command {
             return $this->callable;
         }
 
-        public function execute(CommandSender $sender, string $commandLabel, array $args): mixed
+        public function execute(CommandSender $sender, string $commandLabel, array $args)
         {
             if (!$this->testPermission($sender)) {
                 return false;
@@ -435,7 +440,7 @@ namespace pocketmine\command {
             $this->setPermissions($permissions);
         }
 
-        public function execute(CommandSender $sender, string $commandLabel, array $args): mixed
+        public function execute(CommandSender $sender, string $commandLabel, array $args)
         {
             return ($this->execute)($sender, $this, $commandLabel, $args);
         }
@@ -459,7 +464,7 @@ namespace pocketmine\command {
             return $this->plugin;
         }
 
-        public function execute(CommandSender $sender, string $commandLabel, array $args): mixed
+        public function execute(CommandSender $sender, string $commandLabel, array $args)
         {
             if (!$this->testPermission($sender)) {
                 return false;
@@ -685,7 +690,7 @@ namespace pocketmine\command {
             return $this->targets;
         }
 
-        public function execute(CommandSender $sender, string $commandLabel, array $args): mixed
+        public function execute(CommandSender $sender, string $commandLabel, array $args)
         {
             $map = $sender->getServer()->getCommandMap();
             foreach ($this->targets as $target) {

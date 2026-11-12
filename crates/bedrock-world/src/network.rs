@@ -85,8 +85,9 @@ pub fn deserialize_subchunk(reader: &mut Reader) -> Result<SubChunk, SubChunkNet
         }
 
         let bits_per_block = header >> 1;
-        let num_words = PalettedBlockArray::words_count_for_bpb(bits_per_block)
-            .ok_or(SubChunkNetworkError::UnsupportedBitsPerBlock(bits_per_block))?;
+        let num_words = PalettedBlockArray::words_count_for_bpb(bits_per_block).ok_or(
+            SubChunkNetworkError::UnsupportedBitsPerBlock(bits_per_block),
+        )?;
 
         let mut words = Vec::with_capacity(num_words);
         for _ in 0..num_words {

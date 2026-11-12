@@ -536,6 +536,8 @@ impl JavaSession {
         self.send_time(hooks.world_time(), hooks.world_time_running());
         self.send_position(true);
         self.join_api(hooks);
+        self.deliver_bossbar_frames(hooks);
+        self.deliver_scoreboard_frames(hooks);
         let targets = crate::server::tab_targets(hooks, None);
         self.sync_tab(&targets);
         self.send_chat(&format!(
@@ -583,6 +585,8 @@ impl JavaSession {
         let gsc = profile::packet_id(self.protocol, "game_state_change").unwrap_or(35);
         self.send(gsc, &[13u8, 0, 0, 0, 0]);
         self.join_api(hooks);
+        self.deliver_bossbar_frames(hooks);
+        self.deliver_scoreboard_frames(hooks);
         let targets = crate::server::tab_targets(hooks, None);
         self.sync_tab(&targets);
         self.send_chat(&format!(
@@ -894,6 +898,7 @@ impl JavaSession {
             status, x, canonical_y, z, self.x, self.y, self.z, self.gamemode,
             payload.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
         );
+        let prev_id = hooks.block_network_id(x, canonical_y, z);
         let broke = hooks.break_block(x, canonical_y, z);
         tracing::info!(
             "java dig result: block=({},{},{}) broke={}",
@@ -901,6 +906,13 @@ impl JavaSession {
         );
         if broke {
             self.send_block_change(hooks, x, canonical_y, z, "air", None);
+            let prev_state = match prev_id {
+                Some(pid) if self.is_modern() => hooks.modern_block_state(pid, self.protocol),
+                Some(pid) => hooks.legacy_block_state(pid),
+                None if self.is_modern() => 1,
+                None => 1 << 4,
+            };
+            self.send_world_event(hooks, 2001, x, canonical_y, z, prev_state, false);
         } else {
             self.send_block_change(hooks, x, canonical_y, z, "", None);
         }
@@ -929,11 +941,12 @@ impl JavaSession {
             r.pos += 1;
             let Some(item_id) = r.read_u16() else { return };
             let item_id = item_id as i16 as i32;
-            if item_id <= 0 {
-                self.send_chat("No tienes ningún bloque en la mano para colocar.");
-                return;
-            }
-            (pos, face_byte as i32, item_id as u32)
+            let block_id = if item_id <= 0 {
+                hooks.stone_network_id()
+            } else {
+                item_id as u32
+            };
+            (pos, face_byte as i32, block_id)
         };
         let offsets = [
             (0, -1, 0),
@@ -1088,7 +1101,7 @@ impl JavaSession {
     /// (`take_bossbar_frames`), so they are appended verbatim (no
     /// re-framing through `send`).
     pub fn deliver_bossbar_frames(&mut self, hooks: &dyn ServerHooks) {
-        if self.closed {
+        if self.closed || !self.playing {
             return;
         }
         let Some(name) = self.username.clone() else {
@@ -1103,7 +1116,7 @@ impl JavaSession {
     /// frames (`take_scoreboard_frames`), already framed for this
     /// session's protocol, so they are appended verbatim.
     pub fn deliver_scoreboard_frames(&mut self, hooks: &dyn ServerHooks) {
-        if self.closed {
+        if self.closed || !self.playing {
             return;
         }
         let Some(name) = self.username.clone() else {
@@ -2005,6 +2018,37 @@ impl JavaSession {
         self.send(id, &payload);
     }
 
+    pub fn send_world_event(
+        &mut self,
+        _hooks: &dyn ServerHooks,
+        effect_id: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        data: i32,
+        global: bool,
+    ) {
+        let (id, payload) = if self.is_modern() {
+            let Some(id) = profile::packet_id(self.protocol, "world_event") else {
+                return;
+            };
+            let mut payload = Vec::with_capacity(18);
+            payload.extend_from_slice(&(effect_id as i32).to_be_bytes());
+            payload.extend_from_slice(&wire::position_modern(x, y, z));
+            payload.extend_from_slice(&(data as i32).to_be_bytes());
+            payload.push(u8::from(global));
+            (id, payload)
+        } else {
+            let mut payload = Vec::with_capacity(18);
+            payload.extend_from_slice(&(effect_id as i32).to_be_bytes());
+            wire::write_position_legacy(&mut payload, x, y + 64, z);
+            payload.extend_from_slice(&(data as i32).to_be_bytes());
+            payload.push(u8::from(global));
+            (wire::S2C_WORLD_EVENT, payload)
+        };
+        self.send(id, &payload);
+    }
+
     fn keep_alive(&mut self, now: Instant) {
         if now.duration_since(self.last_keep_alive).as_secs_f64() < KEEP_ALIVE_SECONDS {
             return;
@@ -2548,14 +2592,14 @@ mod tests {
         // TAB via `tab_targets`, entity via `entity_targets_for`.
         let tabs = tab_targets(&hooks, None);
         assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].name, ".Alex");
+        assert_eq!(tabs[0].name, "Alex");
         session.sync_tab(&tabs);
         let entities = entity_targets_for(&hooks, &session, &hooks.snapshots());
         assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].name, ".Alex");
+        assert_eq!(entities[0].name, "Alex");
         session.sync_entities(&hooks, &entities);
         let sent = frames(&mut session);
-        let expected_uuid = wire::offline_uuid(".Alex");
+        let expected_uuid = wire::offline_uuid("Alex");
         // player_info_update: flags + count + uuid + name + ...
         let tab = sent
             .iter()
@@ -2568,8 +2612,8 @@ mod tests {
         let mut tab_uuid = [0u8; 16];
         tab_uuid.copy_from_slice(&r.data[r.pos..r.pos + 16]);
         r.pos += 16;
-        assert_eq!(tab_uuid, expected_uuid, "TAB UUID must be offline_uuid(.Alex)");
-        assert_eq!(r.read_string().as_deref(), Some(".Alex"));
+        assert_eq!(tab_uuid, expected_uuid, "TAB UUID must be offline_uuid(Alex)");
+        assert_eq!(r.read_string().as_deref(), Some("Alex"));
         // spawn_entity carries the same UUID.
         let spawn = sent
             .iter()
@@ -2587,12 +2631,12 @@ mod tests {
             .find(|(id, _)| *id == profile::packet_id(775, "entity_metadata").unwrap())
             .expect("entity_metadata nametag");
         assert!(
-            meta.1.windows(5).any(|w| w == b".Alex"),
-            "nametag must contain .Alex: {:?}",
+            meta.1.windows(4).any(|w| w == b"Alex"),
+            "nametag must contain Alex: {:?}",
             meta.1
         );
         assert!(
-            session.seen_entities.contains_key(".alex"),
+            session.seen_entities.contains_key("alex"),
             "seen key is the display name"
         );
         // Java snapshot in the same view stays verbatim (no dot).

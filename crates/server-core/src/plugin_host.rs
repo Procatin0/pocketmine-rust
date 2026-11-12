@@ -323,6 +323,7 @@ impl ServerPluginHost {
             "z": live_f64(param_num(&["z"]), live.as_ref().map(|player| player.z)).unwrap_or(0.0),
             "yaw": live_f64(param_num(&["yaw"]), live.as_ref().map(|player| player.yaw)).unwrap_or(0.0),
             "pitch": live_f64(param_num(&["pitch"]), live.as_ref().map(|player| player.pitch)).unwrap_or(0.0),
+            "head_yaw": live_f64(param_num(&["head_yaw", "headYaw"]), live.as_ref().map(|player| player.head_yaw)).unwrap_or(0.0),
             "gamemode": merged_i64(&["gamemode"], live.as_ref().map(|player| player.gamemode as i64).unwrap_or(0)),
             "health": merged_num(&["health"], live.as_ref().map(|player| player.health as f64).unwrap_or(20.0)),
             "max_health": merged_num(&["max_health", "maxHealth"], live.as_ref().map(|player| player.max_health as f64).unwrap_or(20.0)),
@@ -520,7 +521,7 @@ impl PluginHost for ServerPluginHost {
             "server.get_players_full" => Ok(json!(self.players.all())),
             // ------------------------------------------------ persistencia
             // `players/<name>.json` con el mismo formato que las sesiones
-            // Bedrock (`PlayerSession::save_player_data`): JSON v2 (26
+            // Bedrock (`PlayerSession::save_player_data`): JSON v2 (27
             // campos) escrito directamente, sin staging virtual. `y` canónico
             // (sin +64 legacy).
             "player.has_data" => {
@@ -691,6 +692,7 @@ impl PluginHost for ServerPluginHost {
                     z: float("z", 0.0),
                     yaw: float("yaw", 0.0),
                     pitch: float("pitch", 0.0),
+                    head_yaw: float("yaw", 0.0),
                     world: params
                         .get("world")
                         .and_then(Value::as_str)

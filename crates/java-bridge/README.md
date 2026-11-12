@@ -53,3 +53,7 @@ Rust port of the Java Edition TCP listener:
   *contents* are intentionally not asserted (ModernChunk agent).
 
 Run: `cargo test -p java-bridge`
+
+## Prioridad de versiones
+
+La implementación de Java Edition se encuentra **priorizada para la versión 26.1 (protocolo 775)** como versión objetivo principal. Una vez consolidada la compatibilidad completa con 26.1, se irá extendiendo y optimizando el soporte hacia las versiones más antiguas (774, 773, 770, 769 y 340).

@@ -5,14 +5,21 @@
 use std::sync::Arc;
 
 pub mod biome;
+pub mod caves;
 pub mod flat;
+pub mod java_terrain;
 pub mod manager;
 pub mod noise;
 pub mod normal;
 pub mod populators;
 pub mod random;
+pub mod structures;
 
 pub use flat::FlatGenerator;
+pub use java_terrain::{
+    DoublePerlinNoise, JavaTerrain, PerlinNoise, Spline, Xoroshiro128Plus,
+    BEDROCK_NORMAL_SEA_LEVEL, JAVA_SEA_LEVEL,
+};
 pub use manager::{ChunkManager, ChunkManager3x3};
 pub use normal::NormalGenerator;
 

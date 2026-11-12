@@ -2,11 +2,11 @@
 //!
 //! Matches `pocketmine\world\generator\populator\Ore` and `pocketmine\world\generator\object\Ore`.
 
-use std::collections::HashSet;
-use std::f64::consts::PI;
 use crate::block_id;
 use crate::generator::manager::ChunkManager;
 use crate::generator::random::Random;
+use std::collections::HashSet;
+use std::f64::consts::PI;
 
 #[derive(Debug, Clone)]
 pub struct OreType {
@@ -107,20 +107,24 @@ impl OrePopulator {
 
     pub fn new_emerald() -> Self {
         Self {
-            ore_types: vec![
-                OreType {
-                    material: block_id::EMERALD_ORE,
-                    replaces: block_id::STONE,
-                    cluster_count: 11,
-                    cluster_size: 1,
-                    min_height: 0,
-                    max_height: 32,
-                },
-            ],
+            ore_types: vec![OreType {
+                material: block_id::EMERALD_ORE,
+                replaces: block_id::STONE,
+                cluster_count: 11,
+                cluster_size: 1,
+                min_height: 0,
+                max_height: 32,
+            }],
         }
     }
 
-    pub fn populate<M: ChunkManager>(&self, world: &mut M, chunk_x: i32, chunk_z: i32, random: &mut Random) {
+    pub fn populate<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        chunk_x: i32,
+        chunk_z: i32,
+        random: &mut Random,
+    ) {
         let base_x = chunk_x << 4;
         let base_z = chunk_z << 4;
 
@@ -196,7 +200,8 @@ impl OrePopulator {
                         let size_z = (zz as f64 + 0.5 - center_z) / radius;
                         let size_z_sq = size_z * size_z;
                         if (size_x_sq + size_y_sq + size_z_sq) < 1.0 {
-                            let hash = ((xx as i64) << 40) ^ ((zz as i64) << 20) ^ ((yy as i64) & 0xfffff);
+                            let hash =
+                                ((xx as i64) << 40) ^ ((zz as i64) << 20) ^ ((yy as i64) & 0xfffff);
                             if visited.insert(hash) {
                                 if world.get_block_at(xx, yy, zz) == ore_type.replaces {
                                     world.set_block_at(xx, yy, zz, ore_type.material);

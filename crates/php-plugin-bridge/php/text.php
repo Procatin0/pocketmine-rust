@@ -191,6 +191,38 @@ namespace pocketmine\utils {
         }
     }
 
+    /**
+     * PM `pocketmine\utils\SingletonTrait`: shared static instance holder
+     * used by virions (ScoreFactory) and plugins (ScoreHud). Only the
+     * instance storage/accessors are ported — no private constructor, so
+     * the bridge plugin loader can still `new` the using class (PM
+     * instantiates plugins itself, the trait never constructs them).
+     */
+    trait SingletonTrait
+    {
+        private static ?self $instance = null;
+
+        public static function getInstance() : self
+        {
+            return self::$instance ??= new self();
+        }
+
+        public static function setInstance(?self $instance) : void
+        {
+            self::$instance = $instance;
+        }
+
+        public function __clone()
+        {
+            throw new \LogicException("Cloning a singleton is not allowed");
+        }
+
+        public function __wakeup()
+        {
+            throw new \LogicException("Unserializing a singleton is not allowed");
+        }
+    }
+
     class ServerException extends \RuntimeException
     {
     }

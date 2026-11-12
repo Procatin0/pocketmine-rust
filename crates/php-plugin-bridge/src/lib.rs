@@ -14,7 +14,10 @@ pub mod runtime;
 
 pub use chat::{default_format, ChatFormatter, PlaceholderFormatter};
 pub use command::{Command, CommandMap, CommandSender, merge_selector_tokens};
-pub use context::{PlayerContext, PluginAction};
+pub use context::{
+    BossBarData, BossBarOverrideData, PlayerContext, PluginAction, ScoreboardData,
+    ScoreboardLineData, ScoreboardObjectiveData,
+};
 pub use description::{CommandDescription, PermissionDescription, PluginDescription};
 pub use error::PluginError;
 pub use event::{Event, EventDispatcher, EventPriority, RegisteredListener};

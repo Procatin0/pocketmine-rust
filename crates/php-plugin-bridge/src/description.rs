@@ -1,8 +1,52 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::PluginError;
+
+/// PM `PluginDescription` list fields (`api`, `depend`, `aliases`, ...):
+/// YAML allows a single scalar (`api: 5.45.0`, as shipped by ScoreHud's
+/// phar) and PHP coerces it with `(array)`/`stringList()`. Rust must accept
+/// the same shapes or `serde_yaml` rejects the manifest with
+/// `invalid type: string ..., expected a sequence`, which (now that the
+/// PHP worker runs) counts as a load error and stops the server.
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_yaml::Value::Null => Vec::new(),
+        serde_yaml::Value::Sequence(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_yaml::Value::String(text) => Some(text),
+                serde_yaml::Value::Number(number) => Some(number.to_string()),
+                serde_yaml::Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            })
+            .collect(),
+        serde_yaml::Value::String(text) if text.is_empty() => Vec::new(),
+        serde_yaml::Value::String(text) => vec![text],
+        serde_yaml::Value::Number(number) => vec![number.to_string()],
+        serde_yaml::Value::Bool(flag) => vec![flag.to_string()],
+        _ => Vec::new(),
+    })
+}
+
+/// PM `stringValue()`: scalar YAML values (`version: 1.0`) coerce to text.
+fn deserialize_scalar_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_yaml::Value::String(text) => text,
+        serde_yaml::Value::Number(number) => number.to_string(),
+        serde_yaml::Value::Bool(flag) => flag.to_string(),
+        _ => String::new(),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandDescription {
@@ -12,7 +56,7 @@ pub struct CommandDescription {
     pub usage: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub aliases: Vec<String>,
 }
 
@@ -31,24 +75,33 @@ fn default_permission_default() -> String {
 /// Representation of a PocketMine-MP `plugin.yml` file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginDescription {
+    #[serde(deserialize_with = "deserialize_scalar_string")]
     pub name: String,
+    #[serde(deserialize_with = "deserialize_scalar_string")]
     pub version: String,
+    #[serde(deserialize_with = "deserialize_scalar_string")]
     pub main: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub api: Vec<String>,
     #[serde(default)]
     pub author: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub authors: Vec<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub website: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub depend: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub softdepend: Vec<String>,
-    #[serde(default, rename = "load-before", alias = "loadbefore", alias = "loadBefore")]
+    #[serde(
+        default,
+        rename = "load-before",
+        alias = "loadbefore",
+        alias = "loadBefore",
+        deserialize_with = "deserialize_string_list"
+    )]
     pub load_before: Vec<String>,
     /// `src-namespace-prefix` in `plugin.yml` (PM `PluginDescription::
     /// getSrcNamespacePrefix()`). Empty means "not set": the PHP autoloader
@@ -166,6 +219,19 @@ mod tests {
         assert_eq!(desc.src_namespace_prefix, "BetterChat");
         assert_eq!(desc.load_before, vec!["ChatGuard".to_string()]);
         assert_eq!(desc.effective_src_prefix(), "BetterChat\\");
+    }
+
+    #[test]
+    fn scalar_api_and_numeric_version_are_coerced() {
+        // ScoreHud's shipped phar uses `api: 5.45.0` (scalar, not a list).
+        let yml = "name: ScoreHud\nversion: 8.0.1\nmain: Ifera\\ScoreHud\\ScoreHud\napi: 5.45.0\n";
+        let desc = PluginDescription::from_yaml_str(yml).expect("scalar api accepted");
+        assert_eq!(desc.api, vec!["5.45.0".to_string()]);
+        // PM `stringValue()` also coerces numeric scalars.
+        let yml = "name: Foo\nversion: 1.0\nmain: Foo\\Main\napi: [5.0.0]\ndepend: Bar\n";
+        let desc = PluginDescription::from_yaml_str(yml).expect("numeric version accepted");
+        assert_eq!(desc.version, "1.0");
+        assert_eq!(desc.depend, vec!["Bar".to_string()]);
     }
 
     #[test]

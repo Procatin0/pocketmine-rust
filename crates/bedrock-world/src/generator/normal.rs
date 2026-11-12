@@ -14,12 +14,14 @@ use crate::chunk::Chunk;
 use crate::generator::biome::{
     self, generate_chunk_biomes_and_elevations, BiomeSelector, Gaussian,
 };
+use crate::generator::caves::CavePopulator;
 use crate::generator::manager::{ChunkManager, ChunkManager3x3};
 use crate::generator::noise::SimplexNoise;
 use crate::generator::populators::{
     GroundCoverPopulator, OrePopulator, TallGrassPopulator, TreePopulator, TreeType,
 };
 use crate::generator::random::Random;
+use crate::generator::structures::{self, StructurePosition};
 use crate::generator::WorldGenerator;
 
 pub struct NormalGenerator {
@@ -42,6 +44,7 @@ pub struct NormalGenerator {
     tall_grass_river: TallGrassPopulator,
     tall_grass_ocean: TallGrassPopulator,
     tall_grass_ice_plains: TallGrassPopulator,
+    cave_populator: CavePopulator,
     spawn_pos: (i32, i32, i32),
 }
 
@@ -73,6 +76,8 @@ impl NormalGenerator {
         let tall_grass_ocean = TallGrassPopulator::new(5);
         let tall_grass_ice_plains = TallGrassPopulator::new(5);
 
+        let cave_populator = CavePopulator::new();
+
         let mut gen = Self {
             seed,
             noise_base,
@@ -93,6 +98,7 @@ impl NormalGenerator {
             tall_grass_river,
             tall_grass_ocean,
             tall_grass_ice_plains,
+            cave_populator,
             spawn_pos: (0, Self::SEA_LEVEL + 2, 0),
         };
 
@@ -128,12 +134,19 @@ impl NormalGenerator {
 
     /// Generates base terrain for a chunk (bedrock, stone, water, and GroundCover).
     pub fn generate_base_chunk(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
-        let mut random = Random::new(0xdeadbeef ^ ((chunk_x as i64) << 8) ^ (chunk_z as i64) ^ self.seed);
+        let mut random =
+            Random::new(0xdeadbeef ^ ((chunk_x as i64) << 8) ^ (chunk_z as i64) ^ self.seed);
         let base_x = chunk_x * 16;
         let base_z = chunk_z * 16;
 
         let (chunk_biomes, min_noise_heights, max_noise_heights) =
-            generate_chunk_biomes_and_elevations(self.seed, &self.selector, &self.gaussian, base_x, base_z);
+            generate_chunk_biomes_and_elevations(
+                self.seed,
+                &self.selector,
+                &self.gaussian,
+                base_x,
+                base_z,
+            );
 
         let dominant_biome = chunk_biomes[7 * 16 + 7];
         let mut chunk = Chunk::new(dominant_biome);
@@ -159,17 +172,9 @@ impl NormalGenerator {
         let noise_max = (highest_noise_block as f64 / 8.0).ceil() as i32 * 8;
         let y_size = (noise_max - noise_min) as usize;
 
-        let noise = self.noise_base.get_fast_noise_3d(
-            16,
-            y_size,
-            16,
-            4,
-            8,
-            4,
-            base_x,
-            noise_min,
-            base_z,
-        );
+        let noise = self
+            .noise_base
+            .get_fast_noise_3d(16, y_size, 16, 4, 8, 4, base_x, noise_min, base_z);
 
         let min_noise_subchunk = (noise_min as f64 / 16.0).floor() as i32;
 
@@ -204,7 +209,8 @@ impl NormalGenerator {
                     } else {
                         let ny = (y - noise_min) as usize;
                         if ny < noise[x][z].len() && smooth_height > 0.0 {
-                            noise[x][z][ny] - (1.0 / smooth_height) * (y as f64 - smooth_height - min_sum)
+                            noise[x][z][ny]
+                                - (1.0 / smooth_height) * (y as f64 - smooth_height - min_sum)
                         } else {
                             -1.0
                         }
@@ -220,51 +226,96 @@ impl NormalGenerator {
         }
 
         // Generation Populator: GroundCover
-        self.ground_cover.populate(&mut chunk, chunk_x, chunk_z, &mut random);
+        self.ground_cover
+            .populate(&mut chunk, chunk_x, chunk_z, &mut random);
 
         chunk
     }
 
     /// Populates a chunk using the world manager, matching `Normal::populateChunk`.
-    pub fn populate_chunk<M: ChunkManager>(&self, world: &mut M, chunk_x: i32, chunk_z: i32, dominant_biome: u8) {
-        let mut random = Random::new(0xdeadbeef ^ ((chunk_x as i64) << 8) ^ (chunk_z as i64) ^ self.seed);
+    pub fn populate_chunk<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        chunk_x: i32,
+        chunk_z: i32,
+        dominant_biome: u8,
+    ) {
+        let mut random =
+            Random::new(0xdeadbeef ^ ((chunk_x as i64) << 8) ^ (chunk_z as i64) ^ self.seed);
 
         // 1. Overworld standard ores
-        self.ore_populator.populate(world, chunk_x, chunk_z, &mut random);
+        self.ore_populator
+            .populate(world, chunk_x, chunk_z, &mut random);
 
         // 2. Biome-specific population
         match dominant_biome {
             biome::PLAINS => {
-                self.tall_grass_plains.populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_plains
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::FOREST => {
-                self.tree_forest.populate(world, chunk_x, chunk_z, &mut random);
-                self.tall_grass_forest.populate(world, chunk_x, chunk_z, &mut random);
+                self.tree_forest
+                    .populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_forest
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::BIRCH_FOREST => {
-                self.tree_birch.populate(world, chunk_x, chunk_z, &mut random);
-                self.tall_grass_forest.populate(world, chunk_x, chunk_z, &mut random);
+                self.tree_birch
+                    .populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_forest
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::TAIGA => {
-                self.tree_taiga.populate(world, chunk_x, chunk_z, &mut random);
-                self.tall_grass_taiga.populate(world, chunk_x, chunk_z, &mut random);
+                self.tree_taiga
+                    .populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_taiga
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::EXTREME_HILLS | biome::EXTREME_HILLS_EDGE => {
-                self.tree_mountains.populate(world, chunk_x, chunk_z, &mut random);
-                self.tall_grass_mountains.populate(world, chunk_x, chunk_z, &mut random);
-                self.emerald_ore.populate(world, chunk_x, chunk_z, &mut random);
+                self.tree_mountains
+                    .populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_mountains
+                    .populate(world, chunk_x, chunk_z, &mut random);
+                self.emerald_ore
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::RIVER => {
-                self.tall_grass_river.populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_river
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::OCEAN => {
-                self.tall_grass_ocean.populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_ocean
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             biome::ICE_PLAINS => {
-                self.tall_grass_ice_plains.populate(world, chunk_x, chunk_z, &mut random);
+                self.tall_grass_ice_plains
+                    .populate(world, chunk_x, chunk_z, &mut random);
             }
             _ => {}
         }
+
+        // Cave tunnels on a dedicated RNG — they run after the shared
+        // `random` stream is done, so ores/trees/tall-grass above are
+        // untouched. Skipped for water biomes: the certified seed-0 chunks
+        // (0,0)=RIVER keep their section-7 stone/water byte-for-byte, and
+        // the Y <= 44 cap keeps section 7 (Y 48..=63, the 812-fluid zone)
+        // untouched in every other chunk too.
+        match dominant_biome {
+            biome::OCEAN | biome::RIVER | biome::ICE_PLAINS | biome::SWAMPLAND => {}
+            _ => {
+                let mut cave_random = Random::new(
+                    self.seed ^ ((chunk_x as i64) << 32) ^ (chunk_z as i64) ^ 0xC4E5_F00D,
+                );
+                self.cave_populator
+                    .populate(world, chunk_x, chunk_z, &mut cave_random);
+            }
+        }
+    }
+
+    /// Ported niduy structure placements for one chunk (position only —
+    /// mutates no voxel; see `generator::structures`).
+    pub fn structures_at(&self, chunk_x: i32, chunk_z: i32) -> Vec<StructurePosition> {
+        structures::structure_positions_for_chunk(self.seed, chunk_x, chunk_z)
     }
 
     pub fn generate_chunk_internal(&self, chunk_x: i32, chunk_z: i32) -> Chunk {

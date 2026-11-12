@@ -134,6 +134,171 @@ pub enum PluginAction {
         target_player: String,
         message: String,
     },
+    // Scoreboard (Fase 7, `pocketmine\scoreboard\Scoreboard`): the PHP
+    // side owns the full per-player scoreboard object and re-sends it on
+    // every mutation (same full-state pattern as `set_health`/`set_xp`).
+    // Rust diffs it against the stored copy and emits the Bedrock
+    // `RemoveObjective`/`SetDisplayObjective`/`SetScore`/
+    // `SetScoreboardIdentity` packets plus the Java scoreboard packets
+    // (via the Java `take_scoreboard` hook poll).
+    #[serde(rename = "set_scoreboard")]
+    SetScoreboard {
+        target_player: String,
+        #[serde(default)]
+        scoreboard: ScoreboardData,
+    },
+    /// `Player::removeScoreboard()`: drop every objective of the player.
+    #[serde(rename = "remove_scoreboard")]
+    RemoveScoreboard { target_player: String },
+    // apiBossBar (`xenialdan\apibossbar`): the PHP side owns the full
+    // `BossBar`/`DiverseBossBar` object and re-sends its whole state on
+    // every mutation (same full-state pattern as `set_scoreboard`).
+    // Rust diffs it against the stored copy in `BossBarManager` and
+    // emits Bedrock `BossEventPacket` (0x4A) + Java `boss_bar` frames.
+    #[serde(rename = "set_bossbar")]
+    SetBossBar {
+        #[serde(default)]
+        bossbar: BossBarData,
+    },
+    /// `BossBar` destruction: hides the bar from every viewer and
+    /// unregisters it (upstream `removeAllPlayers` + drop).
+    #[serde(rename = "remove_bossbar")]
+    RemoveBossBar { boss_id: i64 },
+    /// PM `World::broadcastPacketToViewers($pos, LevelEventPacket)`.
+    /// Emitted by the server-auth dig flow: `SurvivalBlockBreakHandler`
+    /// broadcasts `BLOCK_START_BREAK`/`BLOCK_STOP_BREAK`/`BLOCK_BREAK_SPEED`
+    /// (LevelEvent 3600/3601/3602) so the client can render dig progress
+    /// and send `PREDICT_DESTROY_BLOCK` when it completes.
+    #[serde(rename = "broadcast_level_event")]
+    BroadcastLevelEvent {
+        event_id: i32,
+        event_data: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+}
+
+/// Wire form of one per-player `DiverseBossBar` override (only set
+/// fields are overrides; missing fields fall back to shared defaults).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BossBarOverrideData {
+    #[serde(default)]
+    pub player: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub percentage: Option<f32>,
+    #[serde(default)]
+    pub color: Option<u8>,
+}
+
+/// Wire form of a whole boss bar (`BossBar`/`DiverseBossBar` in PHP).
+/// Defaults mirror the upstream constructor: 100%, purple, progress,
+/// no flags, shared (non-diverse) bar with no viewers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BossBarData {
+    /// Bedrock actor unique id (`$actorId`; synthetic `nextRuntimeId()`
+    /// unless `setEntity()` bound a real entity).
+    #[serde(default)]
+    pub boss_id: i64,
+    #[serde(default)]
+    pub diverse: bool,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default = "default_bossbar_percentage")]
+    pub percentage: f32,
+    #[serde(default = "default_bossbar_color")]
+    pub color: u8,
+    #[serde(default)]
+    pub overlay: u8,
+    /// Java-only flags (darken/music/fog bits).
+    #[serde(default)]
+    pub flags: u8,
+    #[serde(default)]
+    pub entity: Option<String>,
+    /// Viewers (`addPlayer`...); `hidden` are viewers the bar is
+    /// currently hidden from (`hideFrom` without `removePlayer`).
+    #[serde(default)]
+    pub players: Vec<String>,
+    #[serde(default)]
+    pub hidden: Vec<String>,
+    #[serde(default)]
+    pub overrides: Vec<BossBarOverrideData>,
+}
+
+impl Default for BossBarData {
+    fn default() -> Self {
+        Self {
+            boss_id: 0,
+            diverse: false,
+            title: String::new(),
+            subtitle: String::new(),
+            percentage: default_bossbar_percentage(),
+            color: default_bossbar_color(),
+            overlay: 0,
+            flags: 0,
+            entity: None,
+            players: Vec::new(),
+            hidden: Vec::new(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+fn default_bossbar_percentage() -> f32 {
+    1.0
+}
+
+fn default_bossbar_color() -> u8 {
+    5 // BossBarColor::PURPLE (upstream constructor default)
+}
+
+/// Wire form of one scoreboard line (`ScoreboardLine` in PHP).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ScoreboardLineData {
+    #[serde(default)]
+    pub score: u32,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Wire form of one objective (`ScoreboardObjective` in PHP).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ScoreboardObjectiveData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    /// `ScoreboardSlot` wire value: 1 sidebar, 2 below-name, 3 list.
+    #[serde(default = "default_scoreboard_slot")]
+    pub slot: u8,
+    #[serde(default)]
+    pub sort_order: u8,
+    /// Background tint as `[r, g, b]` (PHP `ColorRange`), ignored when
+    /// empty. Bedrock has no color field on the packet, so the core
+    /// prepends the matching `§` code to the display name.
+    #[serde(default)]
+    pub background: Vec<u8>,
+    #[serde(default)]
+    pub lines: Vec<ScoreboardLineData>,
+}
+
+fn default_scoreboard_slot() -> u8 {
+    1
+}
+
+/// Wire form of a whole per-player scoreboard (`Scoreboard` in PHP).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ScoreboardData {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub objectives: Vec<ScoreboardObjectiveData>,
 }
 
 fn default_socket_addr() -> SocketAddr {
@@ -171,6 +336,11 @@ pub struct PlayerContext {
     pub yaw: f64,
     #[serde(default)]
     pub pitch: f64,
+    /// Head yaw (Bedrock canonical `[0, 360)`), from
+    /// `PlayerAuthInputPacket.headYaw`. Java virtuals report their body
+    /// yaw here. Defaults to 0.0; older payloads omit it.
+    #[serde(default)]
+    pub head_yaw: f64,
     #[serde(default)]
     pub world: String,
     #[serde(default)]
@@ -242,6 +412,7 @@ impl PlayerContext {
             z: 0.0,
             yaw: 0.0,
             pitch: 0.0,
+            head_yaw: 0.0,
             world: String::new(),
             health: 20.0,
             max_health: 20.0,
@@ -300,7 +471,7 @@ impl PlayerContext {
     /// Snapshot in the `players/<name>.json` format shared with Bedrock
     /// sessions (`PlayerSession::save_player_data`).
     ///
-    /// JSON v2 (26 campos, canónico): `y` is the Bedrock world Y (never the
+    /// JSON v2 (27 campos, canónico): `y` is the Bedrock world Y (never the
     /// legacy Java `y+64`; the +64 lives only in legacy Java packets).
     /// Bedrock and virtual (Java) saves write this exact object directly to
     /// `players/<lowercase>.json` — no staging file.
@@ -314,6 +485,7 @@ impl PlayerContext {
             "z": self.z,
             "yaw": self.yaw,
             "pitch": self.pitch,
+            "head_yaw": self.head_yaw,
             "gamemode": self.gamemode as i64,
             "health": self.health as f64,
             "max_health": self.max_health as f64,
@@ -357,6 +529,9 @@ impl PlayerContext {
         }
         if let Some(pitch) = number("pitch") {
             self.pitch = pitch;
+        }
+        if let Some(head_yaw) = first_number(&["head_yaw", "headYaw"]) {
+            self.head_yaw = head_yaw;
         }
         if let Some(gamemode) = value.get("gamemode").and_then(Value::as_i64) {
             self.gamemode = gamemode.max(0) as u32;
@@ -503,6 +678,7 @@ mod tests {
             z: -2.5,
             yaw: 90.0,
             pitch: 10.0,
+            head_yaw: 90.0,
             world: "world".to_string(),
             health: 20.0,
             max_health: 20.0,
@@ -544,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn save_json_is_v2_26_fields_and_roundtrips() {
+    fn save_json_is_v2_27_fields_and_roundtrips() {
         let mut player = PlayerContext::new("Steve", "127.0.0.1:19132".parse().unwrap());
         player.xuid = "2535412345678901".to_string();
         player.first_played = 1700000000.5;
@@ -557,7 +733,7 @@ mod tests {
         player.y = 65.0; // canónico, sin +64
         let saved = player.to_save_json();
         let object = saved.as_object().expect("save json object");
-        assert_eq!(object.len(), 26, "JSON v2 debe tener 26 campos");
+        assert_eq!(object.len(), 27, "JSON v2 debe tener 27 campos");
         assert_eq!(saved["y"], 65.0);
         assert_eq!(saved["xuid"], "2535412345678901");
         assert_eq!(saved["first_played"], 1700000000.5);

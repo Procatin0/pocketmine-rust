@@ -49,6 +49,18 @@ namespace pocketmine\event {
         }
 
         /**
+         * PM `Event::call(): void`: dispatches this event through the
+         * bridge's `PluginManager` — the same machinery the host events
+         * use (`PluginManager::dispatchEvent`, priorities/cancellation
+         * included). Usado por eventos construidos en PHP (ScoreHud,
+         * EconomyLite, etc.): `$ev = new FooEvent(); $ev->call();`.
+         */
+        public function call(): void
+        {
+            \pocketmine\plugin\PluginManager::getInstance()->dispatchEvent($this);
+        }
+
+        /**
          * Hydrates an event from the JSON payload sent by the Rust core.
          * Concrete events override this method.
          */
@@ -361,6 +373,70 @@ namespace pocketmine\event {
             }
 
             throw new \RuntimeException('Position class is not available');
+        }
+
+        /**
+         * Normalises a position-like value into the PM `Location` object
+         * (`pocketmine\world\Location` in the bridge, the class
+         * `Player::getLocation()` returns): feet x/y/z + yaw/pitch + world.
+         * Accepts a Location/Position/Vector3 instance, an
+         * `{"x","y","z","yaw","pitch","world"}` object array, or a legacy
+         * `[x, y, z]` list.
+         */
+        public static function toLocation(mixed $value, mixed $world = null, ?float $yaw = null, ?float $pitch = null): \pocketmine\world\Location
+        {
+            if ($value instanceof \pocketmine\world\Location) {
+                return $value;
+            }
+
+            $vec = self::vectorToArray($value, $world);
+            $worldName = self::worldName($vec['world'] ?? $world);
+
+            $resolvedYaw = $yaw;
+            $resolvedPitch = $pitch;
+            if (is_array($value)) {
+                $resolvedYaw ??= isset($value['yaw']) ? (float)$value['yaw'] : null;
+                $resolvedPitch ??= isset($value['pitch']) ? (float)$value['pitch'] : null;
+            } elseif (is_object($value)) {
+                if (method_exists($value, 'getYaw')) {
+                    try {
+                        $resolvedYaw ??= (float)$value->getYaw();
+                    } catch (\Throwable) {
+                        // Keep the default.
+                    }
+                }
+                if (method_exists($value, 'getPitch')) {
+                    try {
+                        $resolvedPitch ??= (float)$value->getPitch();
+                    } catch (\Throwable) {
+                        // Keep the default.
+                    }
+                }
+            }
+
+            return new \pocketmine\world\Location(
+                $vec['x'],
+                $vec['y'],
+                $vec['z'],
+                $resolvedYaw ?? 0.0,
+                $resolvedPitch ?? 0.0,
+                $worldName
+            );
+        }
+
+        /**
+         * @return array{x:float, y:float, z:float, yaw:float, pitch:float, world:string}
+         */
+        public static function locationToArray(\pocketmine\world\Location $location): array
+        {
+            return [
+                'x' => $location->getX(),
+                'y' => $location->getY(),
+                'z' => $location->getZ(),
+                'yaw' => $location->getYaw(),
+                'pitch' => $location->getPitch(),
+                'world' => $location->getWorldName(),
+            ];
         }
 
         public static function resolveWorld(mixed $world): mixed
@@ -830,47 +906,60 @@ namespace pocketmine\event\player {
         }
     }
 
+    /**
+     * PM `PlayerMoveEvent(Player $player, Location $from, Location $to)`:
+     * `from` is the last location, `to` the new one (both feet-based
+     * `Location` objects, like `Player::getLocation()`); plugins may
+     * rewrite the destination with `setTo()` (the core then teleports
+     * there), and `cancel()` reverts the movement.
+     */
     class PlayerMoveEvent extends PlayerEvent implements Cancellable
     {
-        /** @var array{x:float, y:float, z:float, world?:string} */
-        private array $from;
+        private \pocketmine\world\Location $from;
+        private \pocketmine\world\Location $to;
 
-        /** @var array{x:float, y:float, z:float, world?:string} */
-        private array $to;
-
-        public function __construct(Player $player, mixed $from = [], mixed $to = [])
+        public function __construct(Player $player, mixed $from = null, mixed $to = null)
         {
             parent::__construct($player);
-            $this->from = EventData::vectorToArray($from);
-            $this->to = EventData::vectorToArray($to);
+            $this->from = EventData::toLocation($from ?? $player->getLocation());
+            $this->to = EventData::toLocation($to ?? $player->getLocation());
         }
 
-        public function getFrom(): array
+        public function getFrom(): \pocketmine\world\Location
         {
             return $this->from;
         }
 
-        public function setFrom(mixed $from): void
-        {
-            $this->from = EventData::vectorToArray($from);
-        }
-
-        public function getTo(): array
+        public function getTo(): \pocketmine\world\Location
         {
             return $this->to;
         }
 
-        public function setTo(mixed $to): void
+        public function setTo(\pocketmine\world\Location $to): void
         {
-            $this->to = EventData::vectorToArray($to);
+            $this->to = $to;
+        }
+
+        public function hasChangedPosition(): bool
+        {
+            return $this->from->x !== $this->to->x
+                || $this->from->y !== $this->to->y
+                || $this->from->z !== $this->to->z;
+        }
+
+        public function hasChangedRotation(): bool
+        {
+            return $this->from->getYaw() !== $this->to->getYaw()
+                || $this->from->getPitch() !== $this->to->getPitch();
         }
 
         public static function fromArray(array $data): Event
         {
+            $player = EventData::player($data['player'] ?? null);
             $event = new self(
-                EventData::player($data['player'] ?? null),
-                $data['from'] ?? [],
-                $data['to'] ?? []
+                $player,
+                $data['from'] ?? $player->getLocation(),
+                $data['to'] ?? $player->getLocation()
             );
             $event->applyCancelled($data);
             return $event;
@@ -880,8 +969,8 @@ namespace pocketmine\event\player {
         {
             return [
                 'player' => EventData::playerToArray($this->player),
-                'from' => $this->from,
-                'to' => $this->to,
+                'from' => EventData::locationToArray($this->from),
+                'to' => EventData::locationToArray($this->to),
                 'cancelled' => $this->isCancelled(),
             ];
         }

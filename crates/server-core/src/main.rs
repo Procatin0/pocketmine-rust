@@ -1,16 +1,19 @@
+use nethernet_rs::{NetherNetIdentity, PeerDataChannels, ServerInfo, SignalingServer};
+use php_plugin_bridge::{
+    CommandSender, Event, PluginEnableOrder, PluginManager, ServerCommandEvent,
+};
+use raklib_rs::{RakNetEvent, RakNetListener};
+use server_core::query::{QueryHandler, QueryInfo, QueryListener};
+use server_core::translations::Translator;
+use server_core::{ServerConfig, ServerPluginHost, SessionManager};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use nethernet_rs::{NetherNetIdentity, ServerInfo, SignalingServer};
-use php_plugin_bridge::{CommandSender, Event, PluginEnableOrder, PluginManager, ServerCommandEvent};
-use raklib_rs::{RakNetEvent, RakNetListener};
-use server_core::query::{QueryHandler, QueryInfo, QueryListener};
-use server_core::translations::Translator;
-use server_core::{ServerConfig, ServerPluginHost, SessionManager};
 
 /// `VersionInfo::NAME` (Axolotl branding).
 const SERVER_NAME: &str = "Axolotl-PM";
@@ -22,9 +25,24 @@ const MINECRAFT_VERSION: &str = "1.26.60";
 /// `VersionInfo::GITHUB_URL`.
 const GITHUB_URL: &str = "https://github.com/axolotl-pm/PocketMine-MP";
 
+#[cfg(windows)]
+fn init_windows_timer() {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uPeriod: u32) -> u32;
+    }
+    unsafe {
+        let _ = timeBeginPeriod(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_windows_timer() {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_core::logging::init();
+    init_windows_timer();
 
     let start_time = Instant::now();
 
@@ -56,10 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.enable_dev_builds {
         server_core::emergency!(
             "{}",
-            lang.translate(
-                "pocketmine.server.devBuild.error1",
-                &[SERVER_NAME]
-            )
+            lang.translate("pocketmine.server.devBuild.error1", &[SERVER_NAME])
         );
         server_core::emergency!(
             "{}",
@@ -93,8 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         lang.translate("pocketmine.server.devBuild.warning1", &[SERVER_NAME])
     );
-    warn!("{}", lang.translate("pocketmine.server.devBuild.warning2", &[]));
-    warn!("{}", lang.translate("pocketmine.server.devBuild.warning3", &[]));
+    warn!(
+        "{}",
+        lang.translate("pocketmine.server.devBuild.warning2", &[])
+    );
+    warn!(
+        "{}",
+        lang.translate("pocketmine.server.devBuild.warning3", &[])
+    );
     warn!("{}", "-".repeat(40));
 
     // `Server::__construct`: `pocketmine.server.start` (AQUA version).
@@ -154,7 +175,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session_manager.access().load_from_dir(Path::new("."));
     session_manager.enable_persistence(std::path::PathBuf::from("."));
     // PM has no `world.json`; the Rust snapshot loads silently.
-    let _ = session_manager.world_state().load_from(Path::new("world.json"));
+    let _ = session_manager
+        .world_state()
+        .load_from(Path::new("world.json"));
+    // Persisted scoreboard objectives (`scoreboard.json`, global +
+    // per-player); missing file = no objectives, like `world.json`.
+    let restored_scoreboards = session_manager.load_scoreboards();
+    if restored_scoreboards > 0 {
+        tracing::debug!("restored {restored_scoreboards} persisted scoreboard(s)");
+    }
 
     // Plugin manager + host (created before transports so sessions immediately
     // have events/commands; PM creates `PluginManager` before worlds).
@@ -274,7 +303,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     updater.do_check();
 
     // `Server::__construct`: `startupPrepareNetworkInterfaces`.
-    if !start_network_interfaces(&config, &session_manager, &plugin_manager, &lang).await {
+    // The registry of live WebRTC reliable data channels: the signaling
+    // server publishes each peer's channel to it on connect, and the
+    // central tick loop below pushes the tick-queued envelopes
+    // (`SessionManager::drain_pending_outgoing_bytes`, the
+    // `NetworkSession::flushGamePacketQueue()` half of
+    // `NetworkSession::tick()`) through it — so chunks stream to a
+    // client that is still loading and sends no packets of its own.
+    let peer_data_channels = Arc::new(PeerDataChannels::new());
+    if !start_network_interfaces(
+        &config,
+        &session_manager,
+        &plugin_manager,
+        &lang,
+        Arc::clone(&peer_data_channels),
+    )
+    .await
+    {
         shutdown_sequence(ShutdownContextKind::FailedStartup).await;
         stop_other_threads();
         std::process::exit(1);
@@ -283,20 +328,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Native Java Edition listener (`java-bridge`): the `plugins/JavaBridge`
     // PHP plugin is retired; Tokio serves `JavaServer` on TCP 25565 with
     // the core as its `ServerHooks` (`server_core::java_hooks::CoreHooks`).
+    // Keep the concrete `Arc<CoreHooks>` for the chunk prefetch task below
+    // while the listener owns the trait object.
+    //
+    // `run_arc` is accept/flush only. The logical tick for Java runs on
+    // the single central clock below: `JavaServer::tick_at` with the
+    // same tick number as `SessionManager::tick` (Bedrock). No second
+    // 50 ms interval exists for Java anymore.
+    let core_hooks = Arc::new(server_core::java_hooks::CoreHooks::new(
+        Arc::clone(&session_manager),
+        config.motd.clone(),
+        config.view_distance,
+        config.gamemode,
+        config.level_type.clone(),
+    ));
+    let java_server = {
+        let hooks: Arc<dyn java_bridge::ServerHooks> = core_hooks.clone();
+        Arc::new(java_bridge::JavaServer::new(hooks))
+    };
+    info!("Java Edition listener starting on 0.0.0.0:25565 (java-bridge, native Rust, prioritized for Java 26.1)");
     {
-        let hooks: Arc<dyn java_bridge::ServerHooks> = Arc::new(
-            server_core::java_hooks::CoreHooks::new(
-                Arc::clone(&session_manager),
-                config.motd.clone(),
-                config.view_distance,
-                config.gamemode,
-                config.level_type.clone(),
-            ),
-        );
-        let java_server = Arc::new(java_bridge::JavaServer::new(hooks));
-        info!("Java Edition listener starting on 0.0.0.0:25565 (java-bridge, native Rust)");
+        let server = Arc::clone(&java_server);
         tokio::spawn(async move {
-            java_server.run_arc("0.0.0.0:25565").await;
+            if let Err(e) = server.run_arc("0.0.0.0:25565").await {
+                tracing::error!("FATAL: Failed to bind Java Edition listener on 0.0.0.0:25565: {e}. Check if another server is already using port 25565!");
+            }
+        });
+    }
+
+    // Chunk prefetch sidecar: warms the Java chunk cache (objects plus
+    // converted legacy/modern bytes) on the blocking pool around every
+    // online player, so `streamChunks` in a Java tick consumes bytes that
+    // are already generated instead of paying ~18 ms per cold column. It
+    // never runs on the tick task: the 20 TPS clock cannot slow down no
+    // matter how many columns are cold.
+    {
+        let manager = Arc::clone(&session_manager);
+        let java_server = Arc::clone(&java_server);
+        let radius = config.view_distance.clamp(2, 12);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut running: Option<tokio::task::JoinHandle<usize>> = None;
+            loop {
+                interval.tick().await;
+                if running.as_ref().is_some_and(|h| !h.is_finished()) {
+                    continue;
+                }
+                running = None;
+                // Only Java clients consume the converted Java payload
+                // cache; with none in play there is nothing to warm
+                // (Bedrock streams its own cached payloads).
+                let protocols = java_server.active_protocols();
+                if protocols.is_empty() {
+                    continue;
+                }
+                // Columns around every online player, nearest first. The
+                // registry is the shared source both platforms tick from.
+                let mut wanted: std::collections::HashMap<(i32, i32), i32> =
+                    std::collections::HashMap::new();
+                for player in manager.registry().all() {
+                    let center_x = (player.x / 16.0).floor() as i32;
+                    let center_z = (player.z / 16.0).floor() as i32;
+                    for cx in (center_x - radius)..=(center_x + radius) {
+                        for cz in (center_z - radius)..=(center_z + radius) {
+                            let distance = (cx - center_x).pow(2) + (cz - center_z).pow(2);
+                            wanted
+                                .entry((cx, cz))
+                                .and_modify(|d| *d = (*d).min(distance))
+                                .or_insert(distance);
+                        }
+                    }
+                }
+                if wanted.is_empty() {
+                    continue;
+                }
+                let mut columns: Vec<((i32, i32), i32)> =
+                    wanted.into_iter().map(|(c, d)| (c, d)).collect();
+                columns.sort_by_key(|(_, d)| *d);
+                let columns: Vec<(i32, i32)> = columns.into_iter().map(|(c, _)| c).collect();
+                // Pass the whole sorted list: `prefetch_blocking` skips
+                // warm columns with cache lookups and generates at most
+                // a bounded number of cold ones per pass, so each
+                // 500 ms pass progresses to the next batch. (The old
+                // `truncate(32)` here re-warmed the same nearest 32
+                // columns forever; outer columns stayed cold and the
+                // Java tick paid ~18 ms per column for the whole load.)
+                // Converted bytes are warmed only for the protocols
+                // actually connected — all five used to cost ~5x.
+                let hooks = Arc::clone(&core_hooks);
+                running = Some(tokio::task::spawn_blocking(move || {
+                    hooks.prefetch_blocking(&columns, &protocols)
+                }));
+            }
         });
     }
 
@@ -323,76 +446,180 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     );
 
-    // Tick loop: 20 TPS.
+    // Single server tick (núcleo): one 20 TPS clock drives both
+    // connectors on the same pulse. There is exactly one interval in
+    // this process — the one in the logical-tick task below.
+    //
+    //   ┌─ ONE 50 ms clock (main.rs logical tick) ─────────────────┐
+    //   │ SessionManager::tick()   → Bedrock core (world.tick,     │
+    //   │                              SetTime envelope, Fase 2     │
+    //   │                              UpdateBlock, virtual sync,   │
+    //   │                              doChunkRequests; queue only) │
+    //   │ flush tick queues      → drain_pending_outgoing_bytes +  │
+    //   │                              send on the peer's WebRTC     │
+    //   │                              reliable data channel       │
+    //   │ JavaServer::tick_at(N)   → Java connector (same N, same   │
+    //   │                              shared WorldState::time;     │
+    //   │                              queue only, budgeted)        │
+    //   │ tick_tx.send(N)          → plugin sidecar                 │
+    //   └───────────────────────────────────────────────────────────┘
+    //        │                       │                      │
+    //        ▼                       ▼                      ▼
+    //   Bedrock transport      Java socket flush       PHP sidecar
+    //   (tick queue → drain +  (handle_stream:        (tick_sync on
+    //   encode + send on the   poll_bytes + 20 ms     spawn_blocking,
+    //   peer's data channel;   drain flush; no tick   serialized)
+    //   dispatch still drains  interval left)       + prefetch
+    //   on its path too)                            sidecar (500 ms
+    //                                                    spawn_blocking)
+    //
+    // The tick mutates state and queues envelopes (`pending_outgoing`
+    // for Bedrock, `out_buf` for Java). Right after the Bedrock tick the
+    // loop flushes that queue (`drain_pending_outgoing_bytes` +
+    // `PeerDataChannels::send_to_peer`) — the
+    // `NetworkSession::flushGamePacketQueue()` half of the reference
+    // `NetworkSession::tick()` — so a client that sends nothing after
+    // `RequestChunkRadius` still receives its terrain chunks and the
+    // `PLAYER_SPAWN` that follows them. Blocking work (`tick_sync` PHP
+    // IPC, save) still runs in the sidecars below / on
+    // `spawn_blocking`, so the 50 ms pacing holds at 20 TPS no matter
+    // how slow a plugin is. The old second clocks — the 20 Hz flush
+    // interval for Bedrock polls and the `run_arc` 50 ms `Skip` interval
+    // for Java — are gone: the polls now live in `SessionManager::tick`
+    // and the Java tick is driven from this same loop with the same
+    // number.
     {
-        let plugin_manager = Arc::clone(&plugin_manager);
-        let session_manager = Arc::clone(&session_manager);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut tick = 0u64;
-            loop {
-                interval.tick().await;
-                // Stop ticking as soon as shutdown begins: pending heartbeats
-                // must not interleave with (or restart the worker during)
-                // plugin disabling.
-                if plugin_manager.php_worker().is_shutting_down() {
-                    break;
+        // Plugin-tick sidecar: PHP ticks stay serialized here, in order,
+        // instead of being awaited inline by the loop. Actions land one
+        // cycle later than before (the price of never stalling the
+        // clock); a wedged plugin (30 s IPC timeout) now only backs up
+        // this queue, not the TPS.
+        let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<u64>();
+        {
+            let plugin_manager = Arc::clone(&plugin_manager);
+            let session_manager = Arc::clone(&session_manager);
+            tokio::spawn(async move {
+                while let Some(tick) = tick_rx.recv().await {
+                    // Stop as soon as shutdown begins: pending heartbeats
+                    // must not interleave with (or restart the worker
+                    // during) plugin disabling.
+                    if plugin_manager.php_worker().is_shutting_down() {
+                        break;
+                    }
+                    let manager = Arc::clone(&plugin_manager);
+                    let result = tokio::task::spawn_blocking(move || manager.tick_sync(tick)).await;
+                    match result {
+                        Ok(Ok(actions)) => {
+                            if !actions.is_empty() {
+                                session_manager.apply_actions(&actions, 0);
+                            }
+                        }
+                        Ok(Err(error)) => warn!("Plugin tick {} failed: {}", tick, error),
+                        Err(error) => warn!("Plugin tick task panicked: {}", error),
+                    }
                 }
-                session_manager.metrics().record_tick();
-                tick = tick.wrapping_add(1);
-                let manager = Arc::clone(&plugin_manager);
-                let result =
-                    tokio::task::spawn_blocking(move || manager.tick_sync(tick)).await;
-                match result {
-                    Ok(Ok(actions)) => {
-                        if !actions.is_empty() {
-                            session_manager.apply_actions(&actions, 0);
+            });
+        }
+
+        // Logical tick: the single clock. It records, advances both
+        // connectors with the same tick number, flushes the Bedrock
+        // tick's queued envelopes onto each peer's data channel, and
+        // queues the PHP tick.
+        {
+            let plugin_manager = Arc::clone(&plugin_manager);
+            let session_manager = Arc::clone(&session_manager);
+            let java_server = Arc::clone(&java_server);
+            let peer_data_channels = Arc::clone(&peer_data_channels);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(50));
+                // Skip, never burst-catch-up: a slow tick must not queue
+                // hundreds of catch-up ticks after one slow column build.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    // Stop ticking as soon as shutdown begins: pending
+                    // heartbeats must not interleave with (or restart the
+                    // worker during) plugin disabling.
+                    if plugin_manager.php_worker().is_shutting_down() {
+                        break;
+                    }
+                    let started = Instant::now();
+                    session_manager.metrics().record_tick();
+
+                    // Bedrock connector tick (state + envelopes):
+                    // world clock (queues the 1 Hz `SetTime`, or
+                    // immediately on a jump), Fase 2 block forwarding,
+                    // virtual-player sync, and `doChunkRequests` for
+                    // every PreSpawn/InGame session with a view distance
+                    // (`NetworkSession::tick()` in the reference).
+                    let report = session_manager.tick();
+                    let tick = report.tick;
+
+                    // `NetworkSession::flushGamePacketQueue()`: encode
+                    // everything this tick queued (terrain chunks and
+                    // the `PLAYER_SPAWN` that follows the threshold
+                    // chunk included) and write it to each peer's
+                    // reliable data channel, without waiting for that
+                    // peer to send a packet. A peer with no registered
+                    // channel (not yet connected, or already gone) is
+                    // skipped — its drain already happened here, so the
+                    // batch is dropped rather than re-queued; sessions
+                    // only exist after their first dispatch, which
+                    // requires the channel, so this is the disconnect
+                    // race, not the normal path.
+                    for (peer, batches) in session_manager.drain_pending_outgoing_bytes() {
+                        for batch in batches {
+                            let len = batch.len();
+                            if !peer_data_channels.send_to_peer(peer, batch).await {
+                                debug!(
+                                    "Tick flush: no WebRTC data channel for {peer}; dropped {len} byte batch"
+                                );
+                            }
                         }
                     }
-                    Ok(Err(error)) => warn!("Plugin tick {} failed: {}", tick, error),
-                    Err(error) => warn!("Plugin tick task panicked: {}", error),
+
+                    // Java connector tick with the same number, after
+                    // Bedrock so Java sees the world time Bedrock just
+                    // advanced (e.g. `/time set 6000` on Bedrock reaches
+                    // Java in this same tick via jump detection there,
+                    // and vice versa). Bounded by the Java tick budget
+                    // and fed by the prefetch-warmed cache; the heavy
+                    // part runs on the blocking pool so the Tokio worker
+                    // serving accepts/flushes never stalls, while the
+                    // `await` keeps order and 20 TPS pacing (no second
+                    // interval, no lost ticks).
+                    {
+                        let server = Arc::clone(&java_server);
+                        let _ = tokio::task::spawn_blocking(move || server.tick_at(tick)).await;
+                    }
+
+                    // Queue the PHP tick. If the sidecar died the channel
+                    // is closed, but the clock must keep running regardless
+                    // (game logic is the sidecar's job, not the clock's).
+                    let _ = tick_tx.send(tick);
+
+                    // PocketMine's autosave interval is 6000 ticks (5
+                    // minutes). Fire-and-forget on the blocking pool: the
+                    // old code awaited the whole save inline, stalling
+                    // the clock for the duration of every file write.
+                    if tick % 6000 == 0 && session_manager.auto_save_enabled() {
+                        let saver = Arc::clone(&session_manager);
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(error) = saver.save_all() {
+                                warn!("Autosave failed: {}", error);
+                            }
+                        });
+                    }
+
+                    if started.elapsed() > Duration::from_millis(10) {
+                        debug!(
+                            "Logical tick {tick} took {:?} (must stay << 50 ms)",
+                            started.elapsed()
+                        );
+                    }
                 }
-
-                // Fase 2 Java -> Bedrock every tick (50 ms): Java edits made
-                // purely via the `world.set_block` host call have no
-                // `apply_actions` of their own, so they are forwarded to
-                // Bedrock viewers here even when no Bedrock packet is in
-                // flight. The 20-tick cadence of `poll_prespawn_timeouts`
-                // would delay them by up to 1s; the poll is an empty drain
-                // plus a session scan when idle, so polling each tick is
-                // cheap and keeps place/break feedback snappy without
-                // rejoin. Idempotent: the no-change case sends nothing.
-                session_manager.poll_block_changes();
-
-                // Day/night clock: advance `WorldState::time` by one
-                // tick (unless `/time stop`) and broadcast `SetTime`
-                // to Bedrock every 20 ticks (1 s), or immediately on
-                // a jump. The Java bridge polls the same shared time
-                // in its own tick, so Java and Bedrock stay synced
-                // instead of each freezing at the join time.
-                session_manager.tick_world_time();
-
-                // Fires PLAYER_SPAWN for logins stuck in PreSpawn without
-                // 0x71, so TestKit/plugins see the join and the client's
-                // chunk-radius/input fallback (or its next packet) delivers
-                // the queued spawn packets.
-                if tick % 20 == 0 && session_manager.poll_prespawn_timeouts() > 0 {
-                    debug!("Prespawn timeout fallback forced at least one spawn");
-                }
-
-                // PocketMine's autosave interval is 6000 ticks (5 minutes).
-                if tick % 6000 == 0 && session_manager.auto_save_enabled() {
-                    let saver = Arc::clone(&session_manager);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Err(error) = saver.save_all() {
-                            warn!("Autosave failed: {}", error);
-                        }
-                    })
-                    .await;
-                }
-            }
-        });
+            });
+        }
     }
 
     // Console: ServerCommandEvent + comandos de plugins.
@@ -412,7 +639,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sessions = Arc::clone(&session_manager);
                         let result = tokio::task::spawn_blocking(move || {
                             let mut event = ServerCommandEvent::new(line.clone());
-                            let mut actions = manager.dispatch_event_sync(&mut event).unwrap_or_default();
+                            let mut actions =
+                                manager.dispatch_event_sync(&mut event).unwrap_or_default();
                             if !event.is_cancelled() {
                                 let command = event.command;
                                 // Native commands first (tp, gamemode, say, ...).
@@ -422,7 +650,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     return actions;
                                 }
-                                match manager.execute_command_sync(&CommandSender::Console, &command) {
+                                match manager
+                                    .execute_command_sync(&CommandSender::Console, &command)
+                                {
                                     Ok(Some(outcome)) => actions.extend(outcome.actions),
                                     Ok(None) => server_core::logging::console_message(
                                         &server_core::command::not_found_message(
@@ -726,6 +956,7 @@ async fn start_network_interfaces(
     session_manager: &Arc<SessionManager>,
     plugin_manager: &Arc<PluginManager>,
     lang: &Translator,
+    peer_data_channels: Arc<PeerDataChannels>,
 ) -> bool {
     // PM validates transports here (unknown -> warning, cap 8). Config
     // already capped the list; warnings happen in PM order here.
@@ -802,10 +1033,7 @@ async fn start_network_interfaces(
                 if !config.builtin_signaling_enabled {
                     server_core::notice!(
                         "{}",
-                        lang.translate(
-                            "pocketmine.server.nethernet.builtinSignalingDisabled",
-                            &[]
-                        )
+                        lang.translate("pocketmine.server.nethernet.builtinSignalingDisabled", &[])
                     );
                 }
                 ensure_identity_key_file(&config.nethernet_key_file);
@@ -835,10 +1063,9 @@ async fn start_network_interfaces(
                 // Hyper-V vEthernet address (172.19.16.1). A concrete source
                 // has no route to LAN/loopback clients and produces
                 // Windows `10049`/`10051` on every ICE write.
-                let signaling_addr: SocketAddr =
-                    format!("0.0.0.0:{}", signaling_port)
-                        .parse()
-                        .unwrap_or_else(|_| "0.0.0.0:19132".parse().unwrap());
+                let signaling_addr: SocketAddr = format!("0.0.0.0:{}", signaling_port)
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:19132".parse().unwrap());
 
                 struct BedrockPacketHandler {
                     session_manager: Arc<SessionManager>,
@@ -851,9 +1078,7 @@ async fn start_network_interfaces(
                         channel: &str,
                         data: bytes::Bytes,
                     ) -> Vec<bytes::Bytes> {
-                        if channel != "ReliableDataChannel"
-                            && channel != "UnreliableDataChannel"
-                        {
+                        if channel != "ReliableDataChannel" && channel != "UnreliableDataChannel" {
                             return Vec::new();
                         }
                         self.session_manager.dispatch_webrtc_packet(peer, &data)
@@ -890,6 +1115,10 @@ async fn start_network_interfaces(
                 signaling_server.set_packet_handler(Arc::new(BedrockPacketHandler {
                     session_manager: Arc::clone(session_manager),
                 }));
+                // Share the host's registry so the central tick loop can
+                // push tick-queued envelopes (chunks included) to a peer
+                // without waiting for that peer to send a packet first.
+                signaling_server.set_peer_data_channels(Arc::clone(&peer_data_channels));
 
                 tokio::spawn(async move {
                     if let Err(error) = signaling_server.run().await {
@@ -906,16 +1135,14 @@ async fn start_network_interfaces(
                 let server_id: u64 = 0x1234_5678_aabb_ccdd;
                 // RakNet listens on the wildcard gameplay port, never a
                 // concrete local IP (see signaling bind above).
-                let raknet_addr: SocketAddr =
-                    format!("0.0.0.0:{}", config.server_port_udp)
-                        .parse()
-                        .unwrap_or_else(|_| "0.0.0.0:19132".parse().unwrap());
+                let raknet_addr: SocketAddr = format!("0.0.0.0:{}", config.server_port_udp)
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:19132".parse().unwrap());
                 // Task collision guard: never share the WebRTC gameplay UDP
                 // port between two listening sockets — gameplay datagrams
                 // landing on the RakNet "listening" socket would be dropped
                 // (it only speaks RakNet/STUN) and never reach ICE/DTLS.
-                let raknet_collides_webrtc =
-                    webrtc_active && raknet_addr.port() == webrtc_udp_port;
+                let raknet_collides_webrtc = webrtc_active && raknet_addr.port() == webrtc_udp_port;
                 if raknet_collides_webrtc {
                     tracing::warn!(
                         "RakNet and NetherNet both claim UDP port {}; keeping NetherNet on {} and skipping RakNet bind so gameplay packets are not lost",
@@ -966,7 +1193,10 @@ async fn start_network_interfaces(
                                         }
                                     },
                                     Err(error) => {
-                                        debug!("RakNet listener error on :{}: {}", raknet_port, error);
+                                        debug!(
+                                            "RakNet listener error on :{}: {}",
+                                            raknet_port, error
+                                        );
                                     }
                                 }
                             }
@@ -1064,7 +1294,10 @@ async fn start_network_interfaces(
                     Ok(listener) => {
                         debug!(
                             "Query listener bound to {}",
-                            listener.local_addr().unwrap_or_else(|_| config.server_ip.parse().unwrap_or("0.0.0.0:0".parse().unwrap()))
+                            listener.local_addr().unwrap_or_else(|_| config
+                                .server_ip
+                                .parse()
+                                .unwrap_or("0.0.0.0:0".parse().unwrap()))
                         );
                         tokio::spawn(async move {
                             listener.serve().await;
@@ -1091,7 +1324,10 @@ async fn start_network_interfaces(
                     Ok(listener) => {
                         debug!(
                             "Query listener bound to {}",
-                            listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())
+                            listener
+                                .local_addr()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|_| "unknown".to_string())
                         );
                         tokio::spawn(async move {
                             listener.serve().await;
@@ -1173,5 +1409,8 @@ fn ensure_identity_key_file(key_file: &str) {
         return;
     }
     let _ = std::fs::create_dir_all(Path::new(key_file).parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(key_file, "-----BEGIN EC PRIVATE KEY-----\n# Rust port placeholder\n-----END EC PRIVATE KEY-----\n");
+    let _ = std::fs::write(
+        key_file,
+        "-----BEGIN EC PRIVATE KEY-----\n# Rust port placeholder\n-----END EC PRIVATE KEY-----\n",
+    );
 }

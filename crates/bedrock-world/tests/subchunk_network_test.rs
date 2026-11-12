@@ -1,8 +1,8 @@
+use bedrock_protocol::{Reader, Writer};
 use bedrock_world::{
     deserialize_subchunk, serialize_subchunk, serialize_subchunk_version, SubChunk,
     SubChunkNetworkError,
 };
-use bedrock_protocol::{Reader, Writer};
 
 #[test]
 fn test_empty_subchunk_roundtrip() {
@@ -17,7 +17,8 @@ fn test_empty_subchunk_roundtrip() {
     // [3] = block runtime id VarInt zigzag: 0 -> 0x00
     assert_eq!(bytes, vec![8, 1, 1, 0]);
 
-    let deserialized = SubChunk::deserialize_network(&bytes).expect("Failed to deserialize empty subchunk");
+    let deserialized =
+        SubChunk::deserialize_network(&bytes).expect("Failed to deserialize empty subchunk");
     assert_eq!(deserialized.layers.len(), 1);
 
     for x in 0..16 {
@@ -85,7 +86,9 @@ fn test_dispersed_blocks_roundtrip() {
                     deserialized.get_block(x, y, z, 0),
                     subchunk.get_block(x, y, z, 0),
                     "Mismatch at ({}, {}, {})",
-                    x, y, z
+                    x,
+                    y,
+                    z
                 );
             }
         }
@@ -105,8 +108,8 @@ fn test_multi_layer_waterlogged() {
     subchunk.set_block(4, 2, 8, 1, WATER);
 
     let bytes = subchunk.serialize_network();
-    let deserialized = SubChunk::deserialize_network(&bytes)
-        .expect("Failed to deserialize 2-layer subchunk");
+    let deserialized =
+        SubChunk::deserialize_network(&bytes).expect("Failed to deserialize 2-layer subchunk");
 
     assert_eq!(deserialized.layers.len(), 2);
     assert_eq!(deserialized.get_block(4, 2, 8, 0), OAK_STAIRS);
@@ -128,8 +131,8 @@ fn test_multiple_palette_sizes_and_packing() {
     }
 
     let bytes = subchunk.serialize_network();
-    let deserialized = SubChunk::deserialize_network(&bytes)
-        .expect("Failed to deserialize 3-bpb subchunk");
+    let deserialized =
+        SubChunk::deserialize_network(&bytes).expect("Failed to deserialize 3-bpb subchunk");
 
     for (i, &bid) in block_ids.iter().enumerate() {
         assert_eq!(deserialized.get_block(i, i, i, 0), bid);
@@ -146,7 +149,8 @@ fn test_writer_reader_stream_functions() {
     let bytes = writer.into_bytes();
 
     let mut reader = Reader::new(&bytes);
-    let deserialized = deserialize_subchunk(&mut reader).expect("Failed to deserialize with Reader");
+    let deserialized =
+        deserialize_subchunk(&mut reader).expect("Failed to deserialize with Reader");
     assert_eq!(deserialized.get_block(2, 3, 4, 0), 99);
 }
 

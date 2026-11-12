@@ -214,10 +214,11 @@ fn lp_vec3_zero_and_positioned_vectors() {
 
 #[test]
 fn yaw_vectors_like_php() {
-    assert!((p::bedrock_yaw_to_java(0.0) - 180.0).abs() < 0.001);
-    assert!(p::bedrock_yaw_to_java(180.0).abs() < 0.001);
-    assert!((p::bedrock_yaw_to_java(90.0) + 90.0).abs() < 0.001);
-    assert!((p::bedrock_yaw_to_java(270.0) - 90.0).abs() < 0.001);
-    assert!((p::java_yaw_to_bedrock(0.0) - 180.0).abs() < 0.001);
+    // Same compass in both editions (0 = south, 90 = west).
+    assert!(p::bedrock_yaw_to_java(0.0).abs() < 0.001);
+    assert!((p::bedrock_yaw_to_java(180.0) - 180.0).abs() < 0.001);
+    assert!((p::bedrock_yaw_to_java(90.0) - 90.0).abs() < 0.001);
+    assert!((p::bedrock_yaw_to_java(270.0) - (-90.0)).abs() < 0.001);
+    assert!(p::java_yaw_to_bedrock(0.0).abs() < 0.001);
     assert!((p::bedrock_pitch_to_java(315.0) + 45.0).abs() < 0.001);
 }

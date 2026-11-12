@@ -6,7 +6,6 @@
 //! servers cannot validate Xbox chains anyway).
 
 use serde_json::Value;
-use tracing::debug;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoginIdentity {
@@ -41,14 +40,43 @@ impl LoginIdentity {
 /// player name. This function falls back through several strategies so the
 /// player's real name is used whenever possible.
 pub fn parse_login_identity(connection_request: &str) -> LoginIdentity {
-    debug!("Login connection_request raw: {}", connection_request);
+    tracing::info!("Login connection_request raw len={} head={}", connection_request.len(), &connection_request.chars().take(300).collect::<String>());
+    // The connection_request from the GDK client is length-prefixed binary:
+    // `T\0\0\0{"AuthenticationType":0,"Token":"<jwt>",...}` — first strip any
+    // non-JSON prefix and try parsing the inner JSON for JWT tokens.
+    let json_part = match connection_request.find('{') {
+        Some(idx) => &connection_request[idx..],
+        None => connection_request,
+    };
+    let connection_request = json_part;
 
     let mut identity = LoginIdentity::default();
 
     // Strategy 1: Extract JWT tokens (online mode with Xbox auth).
-    for token in collect_jwt_tokens(connection_request) {
-        if let Some(payload) = decode_jwt_payload(&token) {
+    let tokens = collect_jwt_tokens(connection_request);
+    tracing::info!("Login identity: {} jwt tokens found", tokens.len());
+    for (idx, token) in tokens.iter().enumerate() {
+        if let Some(payload) = decode_jwt_payload(token) {
+            let raw = payload.to_string();
+            tracing::info!("Login identity token {} payload len={} preview={}", idx, raw.len(), &raw.chars().take(300).collect::<String>());
+            // Save huge token payload for external analysis (skin data is ~440k)
+            if idx == 1 {
+                std::fs::write("C:\\Users\\matic\\AppData\\Local\\Temp\\opencode\\clientdata_payload.json", raw.as_bytes()).ok();
+                // also save raw raw client_token to inspect
+                std::fs::write("C:\\Users\\matic\\AppData\\Local\\Temp\\opencode\\clientdata_jwt.txt", token.as_bytes()).ok();
+            }
+            // Debug: show if displayName exists anywhere nested
+            fn contains_key(v: &Value, key: &str) -> bool {
+                match v {
+                    Value::Object(map) => map.keys().any(|k| k == key) || map.values().any(|x| contains_key(x, key)),
+                    Value::Array(a) => a.iter().any(|x| contains_key(x, key)),
+                    _ => false,
+                }
+            }
+            tracing::info!("Login identity token {} has displayName={} extraData={} ThirdPartyName={} XUID={}", idx, contains_key(&payload, "displayName"), contains_key(&payload, "extraData"), contains_key(&payload, "ThirdPartyName"), contains_key(&payload, "XUID"));
             apply_claims(&payload, &mut identity);
+        } else {
+            tracing::info!("Login identity token {} payload decode FAILED", idx);
         }
     }
 
@@ -107,6 +135,13 @@ fn collect_jwt_tokens(input: &str) -> Vec<String> {
     // as a whole, so the trailing client-data JWT would be glued to `]}`
     // without broader delimiters (e.g. `]}.h2.p2.sig`). Split on every JSON
     // structural char and trim stray dots so both tokens are recovered.
+    // However the GDK client sends length-prefixed binary headers like
+    // `T\0\0\0{"AuthenticationType":0,"Token":"eyJ..."}` where the client-data
+    // token sits directly after the chain payload without a clean delimiter
+    // (leading `\?\?`). For candidates with base64 chars wrapped around junk,
+    // trim to the first valid base64 boundary manually.
+    let mut scanned = 0usize;
+    let mut rejected = 0usize;
     for candidate in input.split(|c: char| {
         c == '"'
             || c == '\''
@@ -118,13 +153,26 @@ fn collect_jwt_tokens(input: &str) -> Vec<String> {
             || c == ']'
             || c == ':'
     }) {
-        let candidate = candidate.trim_matches(|c: char| {
-            c == '{' || c == '}' || c == '[' || c == ']' || c == '.' || c == ':' || c == ';'
+        let mut candidate = candidate.trim_matches(|c: char| {
+            c == '{' || c == '}' || c == '[' || c == ']' || c == '.' || c == ':' || c == ';' || c == '?'
         });
+        // If the candidate has a leading non-base64 prefix before the JWT header
+        // (GDK `??\b\0eyJ...`), cut to the first 'ey' that decodes to {"alg":
+        // otherwise is_jwt correctly rejects it but we lose the token.
+        if !is_jwt(candidate) {
+            if let Some(pos) = candidate.find("eyJ") {
+                candidate = &candidate[pos..];
+            }
+        }
+        scanned += 1;
         if is_jwt(candidate) && !tokens.iter().any(|t| t == candidate) {
             tokens.push(candidate.to_string());
+        } else if candidate.split('.').count() == 3 && candidate.len() > 200 {
+            rejected += 1;
+            tracing::info!("Login identity: rejecting long candidate len={} head={}", candidate.len(), &candidate.chars().take(120).collect::<String>());
         }
     }
+    tracing::info!("Login identity: scanned {} candidates, rejected large-dot {} ones", scanned, rejected);
 
     tokens
 }
@@ -176,7 +224,15 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 
 fn apply_claims(payload: &Value, identity: &mut LoginIdentity) {
     if identity.display_name.is_empty() {
-        if let Some(name) = payload.get("displayName").and_then(Value::as_str) {
+        if let Some(name) = payload.get("ThirdPartyName").and_then(Value::as_str) {
+            identity.display_name = name.to_string();
+        } else if let Some(name) = payload.get("displayName").and_then(Value::as_str) {
+            identity.display_name = name.to_string();
+        } else if let Some(name) = payload
+            .get("extraData")
+            .and_then(|extra| extra.get("displayName"))
+            .and_then(Value::as_str)
+        {
             identity.display_name = name.to_string();
         } else if let Some(name) = payload
             .get("extraData")

@@ -118,6 +118,48 @@ pub struct UseItemData {
     pub client_cooldown_state: u8,
 }
 
+impl UseItemData {
+    /// Field order of `UseItemTransactionData::decodeData`
+    /// (`BedrockProtocol/src/types/inventory/UseItemTransactionData.php`):
+    /// `actionType` VarInt, `triggerType` u8, `blockPosition` 3x VarInt,
+    /// `face` u8, `hotbarSlot` VarInt, `hand` u8, `itemInHand`
+    /// `CommonTypes::getItemStackWrapper` (i16 LE id, u16 LE count,
+    /// VarUInt meta, optional VarInt stack net id, VarUInt block runtime
+    /// id, raw extra data string), `playerPosition` + `clickPosition`
+    /// (3x f32 each), `blockRuntimeId` VarUInt, `clientInteractPrediction`
+    /// u8, `clientCooldownState` u8. Shared by `InventoryTransactionPacket`
+    /// (TYPE_USE_ITEM) and the `itemInteractionData` embedded in
+    /// `PlayerAuthInputPacket`.
+    pub fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
+        Ok(Self {
+            action_type: reader.read_var_i32()?,
+            trigger_type: reader.read_byte()?,
+            block_position: (
+                reader.read_var_i32()?,
+                reader.read_var_i32()?,
+                reader.read_var_i32()?,
+            ),
+            face: reader.read_byte()?,
+            hotbar_slot: reader.read_var_i32()?,
+            hand: reader.read_byte()?,
+            item_in_hand: ItemStack::decode(reader)?,
+            player_position: (
+                reader.read_f32_le()?,
+                reader.read_f32_le()?,
+                reader.read_f32_le()?,
+            ),
+            click_position: (
+                reader.read_f32_le()?,
+                reader.read_f32_le()?,
+                reader.read_f32_le()?,
+            ),
+            block_runtime_id: reader.read_var_u32()?,
+            client_interact_prediction: reader.read_byte()?,
+            client_cooldown_state: reader.read_byte()?,
+        })
+    }
+}
+
 /// Extra data of a `TYPE_USE_ITEM_ON_ENTITY` transaction.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UseItemOnEntityData {
@@ -295,32 +337,7 @@ impl InventoryTransactionPacket {
                 }
                 TransactionData::Mismatch
             }
-            TYPE_USE_ITEM => TransactionData::UseItem(UseItemData {
-                action_type: reader.read_var_i32()?,
-                trigger_type: reader.read_byte()?,
-                block_position: (
-                    reader.read_var_i32()?,
-                    reader.read_var_i32()?,
-                    reader.read_var_i32()?,
-                ),
-                face: reader.read_byte()?,
-                hotbar_slot: reader.read_var_i32()?,
-                hand: reader.read_byte()?,
-                item_in_hand: ItemStack::decode(reader)?,
-                player_position: (
-                    reader.read_f32_le()?,
-                    reader.read_f32_le()?,
-                    reader.read_f32_le()?,
-                ),
-                click_position: (
-                    reader.read_f32_le()?,
-                    reader.read_f32_le()?,
-                    reader.read_f32_le()?,
-                ),
-                block_runtime_id: reader.read_var_u32()?,
-                client_interact_prediction: reader.read_byte()?,
-                client_cooldown_state: reader.read_byte()?,
-            }),
+            TYPE_USE_ITEM => TransactionData::UseItem(UseItemData::decode(reader)?),
             TYPE_USE_ITEM_ON_ENTITY => TransactionData::UseItemOnEntity(UseItemOnEntityData {
                 actor_runtime_id: reader.read_var_u64()?,
                 action_type: reader.read_var_i32()?,

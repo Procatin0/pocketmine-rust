@@ -108,3 +108,30 @@ fn bedrock_newcomer_sees_existing_virtual_before_any_poll() {
     // Nothing left for a later poll (broadcast already synced virtuals).
     assert_eq!(manager.poll_virtual_players(), 0);
 }
+
+#[test]
+fn virtual_sneak_toggle_reaches_bedrock_viewer_as_set_actor_data() {
+    let manager = SessionManager::new();
+    manager.add_session(joined_bedrock(1, "Steve"));
+    register_virtual(&manager, "Procatin0");
+    assert_eq!(manager.poll_virtual_players(), 2);
+
+    // Java holds shift: one SetActorData carrying the sneak flag.
+    let mut player = manager
+        .registry()
+        .get("Procatin0")
+        .expect("virtual still registered");
+    player.is_sneaking = true;
+    manager.registry().upsert(player);
+    assert_eq!(manager.poll_virtual_players(), 1);
+
+    // Releasing shift emits a second one without the flag.
+    let mut player = manager
+        .registry()
+        .get("Procatin0")
+        .expect("virtual still registered");
+    player.is_sneaking = false;
+    manager.registry().upsert(player);
+    assert_eq!(manager.poll_virtual_players(), 1);
+    assert_eq!(manager.poll_virtual_players(), 0);
+}

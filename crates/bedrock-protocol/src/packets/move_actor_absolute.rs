@@ -38,9 +38,11 @@ impl MoveActorAbsolutePacket {
         }
     }
 
-    /// `CommonTypes::putRotationByte()`: 256 steps per full turn.
+    /// `CommonTypes::putRotationByte()`: 256 steps per full turn. The
+    /// reference casts with `(int)` (truncation toward zero), not floor:
+    /// negative rotations must truncate, not round down.
     fn write_rotation_byte(writer: &mut Writer, rotation: f32) {
-        writer.write_byte((rotation * (256.0 / 360.0)).floor() as i32 as u8);
+        writer.write_byte(((rotation * (256.0 / 360.0)) as i32) as u8);
     }
 
     /// `CommonTypes::getRotationByte()`.

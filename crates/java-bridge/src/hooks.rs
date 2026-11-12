@@ -34,6 +34,11 @@ pub struct PlayerSnapshot {
     pub yaw: f64,
     /// Bedrock pitch.
     pub pitch: f64,
+    /// Bedrock head yaw ([0, 360)); Java virtuals report body yaw here.
+    pub head_yaw: f64,
+    /// Sneak state (Bedrock `is_sneaking` / Java shift), shown to Java
+    /// viewers via the entity metadata flags byte (`sneaking = 0x02`).
+    pub is_sneaking: bool,
     pub gamemode: i32,
     pub ping: i32,
     /// True for virtual (Java bridge) players, false for Bedrock sessions.
@@ -52,6 +57,8 @@ impl PlayerSnapshot {
             z,
             yaw: 0.0,
             pitch: 0.0,
+            head_yaw: 0.0,
+            is_sneaking: false,
             gamemode: 0,
             ping: 0,
             is_virtual: false,
@@ -97,6 +104,31 @@ pub struct BlockChange {
     pub network_id: Option<u32>,
     /// Fallback kind (`"air"`, ...) when there is no network id.
     pub kind: String,
+    /// Bedrock network id of the previous block before this edit.
+    pub previous_network_id: Option<u32>,
+}
+
+/// One queued Java boss-bar frame for a player (apiBossBar Java side).
+/// Produced by the server core (`SessionManager::take_bossbar_java_frames`,
+/// encoded with this crate's [`crate::bossbar`]) and drained by the
+/// session every tick, exactly like chat lines (`take_plugin_messages`).
+/// `protocol` is the target client's wire protocol so codecs stay
+/// per-version (340 string vs 769+ NBT titles); frames are already
+/// length-prefixed and can be appended verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BossBarFrame {
+    pub frame: Vec<u8>,
+}
+
+/// One queued Java scoreboard frame for a player (scoreboard Java
+/// side). Produced by the server core
+/// (`SessionManager::take_scoreboard_java_frames`, encoded with
+/// `java-protocol::scoreboard`) and drained by the session every tick,
+/// exactly like boss-bar frames. Frames are already length-prefixed
+/// for the target `protocol` and can be appended verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoreboardFrame {
+    pub frame: Vec<u8>,
 }
 
 /// Result of routing a Java chat line/command through the server.
@@ -190,8 +222,29 @@ pub trait ServerHooks: Send + Sync {
         _pitch: f64,
     ) {
     }
+    /// Java sneak/sprint toggle (`entity_action` / `player_input` shift bit):
+    /// flips `PlayerContext.is_sneaking` in the registry so Bedrock viewers
+    /// receive the `SetActorDataPacket` sneak flag for this virtual player.
+    fn update_virtual_sneak(&self, _name: &str, _sneaking: bool) {}
     /// `player.take_messages`, drained by `deliverPluginMessages`.
     fn take_plugin_messages(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Queued Java `boss_bar` frames for `name` on `protocol`
+    /// (apiBossBar Java side), drained by the session every tick and
+    /// appended verbatim to the output buffer (already framed). Default
+    /// (in-memory test hooks) is empty — no bars.
+    fn take_bossbar_frames(&self, _name: &str, _protocol: i32) -> Vec<BossBarFrame> {
+        Vec::new()
+    }
+
+    /// Queued Java scoreboard frames for `name` on `protocol`
+    /// (`scoreboard_objective` / `scoreboard_score` /
+    /// `scoreboard_display_objective` / `reset_score`), drained by the
+    /// session every tick and appended verbatim (already framed).
+    /// Default (in-memory test hooks) is empty — no objectives.
+    fn take_scoreboard_frames(&self, _name: &str, _protocol: i32) -> Vec<ScoreboardFrame> {
         Vec::new()
     }
 
@@ -240,6 +293,23 @@ pub trait ServerHooks: Send + Sync {
     }
     fn modern_chunk(&self, _protocol: i32, _cx: i32, _cz: i32) -> Option<ModernChunkData> {
         None
+    }
+    /// Cache-only chunk lookup for the tick path (`stream_chunks`).
+    ///
+    /// Unlike [`Self::modern_chunk`] / [`Self::legacy_chunk`], this must
+    /// never run the world generator: a cold column costs ~18 ms, which
+    /// blows the whole Java tick budget (the "17 ms tick" report). It
+    /// returns the already-converted payload when one is cached — or
+    /// converts one from an already-generated chunk object (sub-ms) —
+    /// and `None` when the column is not warm yet, so the session can
+    /// wait for the background prefetch instead of generating inline.
+    /// The default (in-memory test hooks) delegates to the generating
+    /// lookups, preserving their on-demand behaviour.
+    fn try_modern_chunk(&self, protocol: i32, cx: i32, cz: i32) -> Option<ModernChunkData> {
+        self.modern_chunk(protocol, cx, cz)
+    }
+    fn try_legacy_chunk(&self, cx: i32, cz: i32) -> Option<LegacyChunk> {
+        self.legacy_chunk(cx, cz)
     }
     /// `registry_data` payloads for configuration, one per registry.
     fn registry_payloads(&self, _protocol: i32) -> Vec<Vec<u8>> {

@@ -287,6 +287,8 @@ async fn modern_entity_spawn_lpvec3_and_metadata_optional() {
                 z: 2.0,
                 yaw: 0.0,
                 pitch: 0.0,
+                head_yaw: 0.0,
+                is_sneaking: false,
                 gamemode: 0,
                 ping: 0,
             }],

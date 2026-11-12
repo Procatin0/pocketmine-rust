@@ -3,10 +3,10 @@
 //! Matches `pocketmine\world\generator\populator\Tree`, `TreeFactory`,
 //! `OakTree`, `BirchTree`, and `SpruceTree`.
 
-use std::collections::HashMap;
 use crate::block_id;
 use crate::generator::manager::ChunkManager;
 use crate::generator::random::Random;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeType {
@@ -39,7 +39,13 @@ impl TreePopulator {
         self.base_amount = amount;
     }
 
-    pub fn populate<M: ChunkManager>(&self, world: &mut M, chunk_x: i32, chunk_z: i32, random: &mut Random) {
+    pub fn populate<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        chunk_x: i32,
+        chunk_z: i32,
+        random: &mut Random,
+    ) {
         let amount = random.next_range(0, self.random_amount) + self.base_amount;
         let base_x = chunk_x << 4;
         let base_z = chunk_z << 4;
@@ -78,7 +84,13 @@ impl TreePopulator {
         -1
     }
 
-    fn can_place_tree<M: ChunkManager>(world: &M, x: i32, y: i32, z: i32, tree_height: i32) -> bool {
+    fn can_place_tree<M: ChunkManager>(
+        world: &M,
+        x: i32,
+        y: i32,
+        z: i32,
+        tree_height: i32,
+    ) -> bool {
         let mut radius_to_check = 0;
         for yy in 0..(tree_height + 3) {
             if yy == 1 || yy == tree_height {
@@ -96,19 +108,51 @@ impl TreePopulator {
         true
     }
 
-    fn grow_oak<M: ChunkManager>(&self, world: &mut M, x: i32, y: i32, z: i32, random: &mut Random) {
+    fn grow_oak<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        x: i32,
+        y: i32,
+        z: i32,
+        random: &mut Random,
+    ) {
         let tree_height = random.next_bounded_int(3) + 4;
-        self.grow_standard_tree(world, x, y, z, random, tree_height, block_id::OAK_LOG, block_id::OAK_LEAVES);
+        self.grow_standard_tree(
+            world,
+            x,
+            y,
+            z,
+            random,
+            tree_height,
+            block_id::OAK_LOG,
+            block_id::OAK_LEAVES,
+        );
     }
 
-    fn grow_birch<M: ChunkManager>(&self, world: &mut M, x: i32, y: i32, z: i32, random: &mut Random) {
+    fn grow_birch<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        x: i32,
+        y: i32,
+        z: i32,
+        random: &mut Random,
+    ) {
         // TreeFactory::get: BirchTree($random->nextBoundedInt(39) === 0)
         let super_birch = random.next_bounded_int(39) == 0;
         let mut tree_height = random.next_bounded_int(3) + 5;
         if super_birch {
             tree_height += 5;
         }
-        self.grow_standard_tree(world, x, y, z, random, tree_height, block_id::BIRCH_LOG, block_id::BIRCH_LEAVES);
+        self.grow_standard_tree(
+            world,
+            x,
+            y,
+            z,
+            random,
+            tree_height,
+            block_id::BIRCH_LOG,
+            block_id::BIRCH_LEAVES,
+        );
     }
 
     fn grow_standard_tree<M: ChunkManager>(
@@ -135,7 +179,10 @@ impl TreePopulator {
         let trunk_height = tree_height - 1;
         for yy in 0..trunk_height {
             let pos = (x, y + yy, z);
-            let cur = transaction.get(&pos).copied().unwrap_or_else(|| world.get_block_at(x, y + yy, z));
+            let cur = transaction
+                .get(&pos)
+                .copied()
+                .unwrap_or_else(|| world.get_block_at(x, y + yy, z));
             if block_id::can_override_for_tree(cur) {
                 transaction.insert(pos, trunk_block);
             }
@@ -149,11 +196,17 @@ impl TreePopulator {
                 let x_off = (xx - x).abs();
                 for zz in (z - mid)..=(z + mid) {
                     let z_off = (zz - z).abs();
-                    if x_off == mid && z_off == mid && (y_off == 0 || random.next_bounded_int(2) == 0) {
+                    if x_off == mid
+                        && z_off == mid
+                        && (y_off == 0 || random.next_bounded_int(2) == 0)
+                    {
                         continue;
                     }
                     let pos = (xx, yy, zz);
-                    let cur = transaction.get(&pos).copied().unwrap_or_else(|| world.get_block_at(xx, yy, zz));
+                    let cur = transaction
+                        .get(&pos)
+                        .copied()
+                        .unwrap_or_else(|| world.get_block_at(xx, yy, zz));
                     if !block_id::is_solid(cur) {
                         transaction.insert(pos, leaf_block);
                     }
@@ -167,7 +220,14 @@ impl TreePopulator {
         }
     }
 
-    fn grow_spruce<M: ChunkManager>(&self, world: &mut M, x: i32, y: i32, z: i32, random: &mut Random) {
+    fn grow_spruce<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        x: i32,
+        y: i32,
+        z: i32,
+        random: &mut Random,
+    ) {
         let tree_height = random.next_bounded_int(4) + 6;
         if !Self::can_place_tree(world, x, y, z, tree_height) {
             return;
@@ -182,7 +242,10 @@ impl TreePopulator {
         let trunk_height = tree_height - random.next_bounded_int(3);
         for yy in 0..trunk_height {
             let pos = (x, y + yy, z);
-            let cur = transaction.get(&pos).copied().unwrap_or_else(|| world.get_block_at(x, y + yy, z));
+            let cur = transaction
+                .get(&pos)
+                .copied()
+                .unwrap_or_else(|| world.get_block_at(x, y + yy, z));
             if block_id::can_override_for_tree(cur) {
                 transaction.insert(pos, block_id::SPRUCE_LOG);
             }
@@ -205,7 +268,10 @@ impl TreePopulator {
                         continue;
                     }
                     let pos = (xx, yyy, zz);
-                    let cur = transaction.get(&pos).copied().unwrap_or_else(|| world.get_block_at(xx, yyy, zz));
+                    let cur = transaction
+                        .get(&pos)
+                        .copied()
+                        .unwrap_or_else(|| world.get_block_at(xx, yyy, zz));
                     if !block_id::is_solid(cur) {
                         transaction.insert(pos, block_id::SPRUCE_LEAVES);
                     }

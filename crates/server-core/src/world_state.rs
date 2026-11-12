@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
-use bedrock_world::chunk::MIN_SUBCHUNK_INDEX;
+use bedrock_world::chunk::{Chunk, MIN_SUBCHUNK_INDEX};
 use bedrock_world::WorldGenerator;
 use parking_lot::{Mutex, RwLock};
 
@@ -54,12 +54,25 @@ pub const BLOCK_CHANGE_QUEUE_CAP: usize = 512;
 /// `block_id` is the Bedrock network runtime id (FNV-1a hash, stored as
 /// `u32`) — the same value accepted by `world.set_block` / returned by
 /// `world.get_block` and sent in `UpdateBlockPacket`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct BlockChange {
     pub x: i32,
     pub y: i32,
     pub z: i32,
     pub block_id: u32,
+    pub previous_block_id: Option<u32>,
+}
+
+impl PartialEq for BlockChange {
+    fn eq(&self, other: &Self) -> bool {
+        self.x == other.x
+            && self.y == other.y
+            && self.z == other.z
+            && self.block_id == other.block_id
+            && (self.previous_block_id.is_none()
+                || other.previous_block_id.is_none()
+                || self.previous_block_id == other.previous_block_id)
+    }
 }
 
 impl BlockChange {
@@ -69,6 +82,17 @@ impl BlockChange {
             y,
             z,
             block_id,
+            previous_block_id: None,
+        }
+    }
+
+    pub fn with_previous(x: i32, y: i32, z: i32, block_id: u32, previous_block_id: u32) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            block_id,
+            previous_block_id: Some(previous_block_id),
         }
     }
 }
@@ -121,13 +145,26 @@ pub struct WorldState {
     /// Java.
     broadcast_changes: RwLock<VecDeque<BlockChange>>,
     /// Serialized [`WorldState::chunk_payload`] results, shared by every
-    /// consumer (Bedrock streaming via rayon, Java bridge via the
-    /// synchronous `world.get_chunk` host call in the PHP tick). Without
-    /// this cache the Java path regenerated every column from scratch
-    /// (~20 ms per chunk in the generator) inside the 20 TPS tick,
+    /// consumer (Bedrock streaming via rayon, `world.get_chunk` host call
+    /// in the PHP tick). Without this cache every request regenerated
+    /// the column from scratch (~20 ms per chunk in the generator),
     /// collapsing TPS during the initial 169-column load. Invalidated
     /// per-chunk by [`WorldState::set_block`].
     chunk_cache: Mutex<ChunkPayloadCache>,
+    /// Per-column edit counter for the converted Java payloads cached by
+    /// `CoreHooks` (legacy/modern): bumped by [`WorldState::set_block`]
+    /// so a stale converted payload is never served after an edit. The
+    /// background chunk prefetch (main.rs) also reads it to skip columns
+    /// whose payloads are already warm.
+    chunk_versions: Mutex<HashMap<(i32, i32), u64>>,
+    /// In-memory [`Chunk`] per column, shared by every
+    /// [`WorldState::get_chunk_cached`] caller (Java bridge chunk build,
+    /// background prefetch in main.rs). `get_chunk` still regenerates on
+    /// every call for legacy callers; the cached variant serves the
+    /// ~18 ms generator work from memory and is what the Java tick now
+    /// consumes after the prefetch warms it. Invalidated per-chunk by
+    /// [`WorldState::set_block`].
+    chunk_object_cache: Mutex<ChunkObjectCache>,
 }
 
 /// FIFO cache of serialized chunk payloads.
@@ -139,6 +176,21 @@ struct ChunkPayloadCache {
 /// Maximum cached chunk payloads (covers a full `view-distance: 6` area
 /// of 169 columns per player with headroom for two players).
 const CHUNK_PAYLOAD_CACHE_CAP: usize = 512;
+
+/// FIFO cache of in-memory [`Chunk`] objects (see
+/// [`WorldState::get_chunk_cached`]). Paletted chunks are small, so
+/// they stay far cheaper than regeneration stalls on the Java tick.
+/// Sized for two full view areas at radius 10 (441 columns each):
+/// at 512 the moving window's oldest (nearest-inserted) columns were
+/// FIFO-evicted while still on screen, forcing ~18 ms regenerations
+/// on the tick path.
+struct ChunkObjectCache {
+    entries: HashMap<(i32, i32), Chunk>,
+    order: VecDeque<(i32, i32)>,
+}
+
+/// Maximum cached chunk objects.
+const CHUNK_OBJECT_CACHE_CAP: usize = 1024;
 
 impl WorldState {
     pub fn new(name: impl Into<String>, generator: Arc<dyn WorldGenerator>) -> Self {
@@ -159,6 +211,11 @@ impl WorldState {
             block_changes: RwLock::new(VecDeque::new()),
             broadcast_changes: RwLock::new(VecDeque::new()),
             chunk_cache: Mutex::new(ChunkPayloadCache {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+            chunk_versions: Mutex::new(HashMap::new()),
+            chunk_object_cache: Mutex::new(ChunkObjectCache {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
             }),
@@ -327,14 +384,23 @@ impl WorldState {
             .or_default()
             .insert((x, y, z), block_id);
         // The cached payload for this column no longer matches the world.
-        self.chunk_cache
+        self.chunk_cache.lock().entries.remove(&(x >> 4, z >> 4));
+        // Same for the cached object the Java bridge converts.
+        self.chunk_object_cache
             .lock()
             .entries
             .remove(&(x >> 4, z >> 4));
+        // Converted Java payloads keyed by this version are now stale.
+        *self
+            .chunk_versions
+            .lock()
+            .entry((x >> 4, z >> 4))
+            .or_insert(0) += 1;
 
-        let change = BlockChange::new(x, y, z, block_id);
+        let change = BlockChange::with_previous(x, y, z, block_id, previous);
         push_capped(&mut self.block_changes.write(), change);
         push_capped(&mut self.broadcast_changes.write(), change);
+        tracing::info!("world.set_block: ({},{},{}) id={:#010X} enqueued", x, y, z, block_id);
         true
     }
 
@@ -377,17 +443,13 @@ impl WorldState {
     /// Highest non-air block in a column, including edits.
     pub fn highest_block_at(&self, x: i32, z: i32) -> i32 {
         let base = self.generator.highest_block_at(x, z);
-        let highest_edit = self
-            .edits
-            .read()
-            .get(&(x >> 4, z >> 4))
-            .and_then(|chunk| {
-                chunk
-                    .iter()
-                    .filter(|((ex, _, ez), _)| *ex == x && *ez == z)
-                    .map(|((_, ey, _), _)| *ey)
-                    .max()
-            });
+        let highest_edit = self.edits.read().get(&(x >> 4, z >> 4)).and_then(|chunk| {
+            chunk
+                .iter()
+                .filter(|((ex, _, ez), _)| *ex == x && *ez == z)
+                .map(|((_, ey, _), _)| *ey)
+                .max()
+        });
 
         let candidate = match highest_edit {
             Some(edit_y) => base.max(edit_y),
@@ -426,6 +488,13 @@ impl WorldState {
             return cached;
         }
 
+        // Column version at the moment the edit snapshot is taken. If a
+        // `set_block` lands while the payload is being generated, the
+        // generated bytes predate it and must not poison the cache: the
+        // next request regenerates with the edit. (The payload is still
+        // returned for this one stream — viewers that already hold the
+        // chunk get the edit as an `UpdateBlockPacket`.)
+        let version_at_read = self.chunk_version(chunk_x, chunk_z);
         let edits = self
             .edits
             .read()
@@ -443,6 +512,14 @@ impl WorldState {
             .generate_chunk_with_edits(chunk_x, chunk_z, &edits);
 
         let mut cache = self.chunk_cache.lock();
+        // An edit that landed during generation makes this payload stale:
+        // serve it for this stream but do not cache it (see
+        // `version_at_read`). The check runs under the cache lock so
+        // `set_block`'s (invalidate, bump-version) pair cannot slip in
+        // between the check and the insert.
+        if self.chunk_version(chunk_x, chunk_z) != version_at_read {
+            return payload;
+        }
         if !cache.entries.contains_key(&(chunk_x, chunk_z)) {
             cache.order.push_back((chunk_x, chunk_z));
             while cache.order.len() > CHUNK_PAYLOAD_CACHE_CAP {
@@ -451,9 +528,7 @@ impl WorldState {
                 }
             }
         }
-        cache
-            .entries
-            .insert((chunk_x, chunk_z), payload.clone());
+        cache.entries.insert((chunk_x, chunk_z), payload.clone());
         payload
     }
 
@@ -465,10 +540,74 @@ impl WorldState {
     /// In-memory [`Chunk`](bedrock_world::chunk::Chunk) for a column,
     /// base terrain from the generator plus every persistent edit in
     /// the column. Used by the native Java bridge to frame
-    /// `ModernChunk` / `ChunkBuilder` payloads without going through
-    /// per-block `block_at` (which for the default generator
-    /// regenerates the column per voxel).
+    /// `ModernChunk` / `ChunkBuilder` payloads; the bridge now consumes
+    /// [`WorldState::get_chunk_cached`] and regenerates only on a miss.
     pub fn get_chunk(&self, chunk_x: i32, chunk_z: i32) -> bedrock_world::chunk::Chunk {
+        self.build_chunk(chunk_x, chunk_z)
+    }
+
+    /// Edit counter for one column (0 until the first successful edit).
+    /// Converted Java payloads are keyed by this value, so a block edit
+    /// can never leave a stale payload behind.
+    pub fn chunk_version(&self, chunk_x: i32, chunk_z: i32) -> u64 {
+        self.chunk_versions
+            .lock()
+            .get(&(chunk_x, chunk_z))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// True when [`WorldState::get_chunk_cached`] would be served from
+    /// memory. Used by the background prefetch to skip columns the Java
+    /// bridge already has warm.
+    pub fn has_chunk_cached(&self, chunk_x: i32, chunk_z: i32) -> bool {
+        self.chunk_object_cache
+            .lock()
+            .entries
+            .contains_key(&(chunk_x, chunk_z))
+    }
+
+    /// Cached [`WorldState::get_chunk`]: the first request for a column
+    /// pays the generator (~18 ms) and stores the result (FIFO,
+    /// [`CHUNK_OBJECT_CACHE_CAP`] entries) so later Java players and the
+    /// background prefetch never regenerate it. Invalidated by
+    /// [`WorldState::set_block`].
+    pub fn get_chunk_cached(&self, chunk_x: i32, chunk_z: i32) -> bedrock_world::chunk::Chunk {
+        if let Some(cached) = self
+            .chunk_object_cache
+            .lock()
+            .entries
+            .get(&(chunk_x, chunk_z))
+            .cloned()
+        {
+            return cached;
+        }
+
+        // Same stale-payload guard as [`WorldState::chunk_payload`]: an
+        // edit landing during the build must not poison the cache. The
+        // check runs under the cache lock so `set_block`'s (invalidate,
+        // bump-version) pair cannot slip between check and insert.
+        let version_at_read = self.chunk_version(chunk_x, chunk_z);
+        let chunk = self.build_chunk(chunk_x, chunk_z);
+
+        let mut cache = self.chunk_object_cache.lock();
+        if self.chunk_version(chunk_x, chunk_z) != version_at_read {
+            return chunk;
+        }
+        if !cache.entries.contains_key(&(chunk_x, chunk_z)) {
+            cache.order.push_back((chunk_x, chunk_z));
+            while cache.order.len() > CHUNK_OBJECT_CACHE_CAP {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.entries.remove(&oldest);
+                }
+            }
+        }
+        cache.entries.insert((chunk_x, chunk_z), chunk.clone());
+        chunk
+    }
+
+    /// Uncached column build: base terrain plus persistent edits.
+    fn build_chunk(&self, chunk_x: i32, chunk_z: i32) -> bedrock_world::chunk::Chunk {
         let mut chunk = self.generator.generate_chunk_object(chunk_x, chunk_z);
         if let Some(edits) = self.edits.read().get(&(chunk_x, chunk_z)) {
             for ((x, y, z), id) in edits.iter() {
@@ -492,9 +631,9 @@ impl WorldState {
             .read()
             .values()
             .flat_map(|chunk| {
-                chunk.iter().map(|((x, y, z), id)| {
-                    [*x as i64, *y as i64, *z as i64, *id as i64]
-                })
+                chunk
+                    .iter()
+                    .map(|((x, y, z), id)| [*x as i64, *y as i64, *z as i64, *id as i64])
             })
             .collect();
         let value = serde_json::json!({
@@ -558,7 +697,10 @@ impl WorldState {
         if let Some(auto_save) = value.get("auto_save").and_then(|value| value.as_bool()) {
             self.set_auto_save(auto_save);
         }
-        if let Some(interval) = value.get("auto_save_interval").and_then(|value| value.as_i64()) {
+        if let Some(interval) = value
+            .get("auto_save_interval")
+            .and_then(|value| value.as_i64())
+        {
             self.set_auto_save_interval(interval as i32);
         }
         if let Some(running) = value.get("time_running").and_then(|value| value.as_bool()) {
@@ -570,10 +712,7 @@ impl WorldState {
                 let Some(values) = entry.as_array() else {
                     continue;
                 };
-                let nums: Vec<i64> = values
-                    .iter()
-                    .filter_map(|value| value.as_i64())
-                    .collect();
+                let nums: Vec<i64> = values.iter().filter_map(|value| value.as_i64()).collect();
                 if nums.len() != 4 {
                     continue;
                 }
@@ -714,7 +853,39 @@ mod tests {
         assert_eq!(drained.len(), BLOCK_CHANGE_QUEUE_CAP);
         // Oldest 10 were dropped; the survivor starts at x=10.
         assert_eq!(drained[0].x, 10);
-        assert_eq!(drained[BLOCK_CHANGE_QUEUE_CAP - 1].x, (BLOCK_CHANGE_QUEUE_CAP + 9) as i32);
+        assert_eq!(
+            drained[BLOCK_CHANGE_QUEUE_CAP - 1].x,
+            (BLOCK_CHANGE_QUEUE_CAP + 9) as i32
+        );
+    }
+
+    #[test]
+    fn chunk_object_cache_is_shared_and_invalidated_by_edits() {
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        assert!(!world.has_chunk_cached(3, -2));
+        assert_eq!(world.chunk_version(3, -2), 0);
+
+        let first = world.get_chunk_cached(3, -2);
+        assert!(world.has_chunk_cached(3, -2));
+        // A second request is served from the cache (same block data, no
+        // regeneration); equality over the subchunks proves the hit.
+        assert_eq!(
+            world.get_chunk(3, -2).subchunks.len(),
+            first.subchunks.len()
+        );
+
+        // Editing a block bumps the version and invalidates both the
+        // object cache and any converted Java payload keyed by it.
+        assert!(world.set_block(3 * 16 + 1, 64, -2 * 16 + 1, 99));
+        assert_eq!(world.chunk_version(3, -2), 1);
+        assert!(!world.has_chunk_cached(3, -2));
+
+        let rebuilt = world.get_chunk_cached(3, -2);
+        assert_eq!(world.chunk_version(3, -2), 1);
+        assert!(world.has_chunk_cached(3, -2));
+        // The rebuild carries the edit.
+        // Local coords of block (49, 64, -31) inside column (3, -2).
+        assert_eq!(rebuilt.get_block(1, 64, 1), 99);
     }
 
     #[test]

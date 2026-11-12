@@ -72,6 +72,11 @@ pub fn handle_java_chat(manager: &SessionManager, sender: &PlayerContext, messag
 /// Without a plugin listener the default `<name> message` line is used;
 /// with PHP listeners the event's `format` (rendered in PHP via
 /// `ChatFormatter::format()` when BetterChat sets one) is honoured.
+/// A Java sender is verbatim for both audiences
+/// (`java_bridge::display::chat_line` with `sender_is_bedrock == false`);
+/// [`SessionManager::broadcast_text`] still rewrites any live Bedrock name
+/// mentioned inside the line to its Floodgate `"." + raw` form for Java
+/// inboxes only, while Bedrock sessions get the returned `broadcast` verbatim.
 fn dispatch_chat(manager: &SessionManager, sender: &PlayerContext, message: &str) -> JavaChatOutcome {
     let sender = refresh_sender(manager, sender);
     let recipients = manager.registry().names();
@@ -95,7 +100,7 @@ fn dispatch_chat(manager: &SessionManager, sender: &PlayerContext, message: &str
         };
     }
     let line = if event.format.trim().is_empty() {
-        php_plugin_bridge::default_format(&sender.name, &event.message)
+        php_plugin_bridge::default_format(&sender.display_name, &event.message)
     } else {
         event.format.clone()
     };

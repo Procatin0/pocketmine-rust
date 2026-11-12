@@ -4,6 +4,12 @@ use crate::Packet;
 /// Packet ID 0x3A (58): LevelChunkPacket
 ///
 /// Full Bedrock 1.26.60 / Axolotl-PM LevelChunkPacket implementation.
+/// Field order mirrors `LevelChunkPacket::encodePayload`: `ChunkPosition`
+/// (chunk x/z, var_i32), dimension id (var_i32 signed), subchunk count
+/// (var_u32), optional subchunk request limit, cache-enabled flag,
+/// `used_blob_hashes` (var_u32 count + LE u64 each), the chunk payload as
+/// `CommonTypes::putString` (var_u32 length + raw bytes) and the
+/// client-biome-update flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelChunkPacket {
     pub chunk_x: i32,
@@ -87,7 +93,15 @@ impl Packet for LevelChunkPacket {
         };
 
         let cache_enabled = reader.read_bool()?;
+        // Reference rejects more than MAX_BLOB_HASHES (64) hashes with a
+        // PacketDecodeException; mirror that bound instead of allocating
+        // an unbounded Vec from client-controlled input.
         let hash_count = reader.read_var_u32()? as usize;
+        if hash_count > 64 {
+            return Err(CodecError::Custom(format!(
+                "Expected at most 64 blob hashes, got {hash_count}"
+            )));
+        }
         let mut used_blob_hashes = Vec::with_capacity(hash_count);
         for _ in 0..hash_count {
             used_blob_hashes.push(reader.read_u64_le()?);

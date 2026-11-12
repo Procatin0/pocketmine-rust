@@ -67,7 +67,13 @@ pub const S2C_POSITION: i32 = 0x2F;
 pub const S2C_UPDATE_HEALTH: i32 = 0x41;
 pub const S2C_SPAWN_POSITION: i32 = 0x46;
 pub const S2C_UPDATE_TIME: i32 = 0x47;
+pub const S2C_SCOREBOARD_OBJECTIVE: i32 = 0x42;
+pub const S2C_SCOREBOARD_SCORE: i32 = 0x45;
+pub const S2C_SCOREBOARD_DISPLAY_OBJECTIVE: i32 = 0x3B;
 pub const S2C_DIFFICULTY: i32 = 0x0D;
+/// Legacy 340 `boss_bar` (apiBossBar Java side). Modern ids (769=0x0A,
+/// 770+=0x09) live in `crate::bossbar::boss_bar_packet_id`.
+pub const S2C_BOSS_BAR: i32 = 0x0C;
 
 // Play: player entities (legacy 340).
 pub const S2C_NAMED_ENTITY_SPAWN: i32 = 0x05;
@@ -321,12 +327,8 @@ pub fn read_float(buffer: &[u8], offset: &mut usize) -> Option<f32> {
     Some(f32::from_be_bytes(bytes))
 }
 
-/// Read a packed block position: x (26 bits) | y (12 bits) | z (26 bits).
-///
-/// All three coordinates are sign-extended (y is 12 bits since 1.18,
-/// world bottom at Y=-64). Mirrors `Protocol::readPosition`, which splits
-/// the 64 bits into two big-endian halves to avoid PHP sign issues.
-pub fn read_position(buffer: &[u8], offset: &mut usize) -> Option<(i32, i32, i32)> {
+/// Read a legacy packed block position (1.8 - 1.13.2 / 340): x (26 bits) | y (12 bits) | z (26 bits).
+pub fn read_position_legacy(buffer: &[u8], offset: &mut usize) -> Option<(i32, i32, i32)> {
     if buffer.len().saturating_sub(*offset) < 8 {
         return None;
     }
@@ -359,12 +361,53 @@ pub fn read_position(buffer: &[u8], offset: &mut usize) -> Option<(i32, i32, i32
     Some((x, y, z))
 }
 
-/// Pack a block position (see `read_position`).
-pub fn position(x: i32, y: i32, z: i32) -> Vec<u8> {
+/// Read a modern packed block position (1.14+ / 763+): x (26 bits) | z (26 bits) | y (12 bits).
+pub fn read_position_modern(buffer: &[u8], offset: &mut usize) -> Option<(i32, i32, i32)> {
+    if buffer.len().saturating_sub(*offset) < 8 {
+        return None;
+    }
+    let bytes: [u8; 8] = buffer[*offset..*offset + 8].try_into().ok()?;
+    let v = u64::from_be_bytes(bytes);
+    *offset += 8;
+    let mut x = ((v >> 38) & 0x3FF_FFFF) as i32;
+    if x >= 0x2000000 {
+        x -= 0x4000000;
+    }
+    let mut z = ((v >> 12) & 0x3FF_FFFF) as i32;
+    if z >= 0x2000000 {
+        z -= 0x4000000;
+    }
+    let mut y = (v & 0xFFF) as i32;
+    if y >= 0x800 {
+        y -= 0x1000;
+    }
+    Some((x, y, z))
+}
+
+/// Default position reader (modern).
+pub fn read_position(buffer: &[u8], offset: &mut usize) -> Option<(i32, i32, i32)> {
+    read_position_modern(buffer, offset)
+}
+
+/// Pack a legacy block position (1.8 - 1.13.2 / 340).
+pub fn position_legacy(x: i32, y: i32, z: i32) -> Vec<u8> {
     let packed: u64 = (((x as u32) & 0x3FF_FFFF) as u64) << 38
         | (((y as u32) & 0xFFF) as u64) << 26
         | (((z as u32) & 0x3FF_FFFF) as u64);
     packed.to_be_bytes().to_vec()
+}
+
+/// Pack a modern block position (1.14+ / 763+): x (26 bits) | z (26 bits) | y (12 bits).
+pub fn position_modern(x: i32, y: i32, z: i32) -> Vec<u8> {
+    let packed: u64 = (((x as u32) & 0x3FF_FFFF) as u64) << 38
+        | (((z as u32) & 0x3FF_FFFF) as u64) << 12
+        | (((y as u32) & 0xFFF) as u64);
+    packed.to_be_bytes().to_vec()
+}
+
+/// Default position packer (modern).
+pub fn position(x: i32, y: i32, z: i32) -> Vec<u8> {
+    position_modern(x, y, z)
 }
 
 /// Encode a big-endian i64.
@@ -407,18 +450,11 @@ pub fn short(value: i32) -> Vec<u8> {
     ((value & 0xFFFF) as u16).to_be_bytes().to_vec()
 }
 
-/// Angle in degrees to a signed byte, exactly as PHP `Protocol::angle`.
-///
-/// ```text
-/// byte = floor(fmod(degrees * 256 / 360 + 360, 256))  (signed to [-128, 128))
-/// ```
-///
-/// The `+ 360` is added *after* scaling (in code units, not degrees), so
-/// this is offset by 104 from the textbook `degrees * 256 / 360 mod 256`
-/// (0 degrees -> 104). Kept verbatim for wire parity; the plugin's spawn
-/// payloads and tests compare through this same helper.
+/// Angle in degrees to a signed byte (textbook `i8` angle):
+/// `floor(degrees * 256 / 360 mod 256)`, signed to `[-128, 128)`
+/// (0 -> 0, 90 -> 64, 180 -> -128, -90 -> -64).
 pub fn angle(degrees: f64) -> i32 {
-    let scaled = (degrees * 256.0 / 360.0 + 360.0) % 256.0;
+    let scaled = (degrees * 256.0 / 360.0).rem_euclid(256.0);
     let floored = scaled.floor() as i32;
     if floored >= 128 {
         floored - 256
@@ -427,29 +463,22 @@ pub fn angle(degrees: f64) -> i32 {
     }
 }
 
-/// Bedrock yaw (0 = north, 90 = east, 180 = south, 270 = west) to Java yaw
-/// (0 = south, 90 = west, 180 = north, -90 = east): `+180 mod 360`
-/// normalized to Java's `(-180, 180]`. Mirrors `Protocol::bedrockYawToJava`.
+/// Bedrock yaw (0 = south, 90 = west, 180 = north, 270 = east, PocketMine
+/// `Entity::getDirectionVector`) to Java yaw (`(-180, 180]`, same compass:
+/// 0 = south, 90 = west, -90 = east). Range normalization only — no `+180`
+/// (the old offset pointed every facing direction backwards).
 pub fn bedrock_yaw_to_java(yaw: f64) -> f64 {
-    let mut y = (yaw + 180.0) % 360.0;
-    if y < 0.0 {
-        y += 360.0;
-    }
+    let mut y = yaw.rem_euclid(360.0);
     if y > 180.0 {
         y -= 360.0;
     }
     y
 }
 
-/// Java yaw `(-180, 180]` to Bedrock yaw `[0, 360)`: the inverse involution
-/// of `bedrock_yaw_to_java` (also `+180 mod 360`). Mirrors
-/// `Protocol::javaYawToBedrock`.
+/// Java yaw `(-180, 180]` to Bedrock yaw `[0, 360)`: fold to canonical
+/// Bedrock range (inverse of `bedrock_yaw_to_java`).
 pub fn java_yaw_to_bedrock(yaw: f64) -> f64 {
-    let mut y = (yaw + 180.0) % 360.0;
-    if y < 0.0 {
-        y += 360.0;
-    }
-    y
+    yaw.rem_euclid(360.0)
 }
 
 /// Bedrock pitch folded from `[0, 360)` back to Java's `(-180, 180]`.
@@ -769,22 +798,28 @@ mod tests {
 
     #[test]
     fn position_vectors_and_roundtrip() {
-        assert_eq!(hex(&position(0, 4, 0)), "0000000010000000");
-        assert_eq!(hex(&position(-1, 64, 200)), "ffffffc1000000c8");
+        assert_eq!(hex(&position_legacy(0, 4, 0)), "0000000010000000");
+        assert_eq!(hex(&position_legacy(-1, 64, 200)), "ffffffc1000000c8");
         assert_eq!(
-            hex(&position(1_000_000, 255, -1_000_000)),
+            hex(&position_legacy(1_000_000, 255, -1_000_000)),
             "03d09003fff0bdc0"
         );
-        assert_eq!(hex(&position(0, -64, 0)), "0000003f00000000");
+        assert_eq!(hex(&position_legacy(0, -64, 0)), "0000003f00000000");
         for pos in [
             (0, 4, 0),
             (-1, 64, 200),
             (1_000_000, 255, -1_000_000),
             (0, -64, 0),
         ] {
-            let encoded = position(pos.0, pos.1, pos.2);
+            let encoded_legacy = position_legacy(pos.0, pos.1, pos.2);
             let mut offset = 0;
-            assert_eq!(read_position(&encoded, &mut offset), Some(pos));
+            assert_eq!(read_position_legacy(&encoded_legacy, &mut offset), Some(pos));
+
+            let encoded_modern = position_modern(pos.0, pos.1, pos.2);
+            let mut offset = 0;
+            assert_eq!(read_position_modern(&encoded_modern, &mut offset), Some(pos));
+            let mut offset = 0;
+            assert_eq!(read_position(&encoded_modern, &mut offset), Some(pos));
         }
     }
 
@@ -831,19 +866,23 @@ mod tests {
 
     #[test]
     fn angle_matches_php_formula() {
-        // PHP offset included (0 degrees -> 104).
-        assert_eq!(angle(0.0), 104);
-        assert_eq!(angle(90.0), -88);
-        assert_eq!(angle(-90.0), 40);
-        assert_eq!(angle(10.0), 111);
+        // Textbook i8 angle (0 -> 0, 90 -> 64, -90 -> -64).
+        assert_eq!(angle(0.0), 0);
+        assert_eq!(angle(90.0), 64);
+        assert_eq!(angle(180.0), -128);
+        assert_eq!(angle(-90.0), -64);
+        assert_eq!(angle(10.0), 7);
     }
 
     #[test]
     fn yaw_pitch_vectors() {
-        assert!((bedrock_yaw_to_java(0.0) - 180.0).abs() < 0.001);
-        assert!(bedrock_yaw_to_java(180.0).abs() < 0.001);
-        assert!((bedrock_yaw_to_java(90.0) + 90.0).abs() < 0.001);
-        assert!((java_yaw_to_bedrock(0.0) - 180.0).abs() < 0.001);
+        // Same compass in both editions (0 = south, 90 = west).
+        assert!(bedrock_yaw_to_java(0.0).abs() < 0.001);
+        assert!((bedrock_yaw_to_java(180.0) - 180.0).abs() < 0.001);
+        assert!((bedrock_yaw_to_java(90.0) - 90.0).abs() < 0.001);
+        assert!((bedrock_yaw_to_java(270.0) - (-90.0)).abs() < 0.001);
+        assert!(java_yaw_to_bedrock(0.0).abs() < 0.001);
+        assert!((java_yaw_to_bedrock(-90.0) - 270.0).abs() < 0.001);
         assert!((bedrock_pitch_to_java(315.0) + 45.0).abs() < 0.001);
     }
 

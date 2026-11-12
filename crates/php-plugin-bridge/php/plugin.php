@@ -414,6 +414,32 @@ namespace pocketmine\plugin {
     }
 
     /**
+     * PM `pocketmine\plugin\PluginOwned`: commands/tasks/listeners owned
+     * by a plugin (virions like ScoreHud's command use both this and the
+     * trait below; without them the class fails to load with
+     * `Trait "pocketmine\plugin\PluginOwnedTrait" not found`).
+     */
+    interface PluginOwned
+    {
+        public function getOwningPlugin(): Plugin;
+    }
+
+    /**
+     * PM `pocketmine\plugin\PluginOwnedTrait`: `$owningPlugin` is assigned
+     * by the using class (usually its constructor) and read back through
+     * `getOwningPlugin()`.
+     */
+    trait PluginOwnedTrait
+    {
+        protected Plugin $owningPlugin;
+
+        public function getOwningPlugin(): Plugin
+        {
+            return $this->owningPlugin;
+        }
+    }
+
+    /**
      * Validated `plugin.yml` description.
      *
      * `fromArray()` throws `PluginDescriptionParseException` for invalid

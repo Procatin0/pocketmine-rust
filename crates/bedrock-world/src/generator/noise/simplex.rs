@@ -103,7 +103,8 @@ impl SimplexNoise {
 
         let t1 = 0.5 - x1 * x1 - y1 * y1;
         if t1 > 0.0 {
-            let idx = self.perm[ii + i1 as usize + self.perm[jj + j1 as usize] as usize] as usize % 12;
+            let idx =
+                self.perm[ii + i1 as usize + self.perm[jj + j1 as usize] as usize] as usize % 12;
             let gi1 = GRAD3[idx];
             n += t1 * t1 * t1 * t1 * (gi1[0] as f64 * x1 + gi1[1] as f64 * y1);
         }

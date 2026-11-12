@@ -41,7 +41,8 @@ impl SubChunk {
 
     pub fn set_block(&mut self, x: usize, y: usize, z: usize, layer: usize, block_id: u32) {
         if layer >= self.layers.len() {
-            self.layers.resize_with(layer + 1, || PalettedBlockArray::new(self.default_block));
+            self.layers
+                .resize_with(layer + 1, || PalettedBlockArray::new(self.default_block));
         }
         self.layers[layer].set(x, y, z, block_id);
     }
@@ -65,7 +66,9 @@ impl SubChunk {
     }
 
     /// Deserializes a SubChunk from a `bedrock_protocol::Reader`.
-    pub fn deserialize_network_from(reader: &mut bedrock_protocol::Reader) -> Result<Self, SubChunkNetworkError> {
+    pub fn deserialize_network_from(
+        reader: &mut bedrock_protocol::Reader,
+    ) -> Result<Self, SubChunkNetworkError> {
         network::deserialize_subchunk(reader)
     }
 }

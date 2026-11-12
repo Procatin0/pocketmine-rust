@@ -33,6 +33,7 @@ pub const S2C_KICK: i32 = 0x1A;
 pub const S2C_UNLOAD_CHUNK: i32 = 0x1D;
 pub const S2C_KEEP_ALIVE: i32 = 0x1F;
 pub const S2C_MAP_CHUNK: i32 = 0x20;
+pub const S2C_WORLD_EVENT: i32 = 0x21;
 pub const S2C_JOIN_GAME: i32 = 0x23;
 pub const S2C_ABILITIES: i32 = 0x2C;
 pub const S2C_PLAYER_INFO: i32 = 0x2E;
@@ -40,7 +41,13 @@ pub const S2C_POSITION: i32 = 0x2F;
 pub const S2C_UPDATE_HEALTH: i32 = 0x41;
 pub const S2C_SPAWN_POSITION: i32 = 0x46;
 pub const S2C_UPDATE_TIME: i32 = 0x47;
+pub const S2C_SCOREBOARD_OBJECTIVE: i32 = 0x42;
+pub const S2C_SCOREBOARD_SCORE: i32 = 0x45;
+pub const S2C_SCOREBOARD_DISPLAY_OBJECTIVE: i32 = 0x3B;
 pub const S2C_DIFFICULTY: i32 = 0x0D;
+/// Legacy 340 `boss_bar` (apiBossBar Java side); modern ids in
+/// `crate::bossbar::boss_bar_packet_id`.
+pub const S2C_BOSS_BAR: i32 = 0x0C;
 pub const S2C_NAMED_ENTITY_SPAWN: i32 = 0x05;
 pub const S2C_ENTITY: i32 = 0x25;
 pub const S2C_REL_ENTITY_MOVE: i32 = 0x26;
@@ -62,8 +69,21 @@ pub const C2S_POSITION: i32 = 0x0D;
 pub const C2S_POSITION_LOOK: i32 = 0x0E;
 pub const C2S_LOOK: i32 = 0x0F;
 pub const C2S_BLOCK_DIG: i32 = 0x14;
+/// Legacy 1.12.2 `entity_action` (serverbound): entityId + actionId +
+/// jumpBoost as varints; actions 0=start_sneaking, 1=stop_sneaking,
+/// 3=start_sprinting, 4=stop_sprinting (same numbering as modern 769/770).
+pub const C2S_ENTITY_ACTION: i32 = 0x1B;
 pub const C2S_ARM_ANIMATION: i32 = 0x1D;
 pub const C2S_BLOCK_PLACE: i32 = 0x1F;
+
+/// `entity_metadata` flags byte (index 0, type `byte`): vanilla Java
+/// `Entity` flags — bit 1 sneaking (`0x02`), bit 3 sprinting (`0x08`).
+pub const ENTITY_FLAG_SNEAKING: u8 = 0x02;
+pub const ENTITY_FLAG_SPRINTING: u8 = 0x08;
+/// `player_input` bitflags (modern serverbound, one byte): shift bit (5)
+/// is sneak, sprint bit (6) is sprint.
+pub const PLAYER_INPUT_SHIFT: u8 = 1 << 5;
+pub const PLAYER_INPUT_SPRINT: u8 = 1 << 6;
 
 /// `player_info_update` bitflags (modern, identical in 769-775).
 /// `0x02` is `initialize_chat`, NOT `update_game_mode`: sending it makes
@@ -172,16 +192,40 @@ pub fn short(value: i32) -> Vec<u8> {
     (value as i16).to_be_bytes().to_vec()
 }
 
-pub fn write_position(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
+pub fn write_position_legacy(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
     let packed: u64 = (((x as u64) & 0x3FF_FFFF) << 38)
         | (((y as u64) & 0xFFF) << 26)
         | ((z as u64) & 0x3FF_FFFF);
     write_long(out, packed as i64);
 }
 
-pub fn position(x: i32, y: i32, z: i32) -> Vec<u8> {
+pub fn position_legacy(x: i32, y: i32, z: i32) -> Vec<u8> {
     let mut out = Vec::new();
-    write_position(&mut out, x, y, z);
+    write_position_legacy(&mut out, x, y, z);
+    out
+}
+
+pub fn write_position_modern(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
+    let packed: u64 = (((x as u64) & 0x3FF_FFFF) << 38)
+        | (((z as u64) & 0x3FF_FFFF) << 12)
+        | ((y as u64) & 0xFFF);
+    write_long(out, packed as i64);
+}
+
+pub fn position_modern(x: i32, y: i32, z: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_position_modern(&mut out, x, y, z);
+    out
+}
+
+pub fn write_position(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
+    write_position_modern(out, x, y, z);
+}
+
+pub fn position(x: i32, y: i32, z: i32) -> Vec<u8> {
+    position_modern(x, y, z);
+    let mut out = Vec::new();
+    write_position_modern(&mut out, x, y, z);
     out
 }
 
@@ -193,9 +237,11 @@ pub fn ubyte(value: i32) -> Vec<u8> {
     vec![(value & 0xFF) as u8]
 }
 
-/// Angle in degrees (-180..180 yaw, -90..90 pitch) to signed byte.
+/// Angle in degrees (-180..180 yaw, -90..90 pitch) to signed byte:
+/// `degrees * 256 / 360` modulo 256 (textbook `i8` angle: 0 -> 0,
+/// 90 -> 64, 180 -> -128, -90 -> -64).
 pub fn angle(degrees: f64) -> i32 {
-    let scaled = (degrees * 256.0 / 360.0 + 360.0).rem_euclid(256.0).floor() as i32;
+    let scaled = (degrees * 256.0 / 360.0).rem_euclid(256.0).floor() as i32;
     if scaled >= 128 {
         scaled - 256
     } else {
@@ -212,18 +258,24 @@ pub fn rel_delta(delta: f64) -> i32 {
 // Yaw / pitch conversion (Bedrock canonical <-> Java wire)
 // ---------------------------------------------------------------------------
 
-/// Bedrock yaw (0 = north) to Java yaw (0 = south): `+180` mod 360.
+/// Bedrock yaw (0 = south, 90 = west, 180 = north, 270 = east, PocketMine
+/// `Entity::getDirectionVector` / `getHorizontalFacing`) to Java yaw
+/// (`(-180, 180]`, same compass: 0 = south, 90 = west, -90 = east).
+/// Both editions increase the same way, so this is range normalization
+/// only — no `+180` offset. The old `+180` made every facing point
+/// backwards (north <-> south, east <-> west).
 pub fn bedrock_yaw_to_java(yaw: f64) -> f64 {
-    let mut y = (yaw + 180.0).rem_euclid(360.0);
+    let mut y = yaw.rem_euclid(360.0);
     if y > 180.0 {
         y -= 360.0;
     }
     y
 }
 
-/// Java yaw to Bedrock yaw: same involution, result in [0, 360).
+/// Java yaw to Bedrock yaw: fold to `[0, 360)` (inverse of
+/// [`bedrock_yaw_to_java`]).
 pub fn java_yaw_to_bedrock(yaw: f64) -> f64 {
-    (yaw + 180.0).rem_euclid(360.0)
+    yaw.rem_euclid(360.0)
 }
 
 /// Bedrock pitch (normalized to [0, 360) in Rust) to Java pitch (-180, 180].
@@ -401,7 +453,24 @@ impl<'a> Reader<'a> {
         Some(f32::from_be_bytes(bytes.try_into().ok()?))
     }
 
-    pub fn read_position(&mut self) -> Option<(i32, i32, i32)> {
+    pub fn read_position_modern(&mut self) -> Option<(i32, i32, i32)> {
+        let v = self.read_i64()? as u64;
+        let mut x = ((v >> 38) & 0x3FF_FFFF) as i64;
+        let mut z = ((v >> 12) & 0x3FF_FFFF) as i64;
+        let mut y = (v & 0xFFF) as i64;
+        if x >= 0x200_0000 {
+            x -= 0x400_0000;
+        }
+        if z >= 0x200_0000 {
+            z -= 0x400_0000;
+        }
+        if y >= 0x800 {
+            y -= 0x1000;
+        }
+        Some((x as i32, y as i32, z as i32))
+    }
+
+    pub fn read_position_legacy(&mut self) -> Option<(i32, i32, i32)> {
         let v = self.read_i64()? as u64;
         let mut x = ((v >> 38) & 0x3FF_FFFF) as i64;
         let mut y = ((v >> 26) & 0xFFF) as i64;
@@ -416,6 +485,10 @@ impl<'a> Reader<'a> {
             y -= 0x1000;
         }
         Some((x as i32, y as i32, z as i32))
+    }
+
+    pub fn read_position(&mut self) -> Option<(i32, i32, i32)> {
+        self.read_position_modern()
     }
 
     pub fn read_varint_array(&mut self) -> Option<Vec<i32>> {
@@ -549,9 +622,15 @@ mod tests {
     #[test]
     fn position_roundtrip() {
         for (x, y, z) in [(0, 0, 0), (0, 68, 0), (-30, -64, 10), (12345, 319, -9876)] {
-            let encoded = position(x, y, z);
+            let encoded = position_modern(x, y, z);
             let mut r = Reader::new(&encoded);
-            assert_eq!(r.read_position(), Some((x, y, z)));
+            assert_eq!(r.read_position_modern(), Some((x, y, z)));
+            let mut r2 = Reader::new(&encoded);
+            assert_eq!(r2.read_position(), Some((x, y, z)));
+
+            let encoded_legacy = position_legacy(x, y, z);
+            let mut r_legacy = Reader::new(&encoded_legacy);
+            assert_eq!(r_legacy.read_position_legacy(), Some((x, y, z)));
         }
     }
 
@@ -565,10 +644,21 @@ mod tests {
 
     #[test]
     fn yaw_conversions() {
-        assert!((bedrock_yaw_to_java(0.0) - 180.0).abs() < 0.001);
-        assert!((bedrock_yaw_to_java(90.0) - (-90.0)).abs() < 0.001);
+        // Same compass in both editions (0 = south, 90 = west): identity
+        // modulo range, no +180.
+        assert!((bedrock_yaw_to_java(0.0) - 0.0).abs() < 0.001);
+        assert!((bedrock_yaw_to_java(90.0) - 90.0).abs() < 0.001);
+        assert!((bedrock_yaw_to_java(270.0) - (-90.0)).abs() < 0.001);
         assert!((java_yaw_to_bedrock(bedrock_yaw_to_java(123.0)) - 123.0).abs() < 0.001);
         assert!((bedrock_pitch_to_java(315.0) - (-45.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn angle_vectors() {
+        assert_eq!(angle(0.0), 0);
+        assert_eq!(angle(90.0), 64);
+        assert_eq!(angle(180.0), -128);
+        assert_eq!(angle(-90.0), -64);
     }
 
     #[test]

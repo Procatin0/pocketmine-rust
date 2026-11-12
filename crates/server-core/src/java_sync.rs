@@ -18,7 +18,8 @@
 //!   `abilities` flags + `0.05`/`0.1` — see
 //!   [`encode_player_info_gamemode`], [`encode_game_state_gamemode`],
 //!   [`encode_abilities`];
-//! * teleport rotation: Bedrock<->Java yaw is `+180` modulo 360
+//! * teleport rotation: Bedrock and Java share the compass
+//!   (0 = south, 90 = west), so yaw is range normalization only
 //!   ([`bedrock_yaw_to_java`] / [`java_yaw_to_bedrock`]) and pitch
 //!   folds back to `(-180, 180]` ([`bedrock_pitch_to_java`]), with
 //!   an extra `[-90, 90]` clip for Java payloads
@@ -86,10 +87,13 @@ pub fn java_ability_flags(gamemode: i32) -> u8 {
     }
 }
 
-/// Bedrock yaw (`[0, 360)`) to Java yaw (`(-180, 180]`): `+180`
-/// modulo 360, normalized. Same rotation direction, opposite zero.
+/// Bedrock yaw (`[0, 360)`, 0 = south, 90 = west, 180 = north,
+/// 270 = east per PocketMine `Entity::getDirectionVector`) to Java yaw
+/// (`(-180, 180]`, same compass: 0 = south, 90 = west, -90 = east).
+/// Range normalization only — no `+180` (the old offset made every
+/// facing point backwards).
 pub fn bedrock_yaw_to_java(yaw: f32) -> f32 {
-    let y = (yaw + 180.0).rem_euclid(360.0);
+    let y = yaw.rem_euclid(360.0);
     if y > 180.0 {
         y - 360.0
     } else {
@@ -97,10 +101,10 @@ pub fn bedrock_yaw_to_java(yaw: f32) -> f32 {
     }
 }
 
-/// Java yaw (`(-180, 180]`) to Bedrock yaw (`[0, 360)`): the inverse
-/// of [`bedrock_yaw_to_java`] (also `+180` modulo 360).
+/// Java yaw (`(-180, 180]`) to Bedrock yaw (`[0, 360)`): fold to
+/// canonical Bedrock range (inverse of [`bedrock_yaw_to_java`]).
 pub fn java_yaw_to_bedrock(yaw: f32) -> f32 {
-    (yaw + 180.0).rem_euclid(360.0)
+    yaw.rem_euclid(360.0)
 }
 
 /// Fold any yaw into the canonical Bedrock range `[0, 360)` that the
@@ -127,10 +131,10 @@ pub fn clip_java_pitch(pitch: f32) -> f32 {
     pitch.clamp(-90.0, 90.0)
 }
 
-/// Java angle byte (`Protocol::angle`): degrees scaled to
-/// `deg * 256 / 360` modulo 256, returned as a signed byte.
+/// Java angle byte: degrees scaled to `deg * 256 / 360` modulo 256,
+/// returned as a signed byte (0 -> 0, 90 -> 64, 180 -> -128).
 pub fn angle_byte(degrees: f32) -> i8 {
-    let scaled = (degrees as f64 * 256.0 / 360.0 + 360.0).rem_euclid(256.0) as i32;
+    let scaled = (degrees as f64 * 256.0 / 360.0).rem_euclid(256.0).floor() as i32;
     if scaled >= 128 {
         (scaled - 256) as i8
     } else {
@@ -570,11 +574,13 @@ mod tests {
 
     #[test]
     fn yaw_conversions_match_protocol_php() {
-        // Bedrock 0 (north) -> Java 180; Bedrock 90 (east) -> Java -90
-        // (see `bedrock-vis` check in modern_test.php).
-        assert!((bedrock_yaw_to_java(0.0) - 180.0).abs() < 1e-6);
-        assert!((bedrock_yaw_to_java(90.0) - (-90.0)).abs() < 1e-6);
-        assert!((java_yaw_to_bedrock(180.0) - 0.0).abs() < 1e-6);
+        // Same compass in both editions (0 = south, 90 = west): identity
+        // modulo range, no +180.
+        assert!((bedrock_yaw_to_java(0.0) - 0.0).abs() < 1e-6);
+        assert!((bedrock_yaw_to_java(90.0) - 90.0).abs() < 1e-6);
+        assert!((bedrock_yaw_to_java(270.0) - (-90.0)).abs() < 1e-6);
+        assert!((java_yaw_to_bedrock(180.0) - 180.0).abs() < 1e-6);
+        assert!((java_yaw_to_bedrock(-90.0) - 270.0).abs() < 1e-6);
         // Round-trip is stable.
         for yaw in [-270.0, -180.0, -90.0, 0.0, 45.0, 90.0, 179.0, 180.0, 400.0] {
             let back = java_yaw_to_bedrock(bedrock_yaw_to_java(yaw));
@@ -589,10 +595,10 @@ mod tests {
 
     #[test]
     fn teleport_decision_matches_tp_sync_test() {
-        // Registry moved to (0,100,0) with Bedrock yaw 0; last sent
-        // [10,64,10, Java 180, 0]. Converted yaw is Java 180 -> same,
+        // Registry moved to (0,100,0) with Bedrock yaw 0 (south); last
+        // sent [10,64,10, Java 0, 0]. Converted yaw is Java 0 -> same,
         // position diverges -> teleport.
-        let last = [10.0, 64.0, 10.0, 180.0, 0.0];
+        let last = [10.0, 64.0, 10.0, 0.0, 0.0];
         let registry = BedrockSnapshot {
             x: 0.0,
             y: 100.0,
@@ -605,7 +611,7 @@ mod tests {
                 assert_eq!(x, 0.0);
                 assert_eq!(y, 100.0);
                 assert_eq!(z, 0.0);
-                assert!((yaw - 180.0).abs() < 1e-6);
+                assert!((yaw - 0.0).abs() < 1e-6);
             }
             other => panic!("expected teleport, got {other:?}"),
         }
@@ -619,7 +625,7 @@ mod tests {
             yaw_bedrock: 0.0,
             pitch_bedrock: 0.0,
         };
-        let last_after = [0.0, 100.0, 0.0, 180.0, 0.0];
+        let last_after = [0.0, 100.0, 0.0, 0.0, 0.0];
         assert_eq!(
             decide_teleport(last_after, Some(still), Some(still)),
             TeleportDecision::None
@@ -702,11 +708,10 @@ mod tests {
 
     #[test]
     fn angle_byte_matches_protocol() {
-        // `Protocol::angle` verified with php-cli: 0->104, 90->-88,
-        // 180->-24, -90->40 (the +360 before the modulo, kept exact).
-        assert_eq!(angle_byte(0.0), 104);
-        assert_eq!(angle_byte(90.0), -88);
-        assert_eq!(angle_byte(180.0), -24);
-        assert_eq!(angle_byte(-90.0), 40);
+        // Textbook i8 angle: deg * 256 / 360 mod 256, signed.
+        assert_eq!(angle_byte(0.0), 0);
+        assert_eq!(angle_byte(90.0), 64);
+        assert_eq!(angle_byte(180.0), -128);
+        assert_eq!(angle_byte(-90.0), -64);
     }
 }

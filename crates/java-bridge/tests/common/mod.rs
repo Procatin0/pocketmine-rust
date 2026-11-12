@@ -194,6 +194,7 @@ impl ServerHooks for StubHooks {
             y,
             z,
             network_id: Some(network_id),
+            previous_network_id: None,
             kind: String::new(),
         });
         true

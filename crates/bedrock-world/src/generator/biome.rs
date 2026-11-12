@@ -1,4 +1,24 @@
-//! Port of PocketMine-MP's Biome and BiomeSelector system.
+//! Port of PocketMine-MP's Biome and BiomeSelector system, extended with
+//! the badlands family from the legacy biome-id table that
+//! `niduy/minecraft-world-generator` (`src/lib/minecraft/const.ts`,
+//! `BIOME`: `Ocean: 0, Plains: 1, ..., Badlands: 37, WoodedBadlands: 38,
+//! BadlandsPlateau: 39, ..., ErodedBadlands: 165,
+//! ModifiedWoodedBadlandsPlateau: 166, ModifiedBadlandsPlateau: 167`)
+//! funnels into its cubiomes biome noise. `Plains` (1) and `Ocean` (0)
+//! already matched; the six badlands ids were the gap.
+//!
+//! What is *not* ported from niduy: its 1.18+ climate engine (temperature,
+//! humidity, continentalness, erosion and weirdness double-Perlin noises
+//! plus spline/Voronoi biome noise and a ~1.6k-entry parameter tree).
+//! PocketMine's `BiomeSelector` is a temperature/rainfall lookup, and the
+//! PocketMine seed-parity suite expects those elevations/blocks exactly,
+//! so the selector keeps its 11 emitted biomes and, like PocketMine,
+//! never emits a badlands id (see
+//! [`tests::selector_lookup_never_emits_badlands`]). niduy locates biomes
+//! and structures only — it has no terrain or water pass — so sea level
+//! stays PocketMine's (`NormalGenerator::SEA_LEVEL = 62`); the Java
+//! client side (plains/badlands registry indexes, 26.1 `fluidCount`)
+//! lives in `crate::java_chunk`.
 
 use crate::block_id;
 use crate::generator::noise::SimplexNoise;
@@ -16,6 +36,17 @@ pub mod biome_ids {
     pub const ICE_PLAINS: u8 = 12;
     pub const EXTREME_HILLS_EDGE: u8 = 20;
     pub const BIRCH_FOREST: u8 = 27;
+    /// Badlands family (`niduy .../const.ts` `BIOME`): legacy biome ids
+    /// 37-39 and the 1.13+ eroded/modified variants 165-167. Named like
+    /// PocketMine (`WOODED_BADLANDS_PLATEAU` for 38). Defined for
+    /// completeness (info/cover) but, like PocketMine, not emitted by
+    /// `BiomeSelector::lookup`.
+    pub const BADLANDS: u8 = 37;
+    pub const WOODED_BADLANDS_PLATEAU: u8 = 38;
+    pub const BADLANDS_PLATEAU: u8 = 39;
+    pub const ERODED_BADLANDS: u8 = 165;
+    pub const MODIFIED_WOODED_BADLANDS_PLATEAU: u8 = 166;
+    pub const MODIFIED_BADLANDS_PLATEAU: u8 = 167;
 }
 
 pub use biome_ids::*;
@@ -43,6 +74,16 @@ static SANDY_COVER: &[u32] = &[
     block_id::SAND,
     block_id::SAND,
     block_id::SANDSTONE,
+    block_id::SANDSTONE,
+    block_id::SANDSTONE,
+];
+
+/// Badlands surface: PocketMine has no red sand/terracotta block in
+/// `block_id`, so the desert's sand/sandstone stack stands in.
+static BADLANDS_COVER: &[u32] = &[
+    block_id::SAND,
+    block_id::SAND,
+    block_id::SAND,
     block_id::SANDSTONE,
     block_id::SANDSTONE,
 ];
@@ -173,6 +214,60 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             ground_cover: GRASSY_COVER,
             temperature: 0.6,
             rainfall: 0.5,
+        },
+        BADLANDS => BiomeInfo {
+            id: BADLANDS,
+            name: "Badlands",
+            min_elevation: 63.0,
+            max_elevation: 120.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        WOODED_BADLANDS_PLATEAU => BiomeInfo {
+            id: WOODED_BADLANDS_PLATEAU,
+            name: "Wooded Badlands Plateau",
+            min_elevation: 63.0,
+            max_elevation: 110.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.2,
+        },
+        BADLANDS_PLATEAU => BiomeInfo {
+            id: BADLANDS_PLATEAU,
+            name: "Badlands Plateau",
+            min_elevation: 63.0,
+            max_elevation: 100.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        ERODED_BADLANDS => BiomeInfo {
+            id: ERODED_BADLANDS,
+            name: "Eroded Badlands",
+            min_elevation: 63.0,
+            max_elevation: 127.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        MODIFIED_WOODED_BADLANDS_PLATEAU => BiomeInfo {
+            id: MODIFIED_WOODED_BADLANDS_PLATEAU,
+            name: "Modified Wooded Badlands Plateau",
+            min_elevation: 63.0,
+            max_elevation: 110.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.2,
+        },
+        MODIFIED_BADLANDS_PLATEAU => BiomeInfo {
+            id: MODIFIED_BADLANDS_PLATEAU,
+            name: "Modified Badlands Plateau",
+            min_elevation: 63.0,
+            max_elevation: 100.0,
+            ground_cover: BADLANDS_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
         },
         _ => BiomeInfo {
             id,
@@ -412,4 +507,93 @@ pub fn generate_chunk_biomes_and_elevations(
     }
 
     (chunk_biomes, min_heights, max_heights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legacy biome ids are the contract shared with
+    /// `niduy/minecraft-world-generator` (`src/lib/minecraft/const.ts`
+    /// `BIOME}) and PocketMine's `Biome` constants. The pre-existing 11
+    /// keep their ids; the badlands family closes the gap.
+    #[test]
+    fn legacy_ids_match_niduy_and_pocketmine() {
+        // Focus of the port: plains / ocean / badlands.
+        assert_eq!(OCEAN, 0);
+        assert_eq!(PLAINS, 1);
+        assert_eq!(BADLANDS, 37);
+        assert_eq!(WOODED_BADLANDS_PLATEAU, 38);
+        assert_eq!(BADLANDS_PLATEAU, 39);
+        assert_eq!(ERODED_BADLANDS, 165);
+        assert_eq!(MODIFIED_WOODED_BADLANDS_PLATEAU, 166);
+        assert_eq!(MODIFIED_BADLANDS_PLATEAU, 167);
+        // The other PocketMine 11, pinned so the set cannot drift.
+        assert_eq!(DESERT, 2);
+        assert_eq!(EXTREME_HILLS, 3);
+        assert_eq!(FOREST, 4);
+        assert_eq!(TAIGA, 5);
+        assert_eq!(SWAMPLAND, 6);
+        assert_eq!(RIVER, 7);
+        assert_eq!(ICE_PLAINS, 12);
+        assert_eq!(EXTREME_HILLS_EDGE, 20);
+        assert_eq!(BIRCH_FOREST, 27);
+    }
+
+    #[test]
+    fn badlands_family_uses_sandy_cover_and_hot_dry_climate() {
+        for id in [
+            BADLANDS,
+            WOODED_BADLANDS_PLATEAU,
+            BADLANDS_PLATEAU,
+            ERODED_BADLANDS,
+            MODIFIED_WOODED_BADLANDS_PLATEAU,
+            MODIFIED_BADLANDS_PLATEAU,
+        ] {
+            let info = get_biome_info(id);
+            assert_eq!(info.id, id, "bioma {id}");
+            assert_eq!(info.temperature, 2.0, "bioma {id}: calor como el desierto");
+            assert!(info.rainfall < info.temperature, "bioma {id}: seco");
+            assert!(
+                info.ground_cover.iter().any(|&b| b == block_id::SAND)
+                    && info.ground_cover.iter().any(|&b| b == block_id::SANDSTONE),
+                "bioma {id}: cubierta arenosa (sin red sand en block_id)"
+            );
+        }
+        // Plains/ocean references for the comparison: grass vs gravel.
+        assert_eq!(
+            get_biome_info(PLAINS).ground_cover[0],
+            block_id::GRASS_BLOCK
+        );
+        assert_eq!(get_biome_info(OCEAN).ground_cover[0], block_id::GRAVEL);
+    }
+
+    /// Parity lock: like PocketMine, the temperature/rainfall selector
+    /// never emits a badlands id anywhere in its 64x64 lookup table.
+    /// niduy's climate engine *would* (erosion + temperature), but
+    /// porting it would change PocketMine seed terrain, so the badlands
+    /// family stays info-only.
+    #[test]
+    fn selector_lookup_never_emits_badlands() {
+        for i in 0..=63 {
+            for j in 0..=63 {
+                let b = BiomeSelector::lookup(i as f64 / 63.0, j as f64 / 63.0);
+                assert!(
+                    !matches!(
+                        b,
+                        BADLANDS
+                            | WOODED_BADLANDS_PLATEAU
+                            | BADLANDS_PLATEAU
+                            | ERODED_BADLANDS
+                            | MODIFIED_WOODED_BADLANDS_PLATEAU
+                            | MODIFIED_BADLANDS_PLATEAU
+                    ),
+                    "lookup({i},{j}) emitió badlands {b}"
+                );
+            }
+        }
+        // Spot checks of the two focus biomes that *are* emitted.
+        assert_eq!(BiomeSelector::lookup(0.0, 0.0), OCEAN);
+        assert_eq!(BiomeSelector::lookup(0.5, 0.5), PLAINS);
+    }
 }

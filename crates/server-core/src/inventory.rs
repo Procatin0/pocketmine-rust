@@ -15,8 +15,16 @@ pub const WINDOW_ID_INVENTORY: u32 = 0;
 pub const WINDOW_ID_OFFHAND: u32 = 119;
 pub const WINDOW_ID_ARMOR: u32 = 120;
 pub const WINDOW_ID_CURSOR: u32 = 124;
-/// Armor slots: head, chest, legs, feet.
-pub const ARMOR_SIZE: usize = 4;
+/// Dynamic crafting windows (ItemStackRequest container ids).
+pub const WINDOW_ID_CRAFT_SMALL: u32 = 125;
+pub const WINDOW_ID_CRAFT_BIG: u32 = 126;
+/// Result slot indices inside the crafting windows (grid + result).
+pub const CRAFT_SMALL_RESULT: usize = 4;
+pub const CRAFT_BIG_RESULT: usize = 9;
+/// Armor slots: head, chest, legs, feet, body (Bedrock 1.21+ / protocol 2225).
+pub const ARMOR_SIZE: usize = 5;
+/// UI container slots BDS syncs in window 124 (54 slots, matching capture 3.bin).
+pub const UI_SIZE: usize = 54;
 
 /// Server-side player inventory.
 ///
@@ -30,6 +38,10 @@ pub struct PlayerInventory {
     armor: Vec<ItemStack>,
     offhand: Vec<ItemStack>,
     cursor: Vec<ItemStack>,
+    /// 2x2 player crafting grid (4 inputs + result at index 4).
+    craft_small: Vec<ItemStack>,
+    /// 3x3 crafting-table grid (9 inputs + result at index 9).
+    craft_big: Vec<ItemStack>,
     selected_hotbar_slot: u8,
 }
 
@@ -54,7 +66,9 @@ impl PlayerInventory {
             slots: vec![ItemStack::empty(); INVENTORY_SIZE],
             armor: vec![ItemStack::empty(); ARMOR_SIZE],
             offhand: vec![ItemStack::empty(); 1],
-            cursor: vec![ItemStack::empty(); 1],
+            cursor: vec![ItemStack::empty(); UI_SIZE],
+            craft_small: vec![ItemStack::empty(); CRAFT_SMALL_RESULT + 1],
+            craft_big: vec![ItemStack::empty(); CRAFT_BIG_RESULT + 1],
             selected_hotbar_slot: 0,
         }
     }
@@ -390,6 +404,154 @@ impl PlayerInventory {
     }
 }
 
+/// Armor slots (head, chest, legs, feet), port of PocketMine
+/// `ArmorInventory`. Legends are the network slot order BDS syncs in
+/// window 120.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmorInventory {
+    pub slots: Vec<ItemStack>,
+}
+
+impl Default for ArmorInventory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArmorInventory {
+    pub fn new() -> Self {
+        Self { slots: vec![ItemStack::empty(); ARMOR_SIZE] }
+    }
+
+    pub fn slots(&self) -> &[ItemStack] {
+        &self.slots
+    }
+
+    /// Equips `item` in armor `slot` (0-3) when the item name ends in the
+    /// expected suffix (`_helmet`, `_chestplate`, `_leggings`, `_boots`) and
+    /// returns the previously worn item. Returns `None` without touching
+    /// anything when the slot is out of range or the item does not fit.
+    pub fn equip(&mut self, slot: u8, item: ItemStack) -> Option<ItemStack> {
+        let index = slot as usize;
+        if index >= ARMOR_SIZE {
+            return None;
+        }
+        if !item.is_empty() && !fits_armor_slot(&item, index) {
+            return None;
+        }
+        let previous = self.slots[index].clone();
+        self.slots[index] = item;
+        Some(previous)
+    }
+}
+
+/// Whether a canonical item name fits the armor slot (head/chest/legs/feet).
+fn fits_armor_slot(item: &ItemStack, slot: usize) -> bool {
+    let Some(name) = name_for_network_id(item.network_id) else {
+        return false;
+    };
+    let expected = match slot {
+        0 => "_helmet",
+        1 => "_chestplate",
+        2 => "_leggings",
+        3 => "_boots",
+        _ => return false,
+    };
+    name.ends_with(expected)
+}
+
+impl PlayerInventory {
+    /// Armor slots (window 120), head first.
+    pub fn armor_slots(&self) -> &[ItemStack] {
+        &self.armor
+    }
+
+    /// Offhand slot (window 119).
+    pub fn offhand(&self) -> ItemStack {
+        self.offhand_item()
+    }
+
+    /// Cursor stack (window 124): the stack held between click and drop.
+    pub fn cursor_item(&self) -> ItemStack {
+        self.cursor.first().cloned().unwrap_or_else(ItemStack::empty)
+    }
+
+    pub fn set_cursor(&mut self, item: ItemStack) -> bool {
+        let Some(target) = self.cursor.first_mut() else {
+            return false;
+        };
+        *target = item;
+        true
+    }
+
+    /// Crafting slot: `small=true` addresses the player 2x2 window (4 inputs +
+    /// result at index 4), otherwise the 3x3 window (9 inputs + result at 9).
+    pub fn craft_slot(&self, small: bool, slot: usize) -> Option<ItemStack> {
+        let window = if small { &self.craft_small } else { &self.craft_big };
+        window.get(slot).cloned()
+    }
+
+    pub fn set_craft_slot(&mut self, small: bool, slot: usize, item: ItemStack) -> bool {
+        let window = if small {
+            &mut self.craft_small
+        } else {
+            &mut self.craft_big
+        };
+        let Some(target) = window.get_mut(slot) else {
+            return false;
+        };
+        *target = item;
+        true
+    }
+
+    /// Q-key drop: removes up to `count` items from `(window, slot)` and
+    /// returns the dropped stack (`None` when the slot is empty or unknown).
+    pub fn drop_from_slot(
+        &mut self,
+        window_id: u32,
+        slot: u32,
+        count: u32,
+    ) -> Option<ItemStack> {
+        let current = self.window_slot(window_id, slot)?.clone();
+        if current.is_empty() {
+            return None;
+        }
+        let taken = count.min(current.count as u32) as u16;
+        let dropped = ItemStack { count: taken, ..current.clone() };
+        let mut updated = current;
+        updated.count -= taken;
+        self.set_window_slot(
+            window_id,
+            slot,
+            if updated.count == 0 { ItemStack::empty() } else { updated },
+        );
+        Some(dropped)
+    }
+
+    /// Swaps two main-inventory slots (hotbar scroll / number-key swap).
+    pub fn swap_inventory_slots(&mut self, a: usize, b: usize) {
+        if a < INVENTORY_SIZE && b < INVENTORY_SIZE {
+            self.slots.swap(a, b);
+        }
+    }
+
+    /// Equips one armor piece, returning the previously worn item (if any).
+    /// Rejects non-armor items (returns the item unchanged and equips
+    /// nothing) the same way `ArmorInventory::equip` does.
+    pub fn equip_armor(&mut self, slot: u8, item: ItemStack) -> Option<ItemStack> {
+        let index = slot as usize;
+        if index >= ARMOR_SIZE {
+            return None;
+        }
+        if !item.is_empty() && !fits_armor_slot(&item, index) {
+            return None;
+        }
+        let previous = self.armor[index].clone();
+        self.armor[index] = item;
+        Some(previous)
+    }
+}
+
 /// Compares the fields the server validates on a transaction action (PocketMine
 /// ignores the stack network id and NBT for this comparison).
 fn same_item(a: &ItemStack, b: &ItemStack) -> bool {
@@ -534,6 +696,11 @@ pub fn item_display_name(network_id: i16) -> Option<String> {
 /// Number of items known to the dictionary (used by diagnostics and tests).
 pub fn known_item_count() -> usize {
     registry().len()
+}
+
+/// Canonical identifier for a numeric id, if the registry knows it.
+pub fn name_for_network_id(network_id: i16) -> Option<&'static str> {
+    reverse_registry().get(&network_id).copied()
 }
 
 #[cfg(test)]
@@ -702,9 +869,9 @@ mod tests {
     fn models_every_player_window() {
         let mut inventory = PlayerInventory::new();
         assert_eq!(inventory.window(WINDOW_ID_INVENTORY).map(<[ItemStack]>::len), Some(36));
-        assert_eq!(inventory.window(WINDOW_ID_ARMOR).map(<[ItemStack]>::len), Some(4));
+        assert_eq!(inventory.window(WINDOW_ID_ARMOR).map(<[ItemStack]>::len), Some(ARMOR_SIZE));
         assert_eq!(inventory.window(WINDOW_ID_OFFHAND).map(<[ItemStack]>::len), Some(1));
-        assert_eq!(inventory.window(WINDOW_ID_CURSOR).map(<[ItemStack]>::len), Some(1));
+        assert_eq!(inventory.window(WINDOW_ID_CURSOR).map(<[ItemStack]>::len), Some(UI_SIZE));
         assert!(inventory.window(999).is_none());
 
         assert!(inventory.set_window_slot(WINDOW_ID_ARMOR, 2, ItemStack::new(347, 1)));
@@ -748,5 +915,49 @@ mod tests {
             new_item: ItemStack::new(1, 64),
         }]);
         assert!(applied.rejected);
+    }
+
+    #[test]
+    fn armor_equip_validates_piece_type() {
+        let helmet = ItemStack::new(item_network_id("minecraft:iron_helmet").unwrap(), 1);
+        let boots = ItemStack::new(item_network_id("minecraft:iron_boots").unwrap(), 1);
+        let mut inventory = PlayerInventory::new();
+        assert_eq!(inventory.equip_armor(0, helmet.clone()), Some(ItemStack::empty()));
+        assert_eq!(inventory.armor_slots()[0].network_id, helmet.network_id);
+        // Boots do not fit the helmet slot, and the slot stays untouched.
+        assert_eq!(inventory.equip_armor(0, boots.clone()), None);
+        assert_eq!(inventory.armor_slots()[0].network_id, helmet.network_id);
+        assert_eq!(inventory.equip_armor(3, boots.clone()), Some(ItemStack::empty()));
+        assert_eq!(inventory.armor_slots()[3].network_id, boots.network_id);
+    }
+
+    #[test]
+    fn armor_inventory_struct_equip_and_reject() {
+        let mut armor = ArmorInventory::new();
+        let chest = ItemStack::new(item_network_id("minecraft:diamond_chestplate").unwrap(), 1);
+        assert_eq!(armor.equip(1, chest.clone()), Some(ItemStack::empty()));
+        assert_eq!(armor.slots()[1].network_id, chest.network_id);
+        let sword = ItemStack::new(347, 1);
+        assert_eq!(armor.equip(2, sword), None);
+        assert!(armor.slots()[2].is_empty());
+    }
+
+    #[test]
+    fn cursor_and_crafting_slots_roundtrip() {
+        let mut inventory = PlayerInventory::new();
+        inventory.set_cursor(ItemStack::new(1, 32));
+        assert_eq!(inventory.cursor_item(), ItemStack::new(1, 32));
+        assert!(inventory.set_craft_slot(true, 4, ItemStack::new(5, 4)));
+        assert_eq!(inventory.craft_slot(true, 4), Some(ItemStack::new(5, 4)));
+        assert!(inventory.set_craft_slot(false, 9, ItemStack::new(58, 1)));
+        assert_eq!(inventory.craft_slot(false, 9), Some(ItemStack::new(58, 1)));
+        assert!(!inventory.set_craft_slot(true, 9, ItemStack::new(1, 1)));
+    }
+
+    #[test]
+    fn drop_out_of_range_returns_none() {
+        let mut inventory = PlayerInventory::new();
+        assert_eq!(inventory.drop_from_slot(WINDOW_ID_INVENTORY, 0, 1), None);
+        assert_eq!(inventory.drop_from_slot(999, 0, 1), None);
     }
 }

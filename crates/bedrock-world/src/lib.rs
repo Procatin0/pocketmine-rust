@@ -9,7 +9,9 @@ pub mod paletted_block_array;
 pub mod subchunk;
 
 pub use chunk::Chunk;
-pub use generator::{create_generator, FlatGenerator, NormalGenerator, WorldGenerator};
+pub use generator::{
+    create_generator, FlatGenerator, JavaTerrain, NormalGenerator, WorldGenerator,
+};
 pub use network::{
     deserialize_subchunk, serialize_subchunk, serialize_subchunk_version, SubChunkNetworkError,
     CURRENT_VERSION as CURRENT_NETWORK_VERSION,

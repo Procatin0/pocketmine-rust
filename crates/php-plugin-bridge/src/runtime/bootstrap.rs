@@ -22,9 +22,15 @@ pub const PHP_RUNTIME_FILES: &[(&str, &str)] = &[
     ("item.php", include_str!("../../php/item.php")),
     ("world.php", include_str!("../../php/world.php")),
     ("player.php", include_str!("../../php/player.php")),
+    ("scoreboard.php", include_str!("../../php/scoreboard.php")),
+    ("bossbar.php", include_str!("../../php/bossbar.php")),
     ("chat.php", include_str!("../../php/chat.php")),
     ("core.php", include_str!("../../php/core.php")),
     ("event.php", include_str!("../../php/event.php")),
+    // After `event.php`/`player.php`: extends `Event` and uses `EventData`.
+    // Was shipped in `php/` but never embedded or required, so
+    // `Player::save()`'s `class_exists` guard never fired.
+    ("PlayerDataSaveEvent.php", include_str!("../../php/PlayerDataSaveEvent.php")),
     ("plugin.php", include_str!("../../php/plugin.php")),
     ("autoload.php", include_str!("../../php/autoload.php")),
     ("ipc.php", include_str!("../../php/ipc.php")),
@@ -116,5 +122,43 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the `Missing runtime file: .../bossbar.php` boot
+    /// failure: `bootstrap.php` required `bossbar.php` but Rust never wrote
+    /// it (the scoreboard agent added scoreboard to both lists and bossbar
+    /// only to `bootstrap.php`), so the PHP worker exited before `ping`.
+    ///
+    /// The `$runtimeFiles` list in the embedded `bootstrap.php` must stay
+    /// exactly in sync (same names, same order) with `PHP_RUNTIME_FILES`
+    /// minus `bootstrap.php` itself, which no file requires.
+    #[test]
+    fn runtime_list_matches_bootstrap_php() {
+        assert_eq!(PHP_RUNTIME_FILES.len(), 19, "runtime file count");
+        let bootstrap = PHP_RUNTIME_FILES
+            .iter()
+            .find(|(name, _)| *name == "bootstrap.php")
+            .expect("bootstrap.php embedded")
+            .1;
+        let required: Vec<&str> = bootstrap
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix("',"))
+            })
+            .collect();
+        let embedded: Vec<&str> = PHP_RUNTIME_FILES
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != "bootstrap.php")
+            .collect();
+        assert_eq!(
+            required, embedded,
+            "bootstrap.php $runtimeFiles drifted from PHP_RUNTIME_FILES"
+        );
+        for name in ["bossbar.php", "scoreboard.php", "PlayerDataSaveEvent.php"] {
+            assert!(embedded.contains(&name), "missing {}", name);
+        }
     }
 }

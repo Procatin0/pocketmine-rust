@@ -42,7 +42,15 @@ pub const POPPY: u32 = -876992014i32 as u32;
 pub fn is_transparent(id: u32) -> bool {
     matches!(
         id,
-        AIR | WATER | SNOW_LAYER | SHORT_GRASS | TALL_GRASS | DANDELION | POPPY | OAK_LEAVES | SPRUCE_LEAVES | BIRCH_LEAVES
+        AIR | WATER
+            | SNOW_LAYER
+            | SHORT_GRASS
+            | TALL_GRASS
+            | DANDELION
+            | POPPY
+            | OAK_LEAVES
+            | SPRUCE_LEAVES
+            | BIRCH_LEAVES
     )
 }
 
@@ -58,11 +66,22 @@ pub fn is_solid(id: u32) -> bool {
 pub fn can_override_for_tree(id: u32) -> bool {
     matches!(
         id,
-        AIR | WATER | SNOW_LAYER | SHORT_GRASS | TALL_GRASS | DANDELION | POPPY | OAK_LEAVES | SPRUCE_LEAVES | BIRCH_LEAVES
+        AIR | WATER
+            | SNOW_LAYER
+            | SHORT_GRASS
+            | TALL_GRASS
+            | DANDELION
+            | POPPY
+            | OAK_LEAVES
+            | SPRUCE_LEAVES
+            | BIRCH_LEAVES
     )
 }
 
 #[inline(always)]
 pub fn can_be_flowed_into(id: u32) -> bool {
-    matches!(id, SNOW_LAYER | SHORT_GRASS | TALL_GRASS | DANDELION | POPPY | AIR)
+    matches!(
+        id,
+        SNOW_LAYER | SHORT_GRASS | TALL_GRASS | DANDELION | POPPY | AIR
+    )
 }

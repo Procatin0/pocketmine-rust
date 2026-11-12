@@ -23,6 +23,10 @@ pub fn is_modern(protocol: i32) -> bool {
 
 pub const VERSION_NAMES: [&str; 5] = ["1.21.4", "1.21.5", "1.21.9", "1.21.11", "26.1"];
 
+/// Primary / prioritized Java version protocol (26.1).
+pub const PRIMARY_PROTOCOL: i32 = 775;
+pub const PRIMARY_VERSION_NAME: &str = "26.1";
+
 /// Server brand shown in F3 (`Server:`), sent in configuration.
 pub const BRAND: &str = "PocketMine";
 pub const BRAND_CHANNEL: &str = "minecraft:brand";
@@ -131,6 +135,8 @@ const TABLE_769: &[(&str, i32)] = &[
     ("client_command", 10),
     ("block_dig", 39),
     ("block_place", 60),
+    ("entity_action", 40),
+    ("player_input", 41),
     ("teleport_confirm", 0),
     ("chunk_batch_received", 9),
     ("player_loaded", 42),
@@ -148,6 +154,12 @@ const TABLE_769: &[(&str, i32)] = &[
     ("update_view_position", 88),
     ("update_view_distance", 89),
     ("update_time", 107),
+    ("boss_bar", 0x0A),
+    ("scoreboard_objective", 100),
+    ("scoreboard_score", 104),
+    ("scoreboard_display_objective", 92),
+    ("reset_score", 73),
+    ("world_event", 41),
 ];
 
 const TABLE_770: &[(&str, i32)] = &[
@@ -183,6 +195,8 @@ const TABLE_770: &[(&str, i32)] = &[
     ("client_command", 10),
     ("block_dig", 39),
     ("block_place", 62),
+    ("entity_action", 40),
+    ("player_input", 41),
     ("teleport_confirm", 0),
     ("chunk_batch_received", 9),
     ("player_loaded", 42),
@@ -200,6 +214,12 @@ const TABLE_770: &[(&str, i32)] = &[
     ("update_view_position", 87),
     ("update_view_distance", 88),
     ("update_time", 106),
+    ("boss_bar", 0x09),
+    ("scoreboard_objective", 99),
+    ("scoreboard_score", 103),
+    ("scoreboard_display_objective", 91),
+    ("reset_score", 72),
+    ("world_event", 40),
 ];
 
 const TABLE_773: &[(&str, i32)] = &[
@@ -235,6 +255,8 @@ const TABLE_773: &[(&str, i32)] = &[
     ("client_command", 11),
     ("block_dig", 40),
     ("block_place", 63),
+    ("entity_action", 41),
+    ("player_input", 42),
     ("teleport_confirm", 0),
     ("chunk_batch_received", 10),
     ("player_loaded", 43),
@@ -252,6 +274,12 @@ const TABLE_773: &[(&str, i32)] = &[
     ("update_view_position", 92),
     ("update_view_distance", 93),
     ("update_time", 111),
+    ("boss_bar", 0x09),
+    ("scoreboard_objective", 104),
+    ("scoreboard_score", 108),
+    ("scoreboard_display_objective", 96),
+    ("reset_score", 77),
+    ("world_event", 45),
 ];
 
 const TABLE_774: &[(&str, i32)] = &[
@@ -287,6 +315,8 @@ const TABLE_774: &[(&str, i32)] = &[
     ("client_command", 11),
     ("block_dig", 40),
     ("block_place", 63),
+    ("entity_action", 41),
+    ("player_input", 42),
     ("teleport_confirm", 0),
     ("chunk_batch_received", 10),
     ("player_loaded", 43),
@@ -304,6 +334,12 @@ const TABLE_774: &[(&str, i32)] = &[
     ("update_view_position", 92),
     ("update_view_distance", 93),
     ("update_time", 111),
+    ("boss_bar", 0x09),
+    ("scoreboard_objective", 104),
+    ("scoreboard_score", 108),
+    ("scoreboard_display_objective", 96),
+    ("reset_score", 77),
+    ("world_event", 45),
 ];
 
 const TABLE_775: &[(&str, i32)] = &[
@@ -339,6 +375,8 @@ const TABLE_775: &[(&str, i32)] = &[
     ("client_command", 12),
     ("block_dig", 41),
     ("block_place", 66),
+    ("entity_action", 42),
+    ("player_input", 43),
     ("teleport_confirm", 0),
     ("chunk_batch_received", 11),
     ("player_loaded", 44),
@@ -356,6 +394,12 @@ const TABLE_775: &[(&str, i32)] = &[
     ("update_view_position", 94),
     ("update_view_distance", 95),
     ("update_time", 113),
+    ("boss_bar", 0x09),
+    ("scoreboard_objective", 106),
+    ("scoreboard_score", 110),
+    ("scoreboard_display_objective", 98),
+    ("reset_score", 79),
+    ("world_event", 46),
 ];
 
 #[cfg(test)]

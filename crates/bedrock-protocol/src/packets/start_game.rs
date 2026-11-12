@@ -33,6 +33,12 @@ pub struct LevelSettings {
     pub platform_broadcast_mode: i32,
     pub commands_enabled: bool,
     pub is_texture_packs_required: bool,
+    /// Game rules (PMMP `naturalregeneration` + `locatorbar`, both `false`).
+    /// Each entry is `(name, isPlayerModifiable, value)` for `BoolGameRule`
+    /// (`GameRuleType::BOOL = 1`); the wire is
+    /// `var_u32 count + per entry string name + bool + var_u32 type + bool value`
+    /// (see `CommonTypes::getGameRules/putGameRules`).
+    pub game_rules: Vec<(String, bool, bool)>,
     pub experiments: Vec<(String, bool)>,
     pub experiments_previously_used: bool,
     pub has_bonus_chest_enabled: bool,
@@ -92,6 +98,10 @@ impl Default for LevelSettings {
             platform_broadcast_mode: 6,
             commands_enabled: true,
             is_texture_packs_required: false,
+            game_rules: vec![
+                ("naturalregeneration".to_string(), false, false),
+                ("locatorbar".to_string(), false, false),
+            ],
             experiments: Vec::new(),
             experiments_previously_used: false,
             has_bonus_chest_enabled: false,
@@ -152,8 +162,14 @@ impl LevelSettings {
         writer.write_var_i32(self.platform_broadcast_mode);
         writer.write_bool(self.commands_enabled);
         writer.write_bool(self.is_texture_packs_required);
-        // Game rules count (0 = none)
-        writer.write_var_u32(0);
+        // Game rules (PMMP defaults, as GameRule list)
+        writer.write_var_u32(self.game_rules.len() as u32);
+        for (name, is_modifiable, value) in &self.game_rules {
+            writer.write_string(name);
+            writer.write_bool(*is_modifiable);
+            writer.write_var_u32(1); // BoolGameRule ID 1
+            writer.write_bool(*value);
+        }
         // Experiments
         writer.write_u32_le(self.experiments.len() as u32);
         for (name, enabled) in &self.experiments {
@@ -222,7 +238,20 @@ impl LevelSettings {
         let platform_broadcast_mode = reader.read_var_i32()?;
         let commands_enabled = reader.read_bool()?;
         let is_texture_packs_required = reader.read_bool()?;
-        let _rules_count = reader.read_var_u32()?;
+        let rules_count = reader.read_var_u32()?;
+        let mut game_rules = Vec::new();
+        for _ in 0..rules_count {
+            let name = reader.read_string()?;
+            let is_modifiable = reader.read_bool()?;
+            let rule_type = reader.read_var_u32()?;
+            if rule_type != 1 {
+                return Err(crate::binary::CodecError::Custom(format!(
+                    "Unsupported game rule type {rule_type}"
+                )));
+            }
+            let value = reader.read_bool()?;
+            game_rules.push((name, is_modifiable, value));
+        }
         let exp_count = reader.read_u32_le()?;
         let mut experiments = Vec::with_capacity(exp_count as usize);
         for _ in 0..exp_count {
@@ -290,6 +319,7 @@ impl LevelSettings {
             platform_broadcast_mode,
             commands_enabled,
             is_texture_packs_required,
+            game_rules,
             experiments,
             experiments_previously_used,
             has_bonus_chest_enabled,
@@ -370,6 +400,13 @@ impl Default for StartGamePacket {
             premium_world_template_id: String::new(),
             is_trial: false,
             rewind_history_size: 40,
+            // PM `PreSpawnPacketHandler::setUp()`:
+            // `new PlayerMovementSettings(0, true)` — rewindHistorySize 0
+            // and server-authoritative block breaking ON. With it off the
+            // client predicts breaks locally and never asks the server for
+            // dig progress, so `SurvivalBlockBreakHandler`
+            // (`BLOCK_START_BREAK`/`BLOCK_BREAK_SPEED` level events) has no
+            // effect.
             server_authoritative_block_breaking: true,
             current_tick: 0,
             enchantment_seed: 0,
@@ -377,7 +414,8 @@ impl Default for StartGamePacket {
             enable_new_inventory_system: true,
             server_software_version: "PocketMine-Rust 1.0.0 (Axolotl-PM)".to_string(),
             player_actor_properties: vec![0x0a, 0x00, 0x00],
-            block_palette_checksum: 0, // 0 skips client strict checksum validation (prevents error Boar)
+            // PMC: 0 skips block palette validation (PMMP)
+            block_palette_checksum: 0,
             world_template_id: [0u8; 16],
             enable_client_side_chunk_generation: false,
             block_network_ids_are_hashes: true,
@@ -508,3 +546,153 @@ impl Packet for StartGamePacket {
         })
     }
 }
+
+#[cfg(test)]
+mod cue_samples {
+    use super::*;
+    use crate::binary::{Reader, Writer};
+    use crate::packets::player_list::{uuid_from_str, uuid_to_string};
+    use crate::Packet;
+    use crate::types::{BlockPos, Vector3f};
+
+    fn hex_dump(bytes: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (index, chunk) in bytes.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            lines.push(format!("{:04X}: {}", index * 16, hex.join(" ")));
+        }
+        lines
+    }
+
+    #[test]
+    fn cue_sample_startgame_hex() {
+        // CUE-SAMPLE: wire dump of the exact `StartGamePacket` (0x0B) the
+        // server sends in the PreSpawn bundle (`PreSpawnPacketHandler::setUp()`
+        // lines 100-127 -> Rust `handle_resource_pack_response`).
+        //
+        // Field-by-field comparison (Rust `start_game.rs` `encode` vs PHP
+        // `StartGamePacket.php` `encodePayload` + `LevelSettings.php` `write`):
+        //   actorUniqueId  VarI64 (zigzag)      == getActorUniqueId   OK (value: 1 == PHP $player->getId())
+        //   actorRuntimeId VarU64               == getActorRuntimeId  OK (value: 1)
+        //   playerGamemode VarI32               == VarInt             OK
+        //   playerPosition Vector3f (3x F32 LE) == putVector3         OK
+        //   pitch/yaw      F32 LE               == LE float           OK
+        //   levelSettings  `LevelSettings::encode` == `LevelSettings::write` OK (60+ fields order-verified, see below)
+        //   levelId/worldName/premium String    == putString          OK ("" / motd / "")
+        //   isTrial        Bool                 == putBool            OK (false)
+        //   rewind(VarI32)+auth(Bool)           == PlayerMovementSettings (0,true) OK
+        //   currentTick    U64 LE               == LE unsigned long   OK (0)
+        //   enchantmentSeed VarI32              == VarInt             OK (0)
+        //   blockPalette   VarU32 count (0)     == VarInt count       OK (wire; PHP sends full palette, Rust 0)
+        //   multiplayerCorrelationId String     == putString          OK ("")
+        //   enableNewInventorySystem Bool       == putBool            OK (true)
+        //   serverSoftwareVersion String        == putString          OK
+        //   playerActorProps raw NBT [0A 00 00] == CacheableNbt empty OK (TAG_Compound, empty name, TAG_End)
+        //   blockPaletteChecksum U64 LE (0)     == LE unsigned long   OK
+        //   worldTemplateId 16 bytes (NIL)      == putUUID (NIL)      OK (all-zero, order-invariant)
+        //   enableClientSideChunkGen Bool       == putBool            OK (false)
+        //   blockNetworkIdsAreHashes Bool       -> hashed ids        OK (true, BDS-style; see below)
+        //   disableClientSounds Bool            == NetworkPermissions OK (true)
+        //   serverJoinInfo Bool (false)         == writeOptional null OK (1 byte)
+        //   telemetry      4x String ("")        == ServerTelemetryData OK
+        //
+        // LevelSettings order (Rust vs `LevelSettings.php:157-209`): seed U64 LE,
+        // spawnSettings (I16 LE biomeType, String biomeName, VarI32 dimension),
+        // generator VarI32, worldGamemode VarI32, hardcore Bool, difficulty VarI32,
+        // spawnPosition BlockPos (VarI32 x3), hasAchievementsDisabled Bool,
+        // editorWorldType VarI32, created/exported Bool, editorLevelMigration I8,
+        // time VarI32, eduEditionOffer VarU32, hasEduFeatures Bool, eduProductUUID
+        // String, rain/lightning F32 LE, confirmed/multiplayer/lan Bool,
+        // xbox/platform VarI32, commands Bool, texturePacksRequired Bool,
+        // gameRules VarU32 count (Rust 0 vs PHP 2: wire-legal, content diff),
+        // experiments U32 LE count + (String, Bool) + Bool, bonusChest/startMap Bool,
+        // defaultPermission I8, serverChunkTickRadius I32 LE, locked* Bool x8,
+        // vanillaVersion String ("1.26.60"), limitedWidth/Length I32 LE,
+        // isNewNether Bool, eduUri (String, String), experimentalOverride Optional
+        // Bool, chatRestriction Byte, disableInteractions Bool,
+        // serverEditorConnectionPolicy VarI32, allowAnonymousDrops Bool. All match.
+        //
+        // Run with `cargo test -p bedrock-protocol cue_sample_startgame_hex -- --nocapture`
+        let _ = uuid_from_str("00000000-0000-0000-0000-000000000000").unwrap();
+        let _ = uuid_to_string(&[0u8; 16]);
+
+        let mut packet = StartGamePacket::default();
+        // Mirror `PlayerSession::handle_resource_pack_response` overrides for
+        // a Session 1 login (flat generator, spawn (0,4,0), eye above feet).
+        packet.actor_unique_id = 1;
+        packet.actor_runtime_id = 1;
+        packet.player_gamemode = 0;
+        packet.player_position = Vector3f::new(0.5, 5.62 + 1.62, 0.5);
+        packet.pitch = 0.0;
+        packet.yaw = 0.0;
+        packet.level_settings.seed = u64::MAX;
+        packet.level_settings.spawn_biome_type = 0;
+        packet.level_settings.spawn_biome_name = String::new();
+        packet.level_settings.spawn_position = BlockPos::new(0, 4, 0);
+        packet.level_settings.generator_type = 1;
+        packet.level_settings.world_gamemode = 0;
+        packet.level_settings.difficulty = 1;
+        packet.level_settings.time = 0;
+        packet.level_settings.dimension = 0;
+        packet.level_settings.has_edu_features_enabled = true;
+        packet.level_settings.is_texture_packs_required = true;
+        packet.level_settings.limited_world_width = 0;
+        packet.level_settings.limited_world_length = 0;
+        packet.level_id = String::new();
+        packet.world_name = "Axolotl-PM World".to_string();
+        packet.rewind_history_size = 0;
+        // Mirrors the live `PlayerSession` value (`StartGamePacket::default()`):
+        // `true` (hashed runtime ids, empty palette) like vanilla BDS
+        // (`data/bds-capture/start_game/1.json`), NOT PMMP's index mode
+        // (`false` + full canonical palette). Chunk palettes contain the
+        // FNV-1a hashes from `bedrock-world/src/block_id.rs`; claiming
+        // index mode (`false`) makes the client read those hashes as
+        // palette indices outside 0..23960 and disconnect from the server
+        // with `Block / ClientDisconnection-90`.
+
+        let mut writer = Writer::new();
+        writer.write_var_u32(packet.packet_id());
+        packet.encode(&mut writer).expect("encode");
+        let bytes = writer.into_bytes();
+        let bytes: &[u8] = &bytes;
+
+        println!("=== CUE-SAMPLE StartGamePacket (0x0B) ===");
+        println!(
+            "packet_id=0x{:02X} wire_len={} actorUniqueId={} actorRuntimeId={} gamemode={} pos=({},{},{}) seed=0x{:016X} generator={} difficulty={} time={} rewind={} hashes={} levelId='' worldName='{}'",
+            packet.packet_id(),
+            bytes.len(),
+            packet.actor_unique_id,
+            packet.actor_runtime_id,
+            packet.player_gamemode,
+            packet.player_position.x,
+            packet.player_position.y,
+            packet.player_position.z,
+            packet.level_settings.seed,
+            packet.level_settings.generator_type,
+            packet.level_settings.difficulty,
+            packet.level_settings.time,
+            packet.rewind_history_size,
+            packet.block_network_ids_are_hashes,
+            packet.world_name
+        );
+        println!("--- hex dump (offset: bytes) ---");
+        for line in hex_dump(bytes) {
+            println!("{line}");
+        }
+        println!("--- end hex dump ({} bytes) ---", bytes.len());
+
+        // Payload-only roundtrip: the Bedrock client parses `StartGame` from
+        // the payload after the 0x0B header; any trailing/missing byte here
+        // shifts `blockPaletteChecksum`/`worldTemplateId`/telemetry and the
+        // client discards the packet silently (no VIOLATION, no radius).
+        let mut payload_writer = Writer::new();
+        packet.encode(&mut payload_writer).expect("encode payload");
+        let payload = payload_writer.into_bytes();
+        let payload: &[u8] = &payload;
+        let mut reader = Reader::new(payload);
+        let decoded = StartGamePacket::decode(&mut reader).expect("CUE-SAMPLE StartGame must decode");
+        assert_eq!(decoded, packet);
+        assert_eq!(reader.remaining(), 0, "wire must not have trailing bytes");
+    }
+}
+

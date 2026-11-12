@@ -8,6 +8,15 @@ pub const COMPRESSION_DEFLATE: u8 = 0;
 pub const COMPRESSION_SNAPPY: u8 = 1;
 pub const COMPRESSION_NONE: u8 = 0xFF;
 
+/// Minimum raw batch size that is actually deflated, mirroring
+/// `ZlibCompressor::DEFAULT_THRESHOLD` in the reference
+/// (`target/axolotl-pm/src/network/mcpe/compression/ZlibCompressor.php`,
+/// `Server::prepareBatch`): batches smaller than this go out uncompressed
+/// but still prefixed with `COMPRESSION_NONE`. The compression level
+/// used when the threshold is reached (there: 7) only changes the
+/// compressed bytes, never the wire shape.
+pub const COMPRESSION_THRESHOLD: usize = 256;
+
 pub struct PacketBatch;
 
 impl PacketBatch {

@@ -593,6 +593,35 @@ namespace pocketmine {
             return 20;
         }
 
+        /**
+         * PM `Server::getTickUsage(): float` (% of tick budget used, 0..100).
+         * ScoreHud lo usa en su tarea de refresco; el bridge no mide el tick
+         * con cronómetro, así que devuelve un valor benigno (0.0) para no
+         * romper el scheduler del plugin.
+         */
+        public function getTickUsage(): float
+        {
+            return 0.0;
+        }
+
+        /** PM `Server::getTickSpan(): float` (segundos por tick). */
+        public function getTickSpan(): float
+        {
+            return 0.05;
+        }
+
+        /** PM `Server::getTPS(): array` (avg 1m/5m/15m). */
+        public function getTPS(): array
+        {
+            return [0 => 20.0, 1 => 20.0, 2 => 20.0];
+        }
+
+        /** PM `Server::getTickSummary(): float`. */
+        public function getTickSummary(): float
+        {
+            return 0.0;
+        }
+
         public function getDefaultWorld(): World
         {
             return $this->worldManager->getDefaultWorld();

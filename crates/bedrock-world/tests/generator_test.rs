@@ -97,7 +97,10 @@ fn test_world_generation_verification_suite() {
                 .status();
 
             if status.is_err() || !status.unwrap().success() {
-                eprintln!("Failed to run PHP exporter for seed {} chunk ({}, {})", seed, cx, cz);
+                eprintln!(
+                    "Failed to run PHP exporter for seed {} chunk ({}, {})",
+                    seed, cx, cz
+                );
                 continue;
             }
 
@@ -166,15 +169,28 @@ fn test_world_generation_verification_suite() {
     let overall_biome_rate = total_biome_matches as f64 / total_columns as f64 * 100.0;
 
     println!("-------------------------------------------------------");
-    println!("OVERALL RESULTS (across {} chunks, {} blocks):", chunks.len() * seeds.len(), total_blocks);
+    println!(
+        "OVERALL RESULTS (across {} chunks, {} blocks):",
+        chunks.len() * seeds.len(),
+        total_blocks
+    );
     println!("Biome Consistency:       {:>6.2}%", overall_biome_rate);
     println!("Elevation Height Match:  {:>6.2}%", overall_height_rate);
     println!("Exact Block Alignment:   {:>6.2}%", overall_block_rate);
     println!("=======================================================\n");
 
-    assert!(overall_biome_rate >= 99.99, "Biome consistency must be 100%");
-    assert!(overall_height_rate >= 99.99, "Elevation height match rate must be 100%");
-    assert!(overall_block_rate >= 99.99, "Exact block alignment rate must be 100%");
+    assert!(
+        overall_biome_rate >= 99.99,
+        "Biome consistency must be 100%"
+    );
+    assert!(
+        overall_height_rate >= 99.99,
+        "Elevation height match rate must be 100%"
+    );
+    assert!(
+        overall_block_rate >= 99.99,
+        "Exact block alignment rate must be 100%"
+    );
 }
 
 #[test]
@@ -204,9 +220,13 @@ fn test_terrain_column_consistency() {
                     let mut php_water_h = -1;
                     for y in 0..128 {
                         let b = php_blocks[col_idx * 128 + y];
-                        if b == 1 { php_stone_h = y as i32; }
-                        else if b == 2 || b == 3 { php_dirt_h = y as i32; }
-                        else if b == 5 { php_water_h = y as i32; }
+                        if b == 1 {
+                            php_stone_h = y as i32;
+                        } else if b == 2 || b == 3 {
+                            php_dirt_h = y as i32;
+                        } else if b == 5 {
+                            php_water_h = y as i32;
+                        }
                     }
 
                     // In Rust
@@ -215,12 +235,19 @@ fn test_terrain_column_consistency() {
                     let mut rust_water_h = -1;
                     for y in 0..128 {
                         let b = map_rust_block(rust_chunk.get_block(x, y as i32, z));
-                        if b == 1 { rust_stone_h = y as i32; }
-                        else if b == 2 || b == 3 { rust_dirt_h = y as i32; }
-                        else if b == 5 { rust_water_h = y as i32; }
+                        if b == 1 {
+                            rust_stone_h = y as i32;
+                        } else if b == 2 || b == 3 {
+                            rust_dirt_h = y as i32;
+                        } else if b == 5 {
+                            rust_water_h = y as i32;
+                        }
                     }
 
-                    if php_stone_h == rust_stone_h && php_dirt_h == rust_dirt_h && php_water_h == rust_water_h {
+                    if php_stone_h == rust_stone_h
+                        && php_dirt_h == rust_dirt_h
+                        && php_water_h == rust_water_h
+                    {
                         matched_columns += 1;
                     } else {
                         println!("  Mismatch at ({}, {}): PHP stone={} dirt={} water={} | Rust stone={} dirt={} water={}",
@@ -229,7 +256,10 @@ fn test_terrain_column_consistency() {
                 }
             }
             let col_match_rate = matched_columns as f64 / 256.0 * 100.0;
-            println!("Seed {:>5} Chunk ({:>2}, {:>2}): Terrain Column Match: {:>5.1}%", seed, cx, cz, col_match_rate);
+            println!(
+                "Seed {:>5} Chunk ({:>2}, {:>2}): Terrain Column Match: {:>5.1}%",
+                seed, cx, cz, col_match_rate
+            );
         }
     }
 }
@@ -272,17 +302,37 @@ fn test_dump_chunk_12345() {
                     if rust_b == php_b {
                         exact_matches += 1;
                     } else {
-                        println!("Diff at ({}, {}, {}): Rust={}, PHP={}", x, y, z, rust_b, php_b);
+                        println!(
+                            "Diff at ({}, {}, {}): Rust={}, PHP={}",
+                            x, y, z, rust_b, php_b
+                        );
                     }
                 }
             }
         }
 
         println!("=== Comparison for Seed 12345 Chunk (0,0) ===");
-        println!("Dominant Biome: Rust={}, PHP={}", chunk.biomes[7 * 16 + 7], php_dominant);
-        println!("Biome Match: {}/256 ({:.2}%)", biome_matches, biome_matches as f64 / 256.0 * 100.0);
-        println!("Height Match: {}/256 ({:.2}%)", height_matches, height_matches as f64 / 256.0 * 100.0);
-        println!("Exact Block Match: {}/{} ({:.2}%)", exact_matches, total_blocks, exact_matches as f64 / total_blocks as f64 * 100.0);
+        println!(
+            "Dominant Biome: Rust={}, PHP={}",
+            chunk.biomes[7 * 16 + 7],
+            php_dominant
+        );
+        println!(
+            "Biome Match: {}/256 ({:.2}%)",
+            biome_matches,
+            biome_matches as f64 / 256.0 * 100.0
+        );
+        println!(
+            "Height Match: {}/256 ({:.2}%)",
+            height_matches,
+            height_matches as f64 / 256.0 * 100.0
+        );
+        println!(
+            "Exact Block Match: {}/{} ({:.2}%)",
+            exact_matches,
+            total_blocks,
+            exact_matches as f64 / total_blocks as f64 * 100.0
+        );
     }
 }
 

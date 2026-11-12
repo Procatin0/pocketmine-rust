@@ -155,6 +155,28 @@ pub enum TitleAction {
     },
 }
 
+/// Scoreboard mutation requested by `/scoreboard` (Rust extension over
+/// the PM `Player::setScoreboard()` API; Bedrock's own `/scoreboard`
+/// command manages server objectives instead, which this port does not
+/// expose as a command).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScoreboardOperation {
+    /// Remove every objective (`Player::removeScoreboard()`).
+    Clear,
+    /// Create/replace an objective (empty lines).
+    AddObjective(crate::scoreboard::ScoreboardObjective),
+    /// Remove one objective by name.
+    RemoveObjective(String),
+    /// Add/replace one line.
+    AddScore {
+        objective_name: String,
+        score: u32,
+        text: String,
+    },
+    /// Remove one line by score.
+    RemoveScore { objective_name: String, score: u32 },
+}
+
 /// Side effect requested by a core command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandAction {
@@ -217,6 +239,12 @@ pub enum CommandAction {
     SendTitle {
         target: String,
         action: TitleAction,
+    },
+    /// `/scoreboard`: one mutation on the target's scoreboard (`global`
+    /// targets the persisted default scoreboard instead).
+    Scoreboard {
+        target: String,
+        operation: ScoreboardOperation,
     },
     /// `/transferserver`: send `TransferPacket` and close the session.
     Transfer {
@@ -669,6 +697,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Controls screen titles",
     },
     CommandInfo {
+        name: "scoreboard",
+        aliases: &["sb"],
+        usage: "/scoreboard <player|global> <clear|add|remove|set|list> ...",
+        description: "Manages scoreboard objectives and lines",
+    },
+    CommandInfo {
         name: "transferserver",
         aliases: &[],
         usage: "/transferserver <server> [port]",
@@ -765,6 +799,7 @@ pub fn handle_command(
         "dumpmemory" => Some(dumpmemory(source, &args)),
         "time" => Some(time(source, &args)),
         "title" => Some(title(source, players, &args)),
+        "scoreboard" | "sb" => Some(scoreboard(source, players, &args)),
         "transferserver" => Some(transfer(source, &args)),
         "weather" => Some(weather(source, &args)),
         "op" => Some(set_op(&args, true)),
@@ -1432,6 +1467,7 @@ pub mod lang {
     pub const TIME_ADDED: &str = "Added {%0} to the time";
     pub const TIME_QUERY: &str = "Time is {%0}";
     pub const TITLE_SUCCESS: &str = "Title command successfully executed";
+    pub const SCOREBOARD_SUCCESS: &str = "Scoreboard command successfully executed";
     pub const PLAYER_USER_ONLY: &str = "This command syntax can only be used as a player";
     pub const VERSION_SOFTWARE_NAME: &str = "This server is running {%serverSoftwareName}";
     pub const VERSION_SOFTWARE_VERSION: &str = "Server version: {%serverSoftwareVersion} (git hash: {%serverGitHash})";
@@ -3162,6 +3198,98 @@ fn title(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
     }
 }
 
+/// `/scoreboard <player|global> <clear|add|remove|set> ...` (Rust
+/// extension over `Player::setScoreboard()`):
+/// - `clear`: remove every objective.
+/// - `add <objective> <score> <text...>`: add/replace one line
+///   (creates the objective with display name `<objective>` when
+///   missing).
+/// - `remove <objective> <score>`: remove one line.
+/// - `set <objective> <display...>`: create the objective or update
+///   its display name (existing lines are kept).
+///
+/// `global` targets the persisted default scoreboard (`scoreboard.json`)
+/// instead of one player's board.
+fn scoreboard(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if args.len() < 2 {
+        return usage("scoreboard");
+    }
+
+    let targets: Vec<String> = if args[0].eq_ignore_ascii_case("global") {
+        if !source.can(crate::permission::COMMAND_SCOREBOARD_OTHER) {
+            return error(red(
+                lang::PERMISSION.replace("{%commandName}", "scoreboard"),
+            ));
+        }
+        vec!["global".to_string()]
+    } else {
+        match fetch_permitted_player_targets(
+            source,
+            players,
+            Some(args[0]),
+            "scoreboard",
+            source.can(crate::permission::COMMAND_SCOREBOARD_SELF),
+            source.can(crate::permission::COMMAND_SCOREBOARD_OTHER),
+        ) {
+            Ok(found) => found.iter().map(|player| player.name.clone()).collect(),
+            Err(output) => return output,
+        }
+    };
+
+    let operation = match args[1] {
+        "clear" => ScoreboardOperation::Clear,
+        "add" => {
+            if args.len() < 5 {
+                return usage("scoreboard");
+            }
+            let score = match bounded_int(args[3], 0, 1_000_000_000) {
+                Ok(parsed) => parsed as u32,
+                Err(_) => return usage("scoreboard"),
+            };
+            ScoreboardOperation::AddScore {
+                objective_name: args[2].to_string(),
+                score,
+                text: args[4..].join(" "),
+            }
+        }
+        "remove" => {
+            if args.len() < 4 {
+                return usage("scoreboard");
+            }
+            let score = match bounded_int(args[3], 0, 1_000_000_000) {
+                Ok(parsed) => parsed as u32,
+                Err(_) => return usage("scoreboard"),
+            };
+            ScoreboardOperation::RemoveScore {
+                objective_name: args[2].to_string(),
+                score,
+            }
+        }
+        "set" => {
+            if args.len() < 4 {
+                return usage("scoreboard");
+            }
+            ScoreboardOperation::AddObjective(crate::scoreboard::ScoreboardObjective::sidebar(
+                args[2],
+                args[3..].join(" "),
+            ))
+        }
+        _ => return usage("scoreboard"),
+    };
+
+    let actions = targets
+        .into_iter()
+        .map(|target| CommandAction::Scoreboard {
+            target,
+            operation: operation.clone(),
+        })
+        .collect();
+    CommandOutput {
+        feedback: vec![lang::SCOREBOARD_SUCCESS.to_string()],
+        actions,
+    }
+}
+
 /// `/transferserver <host> [port]`, ported from
 /// `pocketmine\command\defaults\TransferServerCommand`.
 ///
@@ -3269,6 +3397,7 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "kill" | "suicide" => Some(&[COMMAND_KILL_SELF, COMMAND_KILL_OTHER]),
         "spawnpoint" => Some(&[COMMAND_SPAWNPOINT_SELF, COMMAND_SPAWNPOINT_OTHER]),
         "title" => Some(&[COMMAND_TITLE_SELF, COMMAND_TITLE_OTHER]),
+        "scoreboard" | "sb" => Some(&[COMMAND_SCOREBOARD_SELF, COMMAND_SCOREBOARD_OTHER]),
         "transferserver" => Some(&[COMMAND_TRANSFERSERVER]),
         "defaultgamemode" => Some(&[COMMAND_DEFAULTGAMEMODE]),
         "difficulty" => Some(&[COMMAND_DIFFICULTY]),
@@ -4607,6 +4736,93 @@ mod tests {
             "/title Alex nope",
             "/title Alex times 1 2",
             "/title Alex times 1 2 muchas",
+        ] {
+            let output = handle_command(input, &source, &players()).expect("native");
+            assert_eq!(output.feedback, vec![usage_line.to_string()], "{input}");
+            assert!(output.actions.is_empty(), "{input}");
+        }
+    }
+
+    #[test]
+    fn scoreboard_parses_clear_add_remove_set_and_global() {
+        let source = player_source("Steve", (0.0, 64.0, 0.0));
+
+        let output = handle_command("/scoreboard Alex clear", &source, &players()).expect("native");
+        assert_eq!(output.feedback, vec![lang::SCOREBOARD_SUCCESS.to_string()]);
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Scoreboard {
+                target: "Alex".to_string(),
+                operation: ScoreboardOperation::Clear,
+            }]
+        );
+
+        let output = handle_command(
+            "/scoreboard Alex add main 100 Oro extra",
+            &source,
+            &players(),
+        )
+        .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Scoreboard {
+                target: "Alex".to_string(),
+                operation: ScoreboardOperation::AddScore {
+                    objective_name: "main".to_string(),
+                    score: 100,
+                    text: "Oro extra".to_string(),
+                },
+            }]
+        );
+
+        let output =
+            handle_command("/scoreboard Alex remove main 42", &source, &players()).expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Scoreboard {
+                target: "Alex".to_string(),
+                operation: ScoreboardOperation::RemoveScore {
+                    objective_name: "main".to_string(),
+                    score: 42,
+                },
+            }]
+        );
+
+        let output = handle_command(
+            "/scoreboard Alex set main Números top",
+            &source,
+            &players(),
+        )
+        .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Scoreboard {
+                target: "Alex".to_string(),
+                operation: ScoreboardOperation::AddObjective(
+                    crate::scoreboard::ScoreboardObjective::sidebar("main", "Números top")
+                ),
+            }]
+        );
+
+        let output =
+            handle_command("/scoreboard global clear", &source, &players()).expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Scoreboard {
+                target: "global".to_string(),
+                operation: ScoreboardOperation::Clear,
+            }]
+        );
+
+        let usage_line = "§cUsage: /scoreboard <player|global> <clear|add|remove|set|list> ...";
+        for input in [
+            "/scoreboard",
+            "/scoreboard Alex",
+            "/scoreboard Alex nope",
+            "/scoreboard Alex add main",
+            "/scoreboard Alex add main muchas Oro",
+            "/scoreboard Alex remove main",
+            "/scoreboard Alex set main",
         ] {
             let output = handle_command(input, &source, &players()).expect("native");
             assert_eq!(output.feedback, vec![usage_line.to_string()], "{input}");

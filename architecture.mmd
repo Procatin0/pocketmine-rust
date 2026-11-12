@@ -1,0 +1,33 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#0dd', 'primaryTextColor': '#000', 'lineColor': '#333'}}}%%
+flowchart TB
+    subgraph Tick["HILO PRINCIPAL — Tick 20 TPS (main.rs)"]
+        W["WorldState<br/>time++, tick(), physics<br/>rayon (gen chunk)"]
+        S["SessionManager + PlayerRegistry<br/>poll_prespawn(20t), poll_virtual(20t)<br/>broadcast_add_player/move/remove"]
+        P["PluginManager.tickSync<br/>(PHP scheduler, solo plugins)"]
+        W --> S --> P
+    end
+    subgraph Tokio["TAREAS TOKIO (hilos separados, sin bloquear tick)"]
+        SB["Bedrock Net<br/>WebRTC signaling :19132<br/>UDP gameplay :19132/:19133<br/>RakNet listener<br/>Query GS4 :19132<br/>Java :25565"]
+        SJ["Java Server (java-bridge)<br/>JavaSession tick 50ms<br/>TCP accept poll_bytes"]
+        OUTB["Outbound Bedrock<br/>LevelChunk 0x3A<br/>UpdateBlock 0x15<br/>MoveActor 0x12<br/>SetTime 0x0A"]
+        OUTJ["Outbound Java<br/>flush() -> socket TCP<br/>map_chunk 26.1<br/>player_info 0x04<br/>update_tags 0x0d<br/>brand 0x01"]
+        C["Caché compartida FIFO 512<br/>chunk_payload invalidada por set_block"]
+    end
+    Tick -->|"produce Vec<OutgoingPacket> via canal mpsc"| Tokio
+    subgraph Data["DATOS"]
+        WS["WorldState<br/>edits HashMap<br/>BlockChange colas x2 (512)"]
+        PR["PlayerRegistry<br/>PlayerContext + inboxes<br/>virtuals is_virtual"]
+        FS["players/*.json<br/>world.json v2<br/>resource_packs/"]
+    end
+    W <--> WS
+    S <--> PR
+    SJ --- CoreHooks["CoreHooks: ServerHooks<br/>snapshots/chunks/chat/bloques"] --> WS
+    SJ --- PR
+    WS <--> C
+    C --- OutB
+    C --- OutJ
+    SB --- OutB
+    SB --- OutJ
+    SJ --- OUTJ
+    classDef tick fill:#e1f5fe,stroke:#0277bd
+    classDef tokio fill:#fff3e0,stroke:#ef6c00

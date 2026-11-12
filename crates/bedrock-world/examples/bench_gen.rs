@@ -1,4 +1,3 @@
-
 use bedrock_world::generator::normal::NormalGenerator;
 use bedrock_world::generator::WorldGenerator;
 use std::time::Instant;
@@ -16,5 +15,10 @@ fn main() {
         }
     }
     let elapsed = start.elapsed();
-    println!("Generated {} chunks in {:.2?} ({:.2?} per chunk)", count, elapsed, elapsed / count);
+    println!(
+        "Generated {} chunks in {:.2?} ({:.2?} per chunk)",
+        count,
+        elapsed,
+        elapsed / count
+    );
 }

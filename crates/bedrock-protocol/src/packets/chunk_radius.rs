@@ -26,13 +26,12 @@ impl Packet for RequestChunkRadiusPacket {
     }
 
     fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
-        let radius = reader.read_var_i32()?;
-        let max_radius = if reader.remaining() > 0 {
-            reader.read_byte()?
-        } else {
-            0
-        };
-        Ok(Self { radius, max_radius })
+        // Reference `RequestChunkRadiusPacket::decodePayload` always reads both
+        // fields: `radius` (VarInt signed) then `maxRadius` (unsigned byte).
+        Ok(Self {
+            radius: reader.read_var_i32()?,
+            max_radius: reader.read_byte()?,
+        })
     }
 }
 

@@ -29,12 +29,80 @@ pub trait NetherNetPacketHandler: Send + Sync {
     fn on_disconnect(&self, _peer: SocketAddr) {}
 }
 
+/// Registry of the live `ReliableDataChannel` per WebRTC peer.
+///
+/// `NetherNetPacketHandler::handle_message` only ever runs in reply to an
+/// inbound data-channel message, so without this registry the server
+/// could never push bytes to a client that had gone quiet (e.g. Bedrock
+/// in "Locating/Generating the world", waiting for terrain chunks and
+/// sending nothing). The tick loop uses
+/// [`PeerDataChannels::send_to_peer`] to flush the envelopes the central
+/// tick queued (`NetworkSession::flushGamePacketQueue()`), framed
+/// exactly like the replies the data-channel loop sends: one `0x00`
+/// countdown header byte in front of each encoded batch.
+pub struct PeerDataChannels {
+    inner: Mutex<HashMap<SocketAddr, Arc<dyn DataChannel>>>,
+}
+
+impl PeerDataChannels {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers (or replaces) the reliable data channel for `peer`.
+    pub async fn register(&self, peer: SocketAddr, dc: Arc<dyn DataChannel>) {
+        self.inner.lock().await.insert(peer, dc);
+    }
+
+    /// Removes `peer`'s entry, but only when it still points at the
+    /// channel that closed (`dc`): a reconnect may already have
+    /// registered a fresh channel for the same peer address, and the
+    /// old channel's close must not evict it.
+    pub async fn unregister_if_same(&self, peer: SocketAddr, dc: &Arc<dyn DataChannel>) {
+        let mut map = self.inner.lock().await;
+        if map.get(&peer).is_some_and(|stored| Arc::ptr_eq(stored, dc)) {
+            map.remove(&peer);
+        }
+    }
+
+    /// Whether a reliable data channel is currently registered for `peer`.
+    pub async fn has_peer(&self, peer: SocketAddr) -> bool {
+        self.inner.lock().await.contains_key(&peer)
+    }
+
+    /// Frames `data` with the `0x00` countdown header and sends it on
+    /// `peer`'s reliable data channel. Returns `false` when no channel
+    /// is registered for the peer (not yet established, or already
+    /// closed) or the send fails; the caller decides what dropping the
+    /// batch means.
+    pub async fn send_to_peer(&self, peer: SocketAddr, data: bytes::Bytes) -> bool {
+        let dc = self.inner.lock().await.get(&peer).cloned();
+        let Some(dc) = dc else {
+            return false;
+        };
+        let mut framed = Vec::with_capacity(data.len() + 1);
+        framed.push(0x00); // 0x00 NetherNet countdown header (unfragmented)
+        framed.extend_from_slice(&data);
+        let buf = bytes::BytesMut::from(&framed[..]);
+        dc.send(buf).await.is_ok()
+    }
+}
+
+impl Default for PeerDataChannels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct NetherNetWebRtcHandler {
     gather_notify: Arc<tokio::sync::Notify>,
     peer_addr: SocketAddr,
     packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
     peer_conn: Arc<Mutex<Option<Arc<dyn PeerConnection>>>>,
     reliable_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    peer_data_channels: Arc<PeerDataChannels>,
 }
 
 #[async_trait::async_trait]
@@ -68,11 +136,20 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
 
         if label == "ReliableDataChannel" {
             *self.reliable_dc.lock().await = Some(Arc::clone(&dc));
+            // Publish it for tick-driven pushes: `handle_message` only
+            // runs in reply to an inbound message, so without this the
+            // central tick could never reach a client that went quiet
+            // (e.g. waiting for terrain chunks in PreSpawn).
+            self.peer_data_channels
+                .register(peer, Arc::clone(&dc))
+                .await;
         }
 
         let handler = self.packet_handler.clone();
         let peer_conn = Arc::clone(&self.peer_conn);
         let reliable_dc = Arc::clone(&self.reliable_dc);
+        let peer_data_channels = Arc::clone(&self.peer_data_channels);
+        let is_reliable = label == "ReliableDataChannel";
         tokio::spawn(async move {
             loop {
                 match dc.poll().await {
@@ -109,6 +186,13 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                     }
                     Some(DataChannelEvent::OnClose) | None => {
                         debug!("[:WebRTC] DataChannel '{}' closed for {}", label, peer);
+                        if is_reliable {
+                            // Stop tick-driven pushes to this peer; only
+                            // the reliable channel's close unregisters, so
+                            // an unreliable channel closing cannot evict
+                            // the reliable entry.
+                            peer_data_channels.unregister_if_same(peer, &dc).await;
+                        }
                         if let Some(ph) = &handler {
                             ph.on_disconnect(peer);
                         }
@@ -133,6 +217,7 @@ pub struct SignalingServer {
     tls_acceptor: Arc<TlsAcceptor>,
     active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
     packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
+    peer_data_channels: Arc<PeerDataChannels>,
 }
 
 impl SignalingServer {
@@ -151,6 +236,7 @@ impl SignalingServer {
             tls_acceptor,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
             packet_handler: None,
+            peer_data_channels: Arc::new(PeerDataChannels::new()),
         }
     }
 
@@ -169,6 +255,7 @@ impl SignalingServer {
             tls_acceptor,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
             packet_handler: None,
+            peer_data_channels: Arc::new(PeerDataChannels::new()),
         }
     }
 
@@ -179,6 +266,20 @@ impl SignalingServer {
     pub fn with_packet_handler(mut self, handler: Arc<dyn NetherNetPacketHandler>) -> Self {
         self.packet_handler = Some(handler);
         self
+    }
+
+    /// The registry of live reliable data channels this server publishes
+    /// to as peers connect. The host keeps the returned `Arc` (e.g. the
+    /// central tick loop) to push tick-queued batches to a peer without
+    /// waiting for that peer to send a packet first.
+    pub fn peer_data_channels(&self) -> Arc<PeerDataChannels> {
+        Arc::clone(&self.peer_data_channels)
+    }
+
+    /// Replaces the peer data-channel registry (before `run()`), e.g. to
+    /// share one registry created by the host with this server.
+    pub fn set_peer_data_channels(&mut self, registry: Arc<PeerDataChannels>) {
+        self.peer_data_channels = registry;
     }
 
     /// `172.16.0.0/12`: the range Hyper-V's Default Switch and docker bridges
@@ -389,8 +490,9 @@ impl SignalingServer {
             let tls_acceptor = Arc::clone(&self.tls_acceptor);
             let active_peers = Arc::clone(&self.active_peers);
             let packet_handler = self.packet_handler.clone();
+            let peer_data_channels = Arc::clone(&self.peer_data_channels);
             tokio::spawn(async move {
-                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor, active_peers, packet_handler).await {
+                if let Err(e) = Self::listen_loop(addr, info, udp_ports, identity, tls_acceptor, active_peers, packet_handler, peer_data_channels).await {
                     error!("Signaling listener failed on {}: {}", addr, e);
                 }
             });
@@ -408,6 +510,7 @@ impl SignalingServer {
         tls_acceptor: Arc<TlsAcceptor>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
         packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
+        peer_data_channels: Arc<PeerDataChannels>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         loop {
@@ -419,6 +522,7 @@ impl SignalingServer {
             let tls_acceptor = Arc::clone(&tls_acceptor);
             let active_peers = Arc::clone(&active_peers);
             let packet_handler = packet_handler.clone();
+            let peer_data_channels = Arc::clone(&peer_data_channels);
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_connection(
                     stream,
@@ -430,6 +534,7 @@ impl SignalingServer {
                     tls_acceptor,
                     active_peers,
                     packet_handler,
+                    peer_data_channels,
                 )
                 .await
                 {
@@ -449,6 +554,7 @@ impl SignalingServer {
         tls_acceptor: Arc<TlsAcceptor>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
         packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
+        peer_data_channels: Arc<PeerDataChannels>,
     ) -> std::io::Result<()> {
         let mut peek_buf = [0u8; 1];
         let n = stream.peek(&mut peek_buf).await?;
@@ -461,7 +567,7 @@ impl SignalingServer {
             debug!("[:{}] TLS Handshake (HTTPS) initiated by {}", signaling_port, peer_addr);
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => {
-                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler).await
+                    Self::handle_http(tls_stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler, peer_data_channels).await
                 }
                 Err(e) => {
                     debug!("[:{}] TLS handshake failed from {}: {}", signaling_port, peer_addr, e);
@@ -470,7 +576,7 @@ impl SignalingServer {
             }
         } else {
             // Plaintext HTTP connection
-            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler).await
+            Self::handle_http(stream, peer_addr, info, udp_ports, signaling_port, identity, active_peers, packet_handler, peer_data_channels).await
         }
     }
 
@@ -483,6 +589,7 @@ impl SignalingServer {
         identity: Arc<NetherNetIdentity>,
         active_peers: Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
         packet_handler: Option<Arc<dyn NetherNetPacketHandler>>,
+        peer_data_channels: Arc<PeerDataChannels>,
     ) -> std::io::Result<()> {
         // Read HTTP request headers in a loop until \r\n\r\n or \n\n
         let mut buffer = Vec::new();
@@ -651,6 +758,7 @@ impl SignalingServer {
                 &identity,
                 &active_peers,
                 &packet_handler,
+                &peer_data_channels,
             ).await {
                 Ok(sdp_answer) => {
                     let response = format!(
@@ -702,6 +810,7 @@ impl SignalingServer {
         identity: &NetherNetIdentity,
         active_peers: &Arc<Mutex<HashMap<String, Arc<dyn PeerConnection>>>>,
         packet_handler: &Option<Arc<dyn NetherNetPacketHandler>>,
+        peer_data_channels: &Arc<PeerDataChannels>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if offer_sdp.trim().is_empty() {
             return Err("Offer SDP is empty".into());
@@ -752,6 +861,7 @@ impl SignalingServer {
             packet_handler: packet_handler.clone(),
             peer_conn: Arc::clone(&peer_conn_holder),
             reliable_dc,
+            peer_data_channels: Arc::clone(peer_data_channels),
         });
 
         // 2. Configure WebRTC SettingEngine strictly matching Axolotl WebRtcTransportFactory.php:

@@ -147,21 +147,46 @@ const BLOCKS_STABLE: &[(&str, i32)] = &[
 /// Per-protocol overrides as `(protocol, name, state)` rows, kept flat
 /// so the table stays readable next to the PHP original.
 const BLOCKS_BY_PROTOCOL_ROWS: &[(i32, &str, i32)] = &[
-    (769, "redstone_ore", 5904), (769, "diamond_ore", 4329), (769, "emerald_ore", 8285),
-    (769, "short_grass", 2048), (769, "tall_grass", 11635), (769, "snow", 5941),
-    (769, "dandelion", 2118), (769, "poppy", 2120),
-    (770, "redstone_ore", 5913), (770, "diamond_ore", 4338), (770, "emerald_ore", 8295),
-    (770, "short_grass", 2048), (770, "tall_grass", 11645), (770, "snow", 5950),
-    (770, "dandelion", 2121), (770, "poppy", 2123),
-    (773, "redstone_ore", 6681), (773, "diamond_ore", 5106), (773, "emerald_ore", 9372),
-    (773, "short_grass", 2048), (773, "tall_grass", 12722), (773, "snow", 6718),
-    (773, "dandelion", 2121), (773, "poppy", 2123),
-    (774, "redstone_ore", 6681), (774, "diamond_ore", 5106), (774, "emerald_ore", 9372),
-    (774, "short_grass", 2048), (774, "tall_grass", 12722), (774, "snow", 6718),
-    (774, "dandelion", 2121), (774, "poppy", 2123),
-    (775, "redstone_ore", 6882), (775, "diamond_ore", 5307), (775, "emerald_ore", 9573),
-    (775, "short_grass", 2248), (775, "tall_grass", 12924), (775, "snow", 6919),
-    (775, "dandelion", 2321), (775, "poppy", 2324),
+    (769, "redstone_ore", 5904),
+    (769, "diamond_ore", 4329),
+    (769, "emerald_ore", 8285),
+    (769, "short_grass", 2048),
+    (769, "tall_grass", 11635),
+    (769, "snow", 5941),
+    (769, "dandelion", 2118),
+    (769, "poppy", 2120),
+    (770, "redstone_ore", 5913),
+    (770, "diamond_ore", 4338),
+    (770, "emerald_ore", 8295),
+    (770, "short_grass", 2048),
+    (770, "tall_grass", 11645),
+    (770, "snow", 5950),
+    (770, "dandelion", 2121),
+    (770, "poppy", 2123),
+    (773, "redstone_ore", 6681),
+    (773, "diamond_ore", 5106),
+    (773, "emerald_ore", 9372),
+    (773, "short_grass", 2048),
+    (773, "tall_grass", 12722),
+    (773, "snow", 6718),
+    (773, "dandelion", 2121),
+    (773, "poppy", 2123),
+    (774, "redstone_ore", 6681),
+    (774, "diamond_ore", 5106),
+    (774, "emerald_ore", 9372),
+    (774, "short_grass", 2048),
+    (774, "tall_grass", 12722),
+    (774, "snow", 6718),
+    (774, "dandelion", 2121),
+    (774, "poppy", 2123),
+    (775, "redstone_ore", 6882),
+    (775, "diamond_ore", 5307),
+    (775, "emerald_ore", 9573),
+    (775, "short_grass", 2248),
+    (775, "tall_grass", 12924),
+    (775, "snow", 6919),
+    (775, "dandelion", 2321),
+    (775, "poppy", 2324),
 ];
 
 impl ModernProfile {
@@ -222,7 +247,19 @@ impl ModernProfile {
     /// 774-775); index 0 is `minecraft:badlands`, so sending 0 would
     /// paint the world with badlands instead of plains.
     pub fn plains_biome(&self) -> i32 {
-        if self.protocol >= 774 { 40 } else { 39 }
+        if self.protocol >= 774 {
+            40
+        } else {
+            39
+        }
+    }
+
+    /// Index of `minecraft:badlands` (near `minecraft:plains` in the
+    /// legacy id table: 37 vs 1, see `generator::biome`). Always 0:
+    /// first registry entry in 769-775. Kept next to
+    /// [`Self::plains_biome`] so the 0-is-badlands trap stays named.
+    pub fn badlands_biome(&self) -> i32 {
+        0
     }
 }
 
@@ -308,10 +345,7 @@ impl ModernChunk {
     }
 
     /// Bedrock network id for a global Java state, or `None`.
-    pub fn bedrock_network_id_for_java_state(
-        state: i32,
-        profile: &ModernProfile,
-    ) -> Option<u32> {
+    pub fn bedrock_network_id_for_java_state(state: i32, profile: &ModernProfile) -> Option<u32> {
         let name = Self::block_name_for_java_state(state, profile)?;
         Self::bedrock_network_id_for_name(name)
     }
@@ -323,6 +357,13 @@ impl ModernChunk {
     /// packet's `fluidCount` (`LevelChunkSection.hasFluid()`): with 0
     /// it never examines the blocks and the player falls through water
     /// as if it were air, even when the palette is correct.
+    ///
+    /// Number spaces: `86..=117` are *block states*. The login tags
+    /// `minecraft:fluid` `water == [1, 2]` / `lava == [3, 4]` (see
+    /// `java-protocol` `ModernProfile::tag_members`) are *fluid
+    /// registry* ids (`empty=0, water=1, flowing_water=2, lava=3,
+    /// flowing_lava=4`) — different space, so never mix them into a
+    /// palette or a `fluidCount`.
     pub fn is_fluid(state: i32) -> bool {
         (86..=117).contains(&state)
     }
@@ -810,8 +851,7 @@ impl ChunkBuilder {
                             0
                         } else {
                             let word = payload.words[entry / per_word];
-                            ((word >> ((entry % per_word) * payload.bits as usize)) & mask)
-                                as usize
+                            ((word >> ((entry % per_word) * payload.bits as usize)) & mask) as usize
                         };
                         states[((world_y as usize) << 8) | (z << 4) | x] =
                             legacy.get(index).copied().unwrap_or(JAVA_AIR);
@@ -912,7 +952,10 @@ mod tests {
         let p775 = ModernProfile::for_protocol(775).unwrap();
         assert_eq!(ModernChunk::block_name(1211861802), Some("water"));
         assert_eq!(ModernChunk::block_name(12345), None);
-        assert_eq!(ModernChunk::bedrock_network_id_for_name("water"), Some(1211861802));
+        assert_eq!(
+            ModernChunk::bedrock_network_id_for_name("water"),
+            Some(1211861802)
+        );
         assert_eq!(
             ModernChunk::block_name_for_java_state(6882, &p775),
             Some("redstone_ore")
@@ -951,12 +994,31 @@ mod tests {
         assert!(!p770.heightmaps_as_nbt());
         assert!(p769.palette_data_has_length());
         assert!(!p770.palette_data_has_length());
-        assert!(!ModernProfile::for_protocol(774).unwrap().sections_have_fluid_count());
+        assert!(!ModernProfile::for_protocol(774)
+            .unwrap()
+            .sections_have_fluid_count());
         assert!(p775.sections_have_fluid_count());
         assert_eq!(p769.plains_biome(), 39);
         assert_eq!(p775.plains_biome(), 40);
         assert!(ModernProfile::for_protocol(769).is_some());
         assert!(ModernProfile::for_protocol(999).is_none());
+    }
+
+    #[test]
+    fn biome_registry_indexes_plains_vs_badlands() {
+        // Legacy biome ids: plains 1 / badlands 37 (niduy `BIOME`).
+        // Worldgen registry indexes: plains 39/40, badlands 0 — sending
+        // 0 as "plains" would paint badlands. All 5 profiles agree on 0.
+        for protocol in [769, 770, 773, 774, 775] {
+            let profile = ModernProfile::for_protocol(protocol).unwrap();
+            assert_eq!(profile.badlands_biome(), 0, "protocolo {protocol}");
+            assert_ne!(profile.plains_biome(), profile.badlands_biome());
+            assert_eq!(
+                profile.plains_biome(),
+                if protocol >= 774 { 40 } else { 39 },
+                "protocolo {protocol}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,5 @@
-
-use bedrock_world::generator::normal::NormalGenerator;
 use bedrock_world::generator::biome;
+use bedrock_world::generator::normal::NormalGenerator;
 use bedrock_world::generator::WorldGenerator;
 
 fn main() {

@@ -46,7 +46,8 @@ impl Random {
         self.x = self.y;
         self.y = self.z;
         self.z = self.w;
-        self.w = (self.w ^ ((self.w >> 19) & 0x7fffffff) ^ (t ^ ((t >> 8) & 0x7fffffff))) & 0xffffffff;
+        self.w =
+            (self.w ^ ((self.w >> 19) & 0x7fffffff) ^ (t ^ ((t >> 8) & 0x7fffffff))) & 0xffffffff;
         self.w as i32
     }
 

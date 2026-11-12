@@ -562,6 +562,91 @@ mod tests {
     }
 
     #[test]
+    fn cue_sample_playerlist_hex() {
+        // CUE-SAMPLE: wire dump of the exact `PlayerListPacket` (0x3F) the
+        // server sends as the LAST packet of the PreSpawn bundle
+        // (`syncPlayerList([self])`, `PreSpawnPacketHandler::setUp()` line
+        // 167 `syncPlayerList($server->getOnlinePlayers())` -> Rust
+        // `PlayerSession::player_list_addition()`).
+        //
+        // Field-by-field comparison (Rust `player_list.rs` `encode_payload`
+        // vs PHP `PlayerListPacket.php` `encodePayload` +
+        // `CommonTypes::putSkin`):
+        //   count      VarU32                        == VarInt              OK
+        //   type       VarU32 (1 = ADD)             == VarInt              OK
+        //   inner      Byte (0 for ADD, 1 REMOVE)    == Byte               OK
+        //   uuid       `write_uuid` (2x LE long)     == `putUUID`          OK
+        //   actorUniqueId VarI64 (zigzag long)      == `putActorUniqueId` OK (value: PHP `getId()`, now also Rust `runtime`)
+        //   username   String (VarU32 len + bytes)  == `putString`        OK
+        //   xboxUserId String                       == `putString`        OK (PHP `getXuid()`)
+        //   playFabId  String ("" )                 == `putString`        OK
+        //   platformChatId String ("")              == `putString`        OK
+        //   buildPlatform I32 LE (-1)               == LE signed int      OK
+        //   skinData   `SkinData::encode`           == `CommonTypes::putSkin` OK (22 fields in same order, see below)
+        //   isTeacher/isHost/isSubClient Bool       == `putBool`          OK (false/false/false)
+        //   color      U32 LE (0xFFFFFFFF white)     == `writeColor` ARGB  OK (`Color(255,255,255)` fallback)
+        //
+        // SkinData order (both sides identical):
+        //   skinId String, resourcePatch String, skinImage (U32 LE w, U32 LE h,
+        //   VarU32 len + bytes), animations (VarU32 count + per-anim image,
+        //   VarU32 type, F32 LE frames, VarU32 expr), capeImage, geometryData
+        //   String, geometryVersion String, animationData String, capeId String,
+        //   fullSkinId String, armSize Byte (1 = wide), skinColor U32 LE ARGB,
+        //   personaPieces (VarU32 + id String, U32 LE type, UUID, Bool, String),
+        //   pieceTintColors (VarU32 + type String, 4x U32 LE), premium Bool,
+        //   persona Bool, capeOnClassic Bool, isPrimaryUser Bool,
+        //   overrideAppearance Bool, trustedSkinFlag String, profileHash String.
+        //
+        // Run with `cargo test -p bedrock-protocol cue_sample_playerlist_hex -- --nocapture`
+        // to see the complete hex dump and field table.
+        let uuid = uuid_from_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+        let skin = SkinData::default_for(&uuid);
+        // Values mirroring a Session 1 login after the actorUniqueId fix:
+        // `actorUniqueId == actorRuntimeId == 1` (PHP `$player->getId()`),
+        // `xboxUserId` carries the Xbox id separately.
+        let packet = PlayerListPacket::with_additions(vec![PlayerListEntry::addition(
+            uuid,
+            1,
+            "Steve",
+            skin,
+            "2535412345678901",
+        )]);
+
+        let mut writer = Writer::new();
+        writer.write_var_u32(packet.packet_id());
+        packet.encode_payload(&mut writer);
+        let bytes = writer.into_bytes();
+        let bytes: &[u8] = &bytes;
+
+        println!("=== CUE-SAMPLE PlayerListPacket (0x3F) ===");
+        println!("packet_id=0x{:02X} wire_len={}", packet.packet_id(), bytes.len());
+        println!("uuid={} actorUniqueId=1 username='Steve' xboxUserId='2535412345678901'", uuid_to_string(&uuid));
+        println!("skin: skin_id='pm_rust_steve' resource_patch={} image={}x{} ({} bytes) cape=0x0 geometry_version='{}' fullSkinId='{}' arm_size=1 skin_color=0x{:08X} trusted='true' profile_hash=''", crate::packets::player_list::STEVE_RESOURCE_PATCH, 64, 32, 64*32*4, crate::packets::player_list::STEVE_GEOMETRY_VERSION, uuid_to_string(&uuid), 0xFFFFC890u32);
+        println!("--- hex dump (offset: bytes) ---");
+        for (index, chunk) in bytes.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
+            println!("{:04X}: {}", index * 16, hex.join(" "));
+        }
+        println!("--- end hex dump ({} bytes) ---", bytes.len());
+
+        // The packet itself (payload only, without the 0x3F header) must
+        // decode back to the same value with no trailing bytes: this is the
+        // invariant the Bedrock client relies on — a length mismatch here
+        // makes the client discard `PlayerList` (and, in the same batch,
+        // the preceding `StartGame`) silently.
+        let mut payload_writer = Writer::new();
+        packet.encode_payload(&mut payload_writer);
+        let payload = payload_writer.into_bytes();
+        let payload: &[u8] = &payload;
+        let mut reader = Reader::new(payload);
+        let decoded = PlayerListPacket::decode_payload(&mut reader).expect("CUE-SAMPLE PlayerList must decode");
+        assert_eq!(decoded, packet);
+        assert_eq!(reader.remaining(), 0, "wire must not have trailing bytes");
+        assert_eq!(decoded.entries[0].uuid, uuid);
+        assert_eq!(decoded.entries[0].actor_unique_id, 1);
+    }
+
+    #[test]
     fn removal_roundtrips() {
         let uuid = [7u8; 16];
         let packet = PlayerListPacket::removal(uuid);

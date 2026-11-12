@@ -15,9 +15,11 @@
 //! `nbt.rs`) and from the server loop (`session.rs`, `JavaServer`,
 //! `ModernChunk` live outside it and consume it via `pub use` only).
 
+pub mod bossbar;
 pub mod modern;
 pub mod nbt;
 pub mod protocol;
+pub mod scoreboard;
 
 pub use modern::ModernProfile;
 pub use protocol as javabridge_protocol;
