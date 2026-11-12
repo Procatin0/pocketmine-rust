@@ -347,13 +347,17 @@ impl ServerHooks for CoreHooks {
         player.pitch = snapshot.pitch;
         player.gamemode = snapshot.gamemode.max(0) as u32;
         player.is_virtual = true;
-        player.display_name = bedrock_view_display_name(&snapshot.name, true);
+        // The Java player's name already includes its `.` prefix
+        // (`java_bridge::display`), so every announce/feedback line uses the
+        // same name the client sees in TAB, chat and nametags.
+        let display_name = bedrock_view_display_name(&snapshot.name, true);
+        player.display_name = display_name.clone();
         self.manager.registry().upsert(player.clone());
         // Let Bedrock viewers see the join immediately (spawn packet).
         self.manager.poll_virtual_players();
         if let Some(plugins) = self.manager.plugin_manager() {
             let mut event =
-                PlayerJoinEvent::new(player, format!("{} joined the game", snapshot.name));
+                PlayerJoinEvent::new(player, format!("{display_name} joined the game"));
             match plugins.dispatch_event_sync(&mut event) {
                 Ok(actions) => {
                     self.manager.apply_actions(&actions, 0);
@@ -368,9 +372,10 @@ impl ServerHooks for CoreHooks {
         let player = self.manager.registry().get(name);
         self.manager.registry().remove_if_virtual(name);
         if let Some(player) = player {
+            let display_name = bedrock_view_display_name(name, true);
             if let Some(plugins) = self.manager.plugin_manager() {
                 let mut event =
-                    PlayerQuitEvent::new(player, format!("{} left the game", name), "left");
+                    PlayerQuitEvent::new(player, format!("{display_name} left the game"), "left");
                 if let Err(error) = plugins.dispatch_event_sync(&mut event) {
                     tracing::warn!("Java PlayerQuitEvent failed: {error}");
                 }
@@ -443,15 +448,80 @@ impl ServerHooks for CoreHooks {
     }
 
     fn break_block(&self, x: i32, y: i32, z: i32) -> bool {
+        let previous = self.manager.world().block_at(x, y, z);
+        // PM `World::useBreakOn`: `broadcastPacketToViewers(new
+        // LevelEventPacket(PARTICLE_DESTROY_BLOCK, $block->getTypeId()))`
+        // before the edit, so Bedrock viewers see a Java break's particles.
+        // The `changedBlocks` flush only carries the `UpdateBlock`.
+        self.manager.broadcast_level_event(
+            bedrock_protocol::packets::level_event::LEVEL_EVENT_PARTICLE_DESTROY_BLOCK,
+            previous as i32,
+            x,
+            y,
+            z,
+        );
         self.manager.world().set_block(x, y, z, block_id::AIR)
     }
 
     fn place_block(&self, x: i32, y: i32, z: i32, network_id: u32) -> bool {
-        self.manager.world().set_block(x, y, z, network_id)
+        if !self.manager.world().set_block(x, y, z, network_id) {
+            return false;
+        }
+        // PM `World::useItemOn` ends with `addSound(new BlockPlaceSound($placed))`:
+        // Bedrock viewers must hear a block placed by a Java player too.
+        self.manager.broadcast_sound(
+            bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_PLACE,
+            network_id as i32,
+            x,
+            y,
+            z,
+        );
+        true
+    }
+
+    /// `World::useItemOn()` for a Java right click: `Block::onInteract()` runs
+    /// before placement, so a lever toggles instead of getting a block placed
+    /// against it. A consumed click returns true and the session stops there.
+    fn interact_block(&self, x: i32, y: i32, z: i32) -> bool {
+        let world = self.manager.world();
+        let current = world.block_at(x, y, z);
+        let Some(interaction) = world.interact_block(x, y, z) else {
+            return false;
+        };
+        if interaction.new_state != current {
+            if interaction.door_sound {
+                // PM `FenceGate::onInteract` -> `DoorSound` ->
+                // `LevelEventPacket(SOUND_DOOR)`.
+                self.manager.broadcast_level_event(
+                    bedrock_protocol::packets::level_event::LEVEL_EVENT_SOUND_DOOR,
+                    0,
+                    x,
+                    y,
+                    z,
+                );
+            } else {
+                let sound = if interaction.powered {
+                    bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_POWER_ON
+                } else {
+                    bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_POWER_OFF
+                };
+                self.manager.broadcast_sound(sound, -1, x, y, z);
+            }
+        }
+        true
     }
 
     fn block_network_id(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         Some(self.manager.world().block_at(x, y, z))
+    }
+
+    /// Bedrock block for a Java creative item: item id -> item name (the
+    /// per-version `items.json` table) -> canonical block state -> network id
+    /// (`block_states`). Before this, `placeBlock` always sent stone, so every
+    /// Java placement reached Bedrock players as stone.
+    fn block_network_id_for_item(&self, protocol: i32, item_id: i32) -> Option<u32> {
+        let name = bedrock_world::block_states::java_item_block_name(protocol, item_id)?;
+        bedrock_world::java_chunk::ModernChunk::bedrock_network_id_for_name(&name)
     }
 
     fn stone_network_id(&self) -> u32 {
@@ -604,6 +674,28 @@ mod tests {
             0,
             "flat".to_string(),
         )
+    }
+
+    /// A Java right click goes through `Block::onInteract()` first: the lever
+    /// toggles and consumes the click, plain blocks are not interactive.
+    #[test]
+    fn a_java_right_click_toggles_a_lever() {
+        let hooks = core_hooks();
+        let world = hooks.manager.world().clone();
+        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        assert!(world.set_block(2, 80, 3, lever));
+
+        assert!(hooks.interact_block(2, 80, 3));
+        let on = bedrock_world::block_states::with_property(lever, "open_bit", "true").unwrap();
+        assert_eq!(world.block_at(2, 80, 3), on);
+
+        // A second click switches it back off.
+        assert!(hooks.interact_block(2, 80, 3));
+        assert_eq!(world.block_at(2, 80, 3), lever);
+
+        // Stone has no `onInteract()`: the click falls through to placement.
+        assert!(world.set_block(5, 80, 5, block_id::STONE));
+        assert!(!hooks.interact_block(5, 80, 5));
     }
 
     /// Converted Java payloads are cached per column + world version:

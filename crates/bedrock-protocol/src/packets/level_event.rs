@@ -27,6 +27,8 @@ pub const LEVEL_EVENT_BLOCK_START_BREAK: i32 = 3600;
 pub const LEVEL_EVENT_BLOCK_STOP_BREAK: i32 = 3601;
 /// `LevelEvent::BLOCK_BREAK_SPEED`.
 pub const LEVEL_EVENT_BLOCK_BREAK_SPEED: i32 = 3602;
+/// `LevelEvent::SOUND_DOOR` (PM `DoorSound`, played by fence gates).
+pub const LEVEL_EVENT_SOUND_DOOR: i32 = 1003;
 
 /// Encodes a `LevelEventPacket` payload with the exact reference wire
 /// (eventId zigzag varint, position 3x f32 LE, eventData zigzag varint).

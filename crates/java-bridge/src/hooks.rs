@@ -263,7 +263,23 @@ pub trait ServerHooks: Send + Sync {
     fn place_block(&self, _x: i32, _y: i32, _z: i32, _network_id: u32) -> bool {
         false
     }
+    /// `Block::onInteract()` for the block a Java player right-clicked
+    /// (`World::useItemOn`): buttons, levers and fence gates. Returning true
+    /// consumes the click, so no block is placed.
+    fn interact_block(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        false
+    }
     fn block_network_id(&self, _x: i32, _y: i32, _z: i32) -> Option<u32> {
+        None
+    }
+    /// Bedrock network id for the block a Java creative item id carries
+    /// (`placeBlock` uses it instead of the old hardcoded stone).
+    ///
+    /// The Java client never sends the item it places, so the session
+    /// remembers the creative hotbar slots (`set_creative_slot`) and asks
+    /// this hook to translate the held item id into a Bedrock block.
+    /// `None` falls back to `stone_network_id`.
+    fn block_network_id_for_item(&self, _protocol: i32, _item_id: i32) -> Option<u32> {
         None
     }
     /// Bedrock network id of stone (default creative placement).

@@ -247,6 +247,66 @@ Test-NetConnection -ComputerName localhost -Port 25565
   **`server.log`** en el directorio de datos.
 - `debug.level: 1` en `pocketmine.yml` (`> 1` activa debug, p. ej.
   `Server unique id` / `Machine unique id`).
+- **Hilo escritor** (`MainLoggerThread`): el formateo se hace en el hilo
+  que loguea, pero la escritura a consola y a `server.log` la hace un
+  unico hilo con una cola acotada (`LOG_QUEUE_CAP = 8192`). Antes cada
+  `info!` escribia en stdout (sincrono en Windows) y en el fichero bajo
+  un mutex, en el hilo del juego: en rafagas (romper bloques rapido, con
+  `level_event` / `broadcast_block_change` / `world.set_block` por
+  bloque) metia pausas de 100-160 ms en el tick, retrasaba el sonido y
+  las particulas de la rotura y acababa tirando la conexion Bedrock. Si
+  la cola se llena, la linea se descarta y se cuenta (`LOG_DROPPED`) en
+  vez de bloquear. `/stop` y `syncFlushBuffer` piden un `Flush` al hilo.
+- **Diagnóstico de lag (`[lag]`)**: cada segundo se escribe una línea con
+  avg/max por etapa:
+
+  ```
+  [lag] tick=50.1/52.0ms(n=20) body=6.2/44.0ms(n=20) session=1.4/12.0ms(n=20)
+        flush=0.5/9.0ms(n=20) send=0.2/6.0ms(n=48) java=3.9/31.0ms(n=20)
+        dispatch=1.9/60.0ms(n=20) packets=1.6/58.0ms(n=20) actions=0.2/3.0ms(n=20)
+        chunk=0.3/20.0ms(n=4) drain=0.4/2.0ms(n=20) poll=0.1/2.0ms(n=20)
+  ```
+
+  - `tick` es el periodo real del bucle (debe ser ~50 ms) y `body` lo que
+    tarda una iteración completa.
+  - `session` = `SessionManager::tick()` (streaming de chunks + poll de
+    bloques), `flush`+`send` = volcado a los data channels, `java` = tick
+    del conector Java.
+  - `dispatch` es un lote entrante completo; dentro, `packets` (parseo y
+    manejadores, incluido el evento PHP de `BlockBreakEvent`) y `actions`
+    (aplicar lo que encolaron: `set_block`, sonidos, partículas).
+  - `send` mide cada `DataChannel::send` (SCTP); por encima de 20 ms
+    aparece también un `[:WebRTC] slow data channel send` en WARN.
+  - `lock` es la espera por el lock de sesiones en `dispatch` y `ipc` el
+    tiempo total de los eventos de plugin (`dispatch_event_sync`, un
+    roundtrip bloqueante al proceso PHP) en el último segundo.
+  - Lectura rápida: si `packets`/`dispatch` mandan, el retraso es de
+    lógica (evento PHP); si `send`/`flush` mandan, es el transporte; si
+    `tick` sube a 60-200 ms con `body` igual de alto, el bucle se está
+    atrasando y hay que mirar la etapa más grande y `chunk`.
+
+- **Lotes lentos (`[lag-slow]`)**: cada lote entrante que pase de 20 ms
+  deja una línea con su desglose, y `apply_actions` otra si él solo pasa
+  de 20 ms:
+
+  ```
+  [lag-slow] batch=173.4ms npk=24 lock=0.2ms packets=120.1ms actions=48.3ms ipc=96.4ms/4 slowest=41.2ms/0x90
+  [lag-slow] actions=6 total=48.3ms slowest=44.9ms: SetBlock { world: "world", x: 968, ... }
+  ```
+
+  - `npk` = paquetes del lote; `slowest` = el paquete más caro y su id
+    (`0x90` `PlayerAuthInput`, `0x14` `PlayerAction`, `0x1E`
+    `InventoryTransaction`, `0x93` `ItemStackRequest`).
+  - `ipc=Nms/K` son los eventos de plugin disparados dentro del lote:
+    si `ipc` se come `packets`, el plugin (no el servidor) es el coste.
+  - Si `batch` es grande pero `packets + actions` es pequeño, el tiempo
+    se fue en el lock, en `encode_outgoing` o en el planificador del
+    sistema (el hilo no corrió).
+
+- **Rutas calientes en DEBUG**: `auth_input`, `block_actions`,
+  `break handler *`, `[SetBlock]`, `level_event`,
+  `broadcast_block_change`, `poll_block_changes` y `world.set_block`
+  solo aparecen con `POCKETMINE_LOG_LEVEL=debug` (o `debug.level`).
 - Archivado: ficheros ≥ **32 MiB** se renombran a
   `log_archive/` con la cabecera
   `--- Starting new log file - old log file archived as {name} ---`,

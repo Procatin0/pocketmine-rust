@@ -106,9 +106,10 @@ pub fn online_count(hooks: &dyn ServerHooks) -> usize {
 
 /// TAB targets: every online player, including the observer itself.
 ///
-/// Names are *display* names for this Java observer (Floodgate-style, see
-/// [`crate::display`]): Bedrock snapshots become `"." + raw`, Java snapshots
-/// stay verbatim. The lowercase key is also the display name's, so
+/// Names are *display* names for this Java observer (see [`crate::display`]):
+/// Bedrock snapshots stay verbatim, Java snapshots already carry their `"."`
+/// prefix (`java_player_name`), on Java just like on Bedrock. The lowercase
+/// key is also the display name's, so
 /// `sync_tab` diffing and `offline_uuid(display)` stay coherent with
 /// `spawn_entity` / nametag, which are built from the same `EntityTarget`.
 pub fn tab_targets(hooks: &dyn ServerHooks, extra: Option<&[TabTarget]>) -> Vec<TabTarget> {
@@ -137,8 +138,9 @@ pub fn tab_targets(hooks: &dyn ServerHooks, extra: Option<&[TabTarget]>) -> Vec<
 /// Entity targets for one observer: everyone but itself, chunk-gated,
 /// Bedrock yaw/pitch converted to Java. Bedrock snapshots win over
 /// virtual ones with the same raw name (same rule as `sync_virtuals_locked`).
-/// `name` is the Java-view display name (Bedrock -> `"." + raw`, Java verbatim),
-/// so `spawn_entity` UUID, TAB UUID and nametag all derive from one string.
+/// `name` is the Java-view display name (Bedrock verbatim, Java players keep
+/// their `"."` prefix), so `spawn_entity` UUID, TAB UUID and nametag all derive
+/// from one string.
 pub fn entity_targets_for(
     _hooks: &dyn ServerHooks,
     observer: &JavaSession,
@@ -743,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_targets_leave_both_bedrock_and_java_verbatim_for_java() {
+    fn tab_targets_keep_bedrock_verbatim_and_java_prefixed() {
         let hooks = Stub {
             changes: Mutex::new(vec![]),
             snapshots: vec![
@@ -778,7 +780,9 @@ mod tests {
         let targets = tab_targets(&hooks, None);
         let mut names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
         names.sort();
-        assert_eq!(names, vec!["Procatin0".to_string(), "Steve".to_string()]);
+        // Java players are named with their `.` prefix everywhere (TAB,
+        // nametags, chat); Bedrock players stay verbatim.
+        assert_eq!(names, vec![".Procatin0".to_string(), "Steve".to_string()]);
     }
 
     #[test]

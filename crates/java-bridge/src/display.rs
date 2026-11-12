@@ -10,55 +10,73 @@
 //!   Java viewers see `Procatin0` as `Procatin0`.
 //!   Scores, nametags, TAB entries, and chat for Bedrock players are always verbatim.
 //!
-//! * **Java players (virtual/guest) receive the `.` prefix when seen on Bedrock**:
-//!   Bedrock viewers see Java player `sunkiler008` as `.sunkiler008`.
-//!   This appears in Bedrock TAB (`PlayerListPacket`), nametag metadata (`AddPlayerPacket`
-//!   and `SetActorDataPacket`), and Bedrock chat/scoreboard.
+//! * **Java players (virtual/guest) are named with the `.` prefix from the
+//!   start**, on every surface: their canonical display name already carries
+//!   it, so Bedrock TAB (`PlayerListPacket`), nametag metadata
+//!   (`AddPlayerPacket` / `SetActorDataPacket`), Bedrock and Java chat,
+//!   scoreboards, Java TAB and Java nametags all agree (`sunkiler008` is
+//!   always shown as `.sunkiler008`).
 //!
-//! * **When viewed on Java**, Java players see raw names (e.g. `sunkiler008`).
-//!
-//! Single source of truth: [`JAVA_PREFIX_IN_BEDROCK`].
+//! Single source of truth: [`JAVA_PREFIX_IN_BEDROCK`] and
+//! [`java_player_name`] (idempotent, so applying it twice never yields `..`).
 
-/// Prefix added to Java player names when viewed on Bedrock (inverse of GeyserMC/Floodgate).
+/// Prefix carried by every Java player's name (inverse of GeyserMC/Floodgate).
 pub const JAVA_PREFIX_IN_BEDROCK: &str = ".";
 
 /// Deprecated / compatibility alias: Bedrock players never have a prefix in Java.
 pub const BEDROCK_PREFIX_IN_JAVA: &str = "";
+
+/// Canonical name of a Java player: the wire username with the `.` prefix.
+///
+/// Idempotent: an already-prefixed (or empty) name is returned unchanged, so
+/// every surface can treat the player "as if the name already included the
+/// prefix from the start" without producing `.` `.` `name`.
+pub fn java_player_name(raw_name: &str) -> String {
+    if raw_name.is_empty() || raw_name.starts_with(JAVA_PREFIX_IN_BEDROCK) {
+        raw_name.to_string()
+    } else {
+        format!("{JAVA_PREFIX_IN_BEDROCK}{raw_name}")
+    }
+}
 
 /// Display name of a Bedrock player as seen by a Java viewer (verbatim, native platform).
 pub fn bedrock_to_java_display(raw_name: &str) -> String {
     raw_name.to_string()
 }
 
-/// Display name of a Java player as seen by a Bedrock viewer (prefixed with ".").
+/// Display name of a Java player (prefixed with ".").
 pub fn java_to_bedrock_display(raw_name: &str) -> String {
-    format!("{JAVA_PREFIX_IN_BEDROCK}{raw_name}")
+    java_player_name(raw_name)
 }
 
 /// Observer-relative display name for one target.
 ///
-/// `is_bedrock` is `!PlayerSnapshot::is_virtual` (live Bedrock session);
-/// `viewer_is_java` is the observer platform. Only
-/// `!is_bedrock && !viewer_is_java` (Java player viewed by Bedrock) carries the "." prefix.
-pub fn display_name(raw_name: &str, is_bedrock: bool, viewer_is_java: bool) -> String {
-    if !is_bedrock && !viewer_is_java {
-        java_to_bedrock_display(raw_name)
-    } else {
+/// Bedrock players are always verbatim; Java players always carry their `.`
+/// prefix, regardless of who is looking, because the prefix is part of their
+/// canonical name.
+pub fn display_name(raw_name: &str, is_bedrock: bool, _viewer_is_java: bool) -> String {
+    if is_bedrock {
         raw_name.to_string()
+    } else {
+        java_player_name(raw_name)
     }
 }
 
 /// Display name for a Java viewer from a snapshot flag (`is_virtual`).
-/// Java viewers see both Bedrock and Java players verbatim.
-pub fn java_view_display_name(raw_name: &str, _is_virtual: bool) -> String {
-    raw_name.to_string()
+/// Bedrock players stay verbatim; Java players keep their `.` prefix.
+pub fn java_view_display_name(raw_name: &str, is_virtual: bool) -> String {
+    if is_virtual {
+        java_player_name(raw_name)
+    } else {
+        raw_name.to_string()
+    }
 }
 
 /// Display name for a Bedrock viewer.
 /// Java players (`is_virtual == true`) get the "." prefix; Bedrock players are verbatim.
 pub fn bedrock_view_display_name(raw_name: &str, is_virtual: bool) -> String {
     if is_virtual {
-        java_to_bedrock_display(raw_name)
+        java_player_name(raw_name)
     } else {
         raw_name.to_string()
     }
@@ -164,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn java_prefix_in_bedrock_is_dot_and_only_for_java_in_bedrock() {
+    fn java_prefix_is_part_of_the_name_for_every_viewer() {
         assert_eq!(JAVA_PREFIX_IN_BEDROCK, ".");
         assert_eq!(java_to_bedrock_display("sunkiler008"), ".sunkiler008");
         assert_eq!(bedrock_to_java_display("Procatin0"), "Procatin0");
@@ -174,15 +192,20 @@ mod tests {
         assert_eq!(display_name("Procatin0", true, false), "Procatin0"); // seen by Bedrock
         assert_eq!(display_name("Procatin0", true, true), "Procatin0");  // seen by Java
 
-        // Java target ("sunkiler008", is_bedrock=false):
+        // Java target ("sunkiler008", is_bedrock=false): the prefix is part
+        // of the name, so it never disappears from any surface.
         assert_eq!(display_name("sunkiler008", false, false), ".sunkiler008"); // seen by Bedrock
-        assert_eq!(display_name("sunkiler008", false, true), "sunkiler008");   // seen by Java
+        assert_eq!(display_name("sunkiler008", false, true), ".sunkiler008");  // seen by Java
 
         // View helpers:
         assert_eq!(java_view_display_name("Procatin0", false), "Procatin0");
-        assert_eq!(java_view_display_name("sunkiler008", true), "sunkiler008");
+        assert_eq!(java_view_display_name("sunkiler008", true), ".sunkiler008");
+        assert_eq!(java_view_display_name("sunkiler008", false), "sunkiler008");
         assert_eq!(bedrock_view_display_name("Procatin0", false), "Procatin0");
         assert_eq!(bedrock_view_display_name("sunkiler008", true), ".sunkiler008");
+        // Already-prefixed input is never prefixed twice.
+        assert_eq!(java_player_name(".sunkiler008"), ".sunkiler008");
+        assert_eq!(java_player_name(""), "");
     }
 
     #[test]
@@ -229,6 +252,6 @@ mod tests {
         assert_eq!(chat_line("Procatin0", true, false, "hola"), "<Procatin0> hola");
         assert_eq!(chat_line("Procatin0", true, true, "hola"), "<Procatin0> hola");
         assert_eq!(chat_line("sunkiler008", false, false, "hola"), "<.sunkiler008> hola");
-        assert_eq!(chat_line("sunkiler008", false, true, "hola"), "<sunkiler008> hola");
+        assert_eq!(chat_line("sunkiler008", false, true, "hola"), "<.sunkiler008> hola");
     }
 }

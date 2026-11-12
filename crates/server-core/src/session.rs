@@ -38,6 +38,11 @@ use bedrock_protocol::packets::player_auth_input::{
 use bedrock_protocol::packets::level_event::{
     level_event_wire as level_packet_wire, LEVEL_EVENT_BLOCK_START_BREAK,
     LEVEL_EVENT_BLOCK_STOP_BREAK, LEVEL_EVENT_PACKET_ID, LEVEL_EVENT_PARTICLE_DESTROY_BLOCK,
+    LEVEL_EVENT_SOUND_DOOR,
+};
+use bedrock_protocol::packets::level_sound_event::{
+    level_sound_event_wire, LEVEL_SOUND_EVENT_PACKET_ID, LEVEL_SOUND_PLACE, LEVEL_SOUND_POWER_OFF,
+    LEVEL_SOUND_POWER_ON,
 };
 use bedrock_protocol::packets::player_list::uuid_from_str;
 use bedrock_world::{block_id::AIR, FlatGenerator, WorldGenerator};
@@ -361,12 +366,11 @@ pub struct BreakHandlerState {
 pub struct OpenContainer {
     /// Client container id (10 = crafting table, 16 = anvil in BDS).
     pub window_id: u8,
-    /// Bedrock block container name (`minecraft:crafting_table`, ...).
-    pub name: String,
+    /// Bedrock `ContainerType` byte sent in `ContainerOpenPacket`
+    /// (`CONTAINER_TYPE_WORKBENCH`, `CONTAINER_TYPE_ANVIL`, ...).
+    pub container_type: u8,
     /// Block position of the container block.
     pub position: (i32, i32, i32),
-    /// Server-assigned dynamic container id.
-    pub unique_id: u32,
     /// Inventory kind: `crafting_table` or `anvil`.
     pub kind: String,
 }
@@ -928,6 +932,10 @@ impl PlayerSession {
                     .all()
                     .into_iter()
                     .map(|player| OnlinePlayer {
+                        display_name: java_bridge::display::bedrock_view_display_name(
+                            &player.name,
+                            player.is_virtual,
+                        ),
                         name: player.name,
                         position: (player.x, player.y, player.z),
                         gamemode: player.gamemode as i32,
@@ -942,6 +950,7 @@ impl PlayerSession {
         {
             players.push(OnlinePlayer {
                 name: self.username.clone(),
+                display_name: self.username.clone(),
                 position: (
                     self.position.x as f64,
                     self.position.y as f64,
@@ -1013,7 +1022,12 @@ impl PlayerSession {
         let Some(plugins) = self.plugins.clone() else {
             return Vec::new();
         };
-        match plugins.dispatch_event_sync(event) {
+        let ipc_started = std::time::Instant::now();
+        let result = plugins.dispatch_event_sync(event);
+        // Plugin events cross the process boundary synchronously, so their
+        // round-trip is charged to the caller (the packet or tick thread).
+        crate::metrics::ipc().record(ipc_started.elapsed());
+        match result {
             Ok(actions) => {
                 self.pending_actions.extend(actions.iter().cloned());
                 actions
@@ -1283,7 +1297,9 @@ impl PlayerSession {
                             "Failed to decode ItemStackRequestPacket from session {}: {}",
                             self.session_id, error
                         );
-                        Ok(Vec::new())
+                        // Reject the requests so the client rolls its
+                        // prediction back instead of diverging silently.
+                        Ok(self.item_stack_error_response(payload))
                     }
                 }
             }
@@ -2023,6 +2039,40 @@ impl PlayerSession {
     ///   `PlayStatusPacket::PLAYER_SPAWN` is queued right after that chunk.
     ///
     /// No-op until `RequestChunkRadius` set the view distance.
+    /// True when [`Self::do_chunk_requests`] would stream terrain to this
+    /// session (the manager uses it to warm payloads outside its lock).
+    pub fn wants_chunk_streaming(&self) -> bool {
+        self.view_distance_received
+            && (self.state == SessionState::PreSpawn || self.state == SessionState::InGame)
+    }
+
+    /// Columns the next [`Self::do_chunk_requests`] pass will stream.
+    ///
+    /// Generating a cold column costs ~18 ms, so the manager warms this list
+    /// in parallel *before* taking the sessions lock (see
+    /// [`SessionManager::drive_chunk_requests`]): while the payload tables were
+    /// built under the lock, every packet handler — a block break's particles
+    /// and sound included — waited behind them for 60-160 ms, which the client
+    /// also felt as lag and, under fast breaking, as a dropped connection.
+    pub fn next_chunk_columns(&self) -> Vec<(i32, i32)> {
+        if !self.chunk_load_queue.is_empty() {
+            return self
+                .chunk_load_queue
+                .iter()
+                .take(CHUNK_SENDING_PER_TICK)
+                .copied()
+                .collect();
+        }
+        let allowed_radius = self.chunk_radius.clamp(2, self.max_view_distance.max(2));
+        let curr_cx = (self.position.x.floor() as i32) >> 4;
+        let curr_cz = (self.position.z.floor() as i32) >> 4;
+        Self::select_chunks(allowed_radius, curr_cx, curr_cz)
+            .into_iter()
+            .filter(|chunk| !self.sent_chunks.contains(chunk))
+            .take(CHUNK_SENDING_PER_TICK)
+            .collect()
+    }
+
     pub fn do_chunk_requests(&mut self) -> Vec<OutgoingPacket> {
         if !self.view_distance_received {
             return Vec::new();
@@ -2416,7 +2466,7 @@ impl PlayerSession {
         // block actions) only appears when it rides a real interaction, so
         // log its length only when it changes — never per packet.
         if packet.input_data.len() != self.last_input_len {
-            info!(
+            debug!(
                 "auth_input tail len={} (was {})",
                 packet.input_data.len(),
                 self.last_input_len
@@ -2527,7 +2577,7 @@ impl PlayerSession {
                         .iter()
                         .map(|byte| format!("{:02x}", byte))
                         .collect();
-                    info!(
+                    debug!(
                         "block actions flagged but none decoded: input_data len={} hex[0..{}]={}",
                         input_data.len(),
                         preview_len,
@@ -2542,7 +2592,7 @@ impl PlayerSession {
             .iter()
             .map(|action| action.action_type.to_string())
             .collect();
-        info!("block_actions types={}", types.join(","));
+        debug!("block_actions types={}", types.join(","));
 
         self.apply_block_actions(actions);
     }
@@ -2631,7 +2681,7 @@ impl PlayerSession {
                             y,
                             z,
                         });
-                        info!(
+                        debug!(
                             "break handler started: ({},{},{}) speed/tick={:.4}",
                             x, y, z, break_speed
                         );
@@ -2960,6 +3010,12 @@ impl PlayerSession {
         if use_item.action_type != ACTION_CLICK_BLOCK {
             return;
         }
+        // PM `World::useItemOn()`: `$blockClicked->onInteract()` runs *before*
+        // item placement and consumes the click. Without this a right click on
+        // a button placed the held block next to it instead of pressing it.
+        if self.handle_block_interact(use_item) {
+            return;
+        }
         let block_id = if use_item.item_in_hand.block_runtime_id != 0 {
             use_item.item_in_hand.block_runtime_id
         } else {
@@ -2986,6 +3042,13 @@ impl PlayerSession {
         if self.world.block_at(x, y, z) != AIR {
             return;
         }
+        // PM `World::useItemOn` refuses the placement when the placed block's
+        // collision boxes intersect an entity (`getCollidingEntities`): without
+        // this a player could place a block inside themselves and get stuck.
+        if self.placement_blocked_by_entity(x, y, z, block_id) {
+            self.revert_predicted_placement(x, z);
+            return;
+        }
 
         // Cancellable plugin hook when a listener exists. `fire_event` is a
         // no-op without a plugin manager, so vanilla placement also works
@@ -3006,12 +3069,7 @@ impl PlayerSession {
             );
             self.fire_event(&mut event);
             if event.cancelled {
-                let chunk = (x >> 4, z >> 4);
-                if self.sent_chunks.remove(&chunk) {
-                    self.pending_outgoing.push(OutgoingPacket::LevelChunk(
-                        self.create_chunk_packet(chunk.0, chunk.1),
-                    ));
-                }
+                self.revert_predicted_placement(x, z);
                 return;
             }
         }
@@ -3022,6 +3080,17 @@ impl PlayerSession {
             y,
             z,
             block_id,
+        });
+        // PM `World::addSound(new BlockPlaceSound($placed))`: the client only
+        // plays the block's place sound when the server broadcasts
+        // `LevelSoundEventPacket(PLACE, blockId)`. Without it the block appeared
+        // with no sound at all.
+        self.pending_actions.push(PluginAction::BroadcastSound {
+            sound: LEVEL_SOUND_PLACE.to_string(),
+            extra_data: block_id as i32,
+            x,
+            y,
+            z,
         });
 
         if self.gamemode == 0 {
@@ -3037,6 +3106,145 @@ impl PlayerSession {
                 }
             }
         }
+    }
+
+    /// PM `Block::onInteract()` for the blocks the reference gives one: buttons
+    /// (`Button::onInteract`: press, then a scheduled update releases it),
+    /// levers (`Lever::onInteract`: toggle) and fence gates
+    /// (`FenceGate::onInteract`: open/close).
+    ///
+    /// Returns true when the click was consumed — either because the block
+    /// changed, because it was already in the requested state, or because the
+    /// client's prediction was refused. Sneaking only skips the interaction
+    /// when the hand holds an item (`PlayerInteractEvent::setUseBlock($item->isNull())`
+    /// in `World::useItemOn`), so a gate can still be opened empty-handed.
+    fn handle_block_interact(&mut self, use_item: &UseItemData) -> bool {
+        let (x, y, z) = use_item.block_position;
+        let current = self.world.block_at(x, y, z);
+        if bedrock_world::block_states::interact(current).is_none() {
+            return false;
+        }
+        if self.is_sneaking && use_item.item_in_hand.network_id != 0 {
+            return false;
+        }
+
+        let has_interact_listeners = self
+            .plugins
+            .as_ref()
+            .map(|plugins| plugins.has_listeners("PlayerInteractEvent"))
+            .unwrap_or(false);
+        if has_interact_listeners {
+            let mut event = PlayerInteractEvent::new(
+                self.player_context(),
+                self.world.name.clone(),
+                x,
+                y,
+                z,
+                PlayerInteractEvent::ACTION_RIGHT_CLICK,
+            );
+            self.fire_event(&mut event);
+            if event.cancelled {
+                // PM: a cancelled `PlayerInteractEvent` makes `useItemOn`
+                // return false without placing anything.
+                return false;
+            }
+        }
+
+        // PM `onInteract()` edits the world inline (`World::setBlock`), which
+        // also schedules a pressed button's release.
+        let Some(interaction) = self.world.interact_block(x, y, z) else {
+            return false;
+        };
+        if interaction.new_state == current {
+            // Already pressed/activated: PM's `Button::onInteract` still
+            // returns true, so the click never reaches the item.
+            return true;
+        }
+
+        if interaction.door_sound {
+            // PM `FenceGate::onInteract` -> `DoorSound` ->
+            // `LevelEventPacket(SOUND_DOOR)` at the block itself.
+            self.pending_actions.push(PluginAction::BroadcastLevelEvent {
+                event_id: LEVEL_EVENT_SOUND_DOOR,
+                event_data: 0,
+                x,
+                y,
+                z,
+            });
+        } else {
+            let sound = if interaction.powered {
+                LEVEL_SOUND_POWER_ON
+            } else {
+                LEVEL_SOUND_POWER_OFF
+            };
+            self.pending_actions.push(PluginAction::BroadcastSound {
+                sound: sound.to_string(),
+                extra_data: -1,
+                x,
+                y,
+                z,
+            });
+        }
+        true
+    }
+
+    /// Undoes the block this client has already predicted (a refused placement):
+    /// resending the column makes the ghost block disappear, exactly like PM
+    /// (which never lets the client keep a placement the server rejected).
+    fn revert_predicted_placement(&mut self, x: i32, z: i32) {
+        let chunk = (x >> 4, z >> 4);
+        if self.sent_chunks.remove(&chunk) {
+            self.pending_outgoing.push(OutgoingPacket::LevelChunk(
+                self.create_chunk_packet(chunk.0, chunk.1),
+            ));
+        }
+    }
+
+    /// PM `World::useItemOn`: the placement is refused when an entity's
+    /// bounding box intersects the block being placed, i.e.
+    /// `count($world->getCollidingEntities($collisionBox)) > 0`.
+    ///
+    /// The canonical state table carries no collision geometry, so passable
+    /// blocks are recognised by name and everything else is treated as a solid
+    /// cell (conservative: it refuses rather than letting a player stand inside
+    /// a newly placed block).
+    fn placement_blocked_by_entity(&self, x: i32, y: i32, z: i32, block_id: u32) -> bool {
+        const HALF_WIDTH: f64 = 0.3; // player hitbox is 0.6 x 1.8
+        const HEIGHT: f64 = 1.8;
+
+        let name = bedrock_world::block_states::state_name(block_id).unwrap_or("air");
+        if !bedrock_world::block_states::has_collision(name) {
+            return false;
+        }
+
+        let (cell_min_x, cell_max_x) = (x as f64, x as f64 + 1.0);
+        let (cell_min_y, cell_max_y) = (y as f64, y as f64 + 1.0);
+        let (cell_min_z, cell_max_z) = (z as f64, z as f64 + 1.0);
+        let intersects = |px: f64, py: f64, pz: f64| {
+            let (min_x, max_x) = (px - HALF_WIDTH, px + HALF_WIDTH);
+            let (min_y, max_y) = (py, py + HEIGHT);
+            let (min_z, max_z) = (pz - HALF_WIDTH, pz + HALF_WIDTH);
+            min_x < cell_max_x
+                && max_x > cell_min_x
+                && min_y < cell_max_y
+                && max_y > cell_min_y
+                && min_z < cell_max_z
+                && max_z > cell_min_z
+        };
+
+        if intersects(
+            self.position.x as f64,
+            self.position.y as f64,
+            self.position.z as f64,
+        ) {
+            return true;
+        }
+        self.registry.as_ref().is_some_and(|registry| {
+            registry
+                .all()
+                .iter()
+                .any(|player| intersects(player.x, player.y, player.z))
+        })
     }
 
 /// Resolves a Bedrock block runtime id from a numeric item network id.
@@ -3094,55 +3302,59 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
     // -----------------------------------------------------------------
 
     /// Opens the crafting table at `(x, y, z)` and sends
-    /// `ContainerOpenPacket` (0x2E, window 10, `minecraft:crafting_table`).
+    /// `ContainerOpenPacket` (0x2E, window 10, workbench container type).
     pub fn open_crafting_table(&mut self, position: (i32, i32, i32)) -> Vec<OutgoingPacket> {
-        let unique_id = self.next_container_id();
+        let container_type = crate::packets_wire::CONTAINER_TYPE_WORKBENCH;
         self.open_container = Some(OpenContainer {
             window_id: 10,
-            name: "minecraft:crafting_table".to_string(),
+            container_type,
             position,
-            unique_id,
             kind: "crafting_table".to_string(),
         });
         vec![OutgoingPacket::RawWire(crate::packets_wire::container_open_wire(
             10,
-            "minecraft:crafting_table",
+            container_type,
             position,
-            unique_id,
+            crate::packets_wire::BLOCK_CONTAINER_ACTOR_ID,
         ))]
     }
 
-    /// Opens the anvil at `(x, y, z)`: window 16, `minecraft:anvil`.
+    /// Opens the anvil at `(x, y, z)`: window 16, anvil container type.
     pub fn open_anvil(&mut self, position: (i32, i32, i32)) -> Vec<OutgoingPacket> {
-        let unique_id = self.next_container_id();
+        let container_type = crate::packets_wire::CONTAINER_TYPE_ANVIL;
         self.open_container = Some(OpenContainer {
             window_id: 16,
-            name: "minecraft:anvil".to_string(),
+            container_type,
             position,
-            unique_id,
             kind: "anvil".to_string(),
         });
         vec![OutgoingPacket::RawWire(crate::packets_wire::container_open_wire(
             16,
-            "minecraft:anvil",
+            container_type,
             position,
-            unique_id,
+            crate::packets_wire::BLOCK_CONTAINER_ACTOR_ID,
         ))]
-    }
-
-    fn next_container_id(&self) -> u32 {
-        // Deterministic per-session id: BDS hands out incrementing ids, the
-        // tests only need uniqueness within the session.
-        10_000 + (self.session_id as u32 % 10_000)
     }
 
     /// Handles `ContainerClosePacket` (0x2F): returns crafting/anvil inputs
     /// to the main inventory and resyncs it.
     pub fn handle_container_close(
         &mut self,
-        _packet: bedrock_protocol::packets::container_close::ContainerClosePacket,
+        packet: bedrock_protocol::packets::container_close::ContainerClosePacket,
     ) -> Vec<OutgoingPacket> {
         let Some(container) = self.open_container.take() else {
+            // The player inventory screen (window 0) is opened directly by
+            // `handle_interact`; the client still expects its close to be
+            // acknowledged, or it refuses to open another window later.
+            if packet.window_id as u32 == WINDOW_ID_INVENTORY {
+                return vec![OutgoingPacket::RawWire(
+                    crate::packets_wire::container_close_wire(
+                        packet.window_id,
+                        packet.container_type,
+                        false,
+                    ),
+                )];
+            }
             return Vec::new();
         };
         let drops = match container.kind.as_str() {
@@ -3159,50 +3371,108 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
         }
         let mut out = self.resync_inventory();
         out.push(OutgoingPacket::RawWire(
-            crate::packets_wire::container_close_wire(container.window_id, false),
+            crate::packets_wire::container_close_wire(
+                container.window_id,
+                container.container_type,
+                false,
+            ),
         ));
         out
     }
 
     /// Handles `InteractPacket` (0x21): `ACTION_OPEN_INVENTORY` (action 6)
-    /// resyncs the player inventory screen; other actions are ignored.
+    /// opens the player inventory screen; other actions are ignored.
+    ///
+    /// Since 1.16 the client waits for `ContainerOpenPacket` before showing
+    /// *any* container screen, its own inventory included (Mojang
+    /// "Server Auth Inventory / Item Stack packets disabled" guide), and BDS
+    /// does not re-send `InventoryContentPacket` when that screen opens. So
+    /// the open packet is what was missing: without it the inventory button
+    /// did nothing, in creative as much as in survival.
     pub fn handle_interact(
         &mut self,
         packet: bedrock_protocol::packets::interact::InteractPacket,
     ) -> Vec<OutgoingPacket> {
-        if packet.action == bedrock_protocol::packets::interact::ACTION_OPEN_INVENTORY {
-            self.resync_inventory()
-        } else {
-            Vec::new()
+        if packet.action != bedrock_protocol::packets::interact::ACTION_OPEN_INVENTORY {
+            return Vec::new();
         }
+        let mut out = vec![OutgoingPacket::RawWire(crate::packets_wire::container_open_wire(
+            WINDOW_ID_INVENTORY as u8,
+            crate::packets_wire::CONTAINER_TYPE_INVENTORY,
+            (0, 0, 0),
+            // `ContainerOpenPacket::entityInv(..., $player->getId())`: the
+            // screen belongs to the player entity itself.
+            self.entity_runtime_id as i64,
+        ))];
+        // The server owns the contents, so re-send them for window 0 (the
+        // id the open packet uses); harmless when the client already has
+        // them and needed after creative catalog clicks.
+        out.extend(self.resync_inventory());
+        out
     }
 
     /// Handles `ItemStackRequestPacket` (0x93), answers with
-    /// `ItemStackResponsePacket` (0x94) plus inventory slot updates.
+    /// `ItemStackResponsePacket` (0x94) plus inventory slot updates, one
+    /// response per request (the packet may batch several).
     pub fn handle_item_stack_request(
         &mut self,
         packet: bedrock_protocol::packets::item_stack_request::ItemStackRequestPacket,
     ) -> Vec<OutgoingPacket> {
         let is_creative = self.gamemode == 1;
-        let outcome = crate::crafting::apply_item_stack_request(
-            &mut self.inventory,
-            crate::crafting::manager(),
-            &packet,
-            is_creative,
-        );
-        let mut out = vec![OutgoingPacket::RawWire(crate::packets_wire::item_stack_response_wire(
-            &outcome.response,
-        ))];
-        // Tell the client the final state of every slot we touched.
-        for changed in &outcome.changed {
-            out.push(OutgoingPacket::RawWire(inventory_slot_wire_for_slot(changed.slot, &changed.item)));
+        let mut out = Vec::new();
+        for request in &packet.requests {
+            let outcome = crate::crafting::apply_item_stack_request(
+                &mut self.inventory,
+                crate::crafting::manager(),
+                request,
+                is_creative,
+                crate::crafting::creative_catalog(),
+            );
+            out.push(OutgoingPacket::RawWire(crate::packets_wire::item_stack_response_wire(
+                &outcome.response,
+            )));
+            // Tell the client the final state of every slot we touched (the
+            // request names slots with container UI ids, not window ids).
+            for (slot, item) in &outcome.changed {
+                let Some((window, index)) =
+                    crate::crafting::ui_container_window(slot.container, slot.slot)
+                else {
+                    continue;
+                };
+                out.push(OutgoingPacket::RawWire(inventory_slot_wire(window, index, item)));
+            }
+            // Dropped items (Q key) become entities for plugin visibility; the
+            // packet contract only requires the inventory delta here.
+            let _ = outcome.dropped;
         }
-        // Dropped items (Q key) become entities for plugin visibility; the
-        // packet contract only requires the inventory delta here.
-        let _ = outcome.dropped;
         // Held-item changes must reach viewers.
         out.push(OutgoingPacket::RawWire(self.mob_equipment_wire()));
         out
+    }
+
+    /// Answers an undecodable `ItemStackRequestPacket` (0x93) with an error
+    /// result for every request id it could read, so the client drops its
+    /// prediction instead of being left waiting for a response.
+    pub fn item_stack_error_response(&self, payload: &[u8]) -> Vec<OutgoingPacket> {
+        let mut reader = Reader::new(payload);
+        let Ok(count) = reader.read_var_u32() else {
+            return Vec::new();
+        };
+        let mut responses = Vec::new();
+        for _ in 0..count.min(64) {
+            let Ok(request_id) = reader.read_var_i32() else {
+                break;
+            };
+            responses.push(crate::crafting::ItemStackResponseEntry::error(request_id));
+        }
+        if responses.is_empty() {
+            return Vec::new();
+        }
+        let mut writer = Writer::new();
+        writer.write_var_u32(bedrock_protocol::packets::item_stack_response::ItemStackResponsePacket::PACKET_ID);
+        bedrock_protocol::packets::item_stack_response::ItemStackResponsePacket::new(responses)
+            .encode_payload(&mut writer);
+        vec![OutgoingPacket::RawWire(writer.into_bytes().to_vec())]
     }
 
     /// `MobEquipmentPacket` (0x1F) for the held item in the main hand.
@@ -4088,6 +4358,8 @@ pub struct SessionManager {
     auto_save: std::sync::atomic::AtomicBool,
     data_dir: RwLock<Option<std::path::PathBuf>>,
     metrics: Arc<crate::metrics::TickMetrics>,
+    /// Per-stage latency samples reported once per second (`[lag]` lines).
+    lag: crate::metrics::LagProbe,
     permissions: Arc<crate::permission::PermissionManager>,
     virtuals: RwLock<HashMap<String, VirtualEntity>>,
     next_virtual_runtime: AtomicU64,
@@ -4164,6 +4436,7 @@ impl SessionManager {
             auto_save: std::sync::atomic::AtomicBool::new(true),
             data_dir: RwLock::new(None),
             metrics: Arc::new(crate::metrics::TickMetrics::new()),
+            lag: crate::metrics::LagProbe::default(),
             permissions: Arc::new(crate::permission::PermissionManager::new()),
             virtuals: RwLock::new(HashMap::new()),
             // Bedrock runtime ids are session ids (small ints); keep virtual
@@ -6632,6 +6905,11 @@ impl SessionManager {
     }
 
     /// Tick sampler consumed by `/tps`.
+    /// Per-stage latency probe (`[lag]` log lines once per second).
+    pub fn lag(&self) -> &crate::metrics::LagProbe {
+        &self.lag
+    }
+
     pub fn metrics(&self) -> &Arc<crate::metrics::TickMetrics> {
         &self.metrics
     }
@@ -6683,8 +6961,18 @@ impl SessionManager {
 
     /// Dispatches a raw Bedrock network message received over NetherNet WebRtc DataChannels
     pub fn dispatch_webrtc_packet(&self, peer: SocketAddr, raw: &[u8]) -> Vec<bytes::Bytes> {
+        let started = std::time::Instant::now();
+        let out = self.dispatch_webrtc_packet_inner(peer, raw);
+        self.lag.dispatch.record(started.elapsed());
+        out
+    }
+
+    fn dispatch_webrtc_packet_inner(&self, peer: SocketAddr, raw: &[u8]) -> Vec<bytes::Bytes> {
+        let batch_started = std::time::Instant::now();
+        let ipc_before = crate::metrics::ipc().snapshot();
         // Take the session out of the map so plugin IPC (which may call back
         // into the host) never runs while the session lock is held.
+        let lock_started = std::time::Instant::now();
         let (session_id, mut session) = {
             let mut map = self.sessions.write();
             match map
@@ -6703,6 +6991,9 @@ impl SessionManager {
                 }
             }
         };
+
+        let lock_elapsed = lock_started.elapsed();
+        self.lag.lock.record(lock_elapsed);
 
         // A session may have been created before plugins finished loading.
         if session.plugins.is_none() {
@@ -6736,7 +7027,11 @@ impl SessionManager {
             }
         };
 
+        let packet_count = packets.len();
+        let mut slow_packet: Option<(std::time::Duration, u32)> = None;
+        let packets_started = std::time::Instant::now();
         for (packet_id, payload) in packets {
+            let packet_started = std::time::Instant::now();
             debug!(
                 "[:WebRTC] Dispatching Bedrock packet 0x{:02X} (len {}) from {}",
                 packet_id, payload.len(), peer
@@ -6751,7 +7046,15 @@ impl SessionManager {
                     );
                 }
             }
+            let elapsed = packet_started.elapsed();
+            if slow_packet
+                .as_ref()
+                .map_or(true, |(slowest, _)| elapsed > *slowest)
+            {
+                slow_packet = Some((elapsed, packet_id));
+            }
         }
+        let packets_total = packets_started.elapsed();
 
         // Chunk streaming (`Player::doChunkRequests`) is *not* run here:
         // in the reference it runs once per `NetworkSession::tick()`,
@@ -6787,12 +7090,36 @@ impl SessionManager {
         for message in broadcasts {
             self.broadcast_text(&message);
         }
+        self.lag.packets.record(packets_total);
+        let actions_started = std::time::Instant::now();
         self.apply_actions(&actions, 0);
         self.apply_command_actions(&core_actions);
+        let actions_total = actions_started.elapsed();
+        self.lag.actions.record(actions_total);
 
         // Pick up packets queued by broadcasts/actions for this same session.
         if let Some(session) = self.sessions.write().get_mut(&session_id) {
             outgoing.append(&mut session.pending_outgoing);
+        }
+
+        let batch_total = batch_started.elapsed();
+        // One line per slow inbound batch: enough to tell a slow handler from
+        // a slow action, a slow IPC round-trip or a stalled thread (a large
+        // `batch` with a small sum of the parts). See `metrics::LagProbe`.
+        if batch_total > std::time::Duration::from_millis(20) {
+            let ipc_after = crate::metrics::ipc().snapshot();
+            warn!(
+                "[lag-slow] batch={:.1}ms npk={} lock={:.1}ms packets={:.1}ms actions={:.1}ms ipc={:.1}ms/{} slowest={:.1}ms/0x{:02X}",
+                Self::ms(batch_total),
+                packet_count,
+                Self::ms(lock_elapsed),
+                Self::ms(packets_total),
+                Self::ms(actions_total),
+                Self::ms(ipc_after.1.saturating_sub(ipc_before.1)),
+                ipc_after.0.saturating_sub(ipc_before.0),
+                Self::ms(slow_packet.map(|(elapsed, _)| elapsed).unwrap_or_default()),
+                slow_packet.map(|(_, id)| id).unwrap_or(0),
+            );
         }
 
         self.encode_outgoing(outgoing, compression_enabled)
@@ -6895,8 +7222,37 @@ impl SessionManager {
         }
 
         let mut follow_up = Vec::new();
+        let actions_started = std::time::Instant::now();
+        // Slowest single action of this call, filled on drop so `continue`
+        // arms are measured too. The debug string is only built when needed.
+        let mut slow_action: Option<(std::time::Duration, String)> = None;
+
+        struct ActionTimer<'a, F: Fn() -> String> {
+            started: std::time::Instant,
+            slowest: &'a mut Option<(std::time::Duration, String)>,
+            describe: F,
+        }
+
+        impl<F: Fn() -> String> Drop for ActionTimer<'_, F> {
+            fn drop(&mut self) {
+                let elapsed = self.started.elapsed();
+                if elapsed > std::time::Duration::from_millis(5)
+                    && self
+                        .slowest
+                        .as_ref()
+                        .map_or(true, |(slowest, _)| elapsed > *slowest)
+                {
+                    *self.slowest = Some((elapsed, (self.describe)()));
+                }
+            }
+        }
 
         for action in actions {
+            let _action_timer = ActionTimer {
+                started: std::time::Instant::now(),
+                slowest: &mut slow_action,
+                describe: || format!("{:?}", action),
+            };
             match action {
                 PluginAction::SendMessage {
                     target_player,
@@ -7000,7 +7356,7 @@ impl SessionManager {
                     // `apply_actions` as a single `UpdateBlockPacket`
                     // (0x15) per viewer holding the chunk — not by
                     // resending a whole `LevelChunk` as before.
-                    info!(
+                    debug!(
                         "[SetBlock] world {} at ({},{},{}) id={}",
                         world, x, y, z, block_id
                     );
@@ -7016,6 +7372,17 @@ impl SessionManager {
                     // PM `World::broadcastPacketToViewers`: dig progress
                     // events go to every viewer holding the chunk.
                     self.broadcast_level_event(*event_id, *event_data, *x, *y, *z);
+                }
+                PluginAction::BroadcastSound {
+                    sound,
+                    extra_data,
+                    x,
+                    y,
+                    z,
+                } => {
+                    // PM `World::addSound`: block place sounds reach every
+                    // viewer holding the chunk, not only the placer.
+                    self.broadcast_sound(sound, *extra_data, *x, *y, *z);
                 }
                 PluginAction::DispatchCommand { command, sender } => {
                     let plugins = self.plugin_manager();
@@ -7276,7 +7643,32 @@ impl SessionManager {
         // poll is an empty drain plus an empty session scan.
         self.poll_block_changes();
 
+        let actions_total = actions_started.elapsed();
+        // A slow `apply_actions` is either one pathological action (addressed
+        // by the debug string) or many cheap ones (the count gives that away).
+        if actions_total > std::time::Duration::from_millis(20) {
+            match &slow_action {
+                Some((elapsed, label)) => warn!(
+                    "[lag-slow] actions={} total={:.1}ms slowest={:.1}ms: {}",
+                    actions.len(),
+                    Self::ms(actions_total),
+                    Self::ms(*elapsed),
+                    label
+                ),
+                None => warn!(
+                    "[lag-slow] actions={} total={:.1}ms, none over 5ms",
+                    actions.len(),
+                    Self::ms(actions_total)
+                ),
+            }
+        }
+
         follow_up
+    }
+
+    /// Milliseconds for the `[lag-slow]` lines.
+    fn ms(duration: std::time::Duration) -> f64 {
+        (duration.as_secs_f64() * 10000.0).round() / 10.0
     }
 
     /// Runs a native command from the server console.
@@ -7324,6 +7716,7 @@ impl SessionManager {
                 seen.insert(session.username.to_lowercase());
                 OnlinePlayer {
                     name: session.username.clone(),
+                    display_name: session.username.clone(),
                     position: (
                         session.position.x as f64,
                         session.position.y as f64,
@@ -7336,6 +7729,10 @@ impl SessionManager {
         for entry in self.registry.all() {
             if seen.insert(entry.name.to_lowercase()) {
                 players.push(OnlinePlayer {
+                    display_name: java_bridge::display::bedrock_view_display_name(
+                        &entry.name,
+                        entry.is_virtual,
+                    ),
                     name: entry.name,
                     position: (entry.x, entry.y, entry.z),
                     gamemode: entry.gamemode as i32,
@@ -8106,7 +8503,46 @@ impl SessionManager {
     /// `LevelEventPacket` dig events: queue the raw wire for every joined
     /// session holding the block's chunk — same recipient rule as
     /// [`Self::broadcast_block_change_ref`]. Returns recipients count.
-    fn broadcast_level_event(
+    /// `World::addSound()` for a non-actor sound: one `LevelSoundEventPacket`
+    /// (0x7B) to every session that holds the chunk.
+    pub(crate) fn broadcast_sound(
+        &self,
+        sound: &str,
+        extra_data: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> usize {
+        let chunk = (x >> 4, z >> 4);
+        let mut wire = Vec::with_capacity(32);
+        {
+            let mut writer = Writer::new();
+            writer.write_var_u32(LEVEL_SOUND_EVENT_PACKET_ID);
+            wire.extend_from_slice(&writer.into_bytes());
+        }
+        // PM plays the sound at the block centre.
+        wire.extend_from_slice(&level_sound_event_wire(
+            sound,
+            x as f32 + 0.5,
+            y as f32 + 0.5,
+            z as f32 + 0.5,
+            extra_data,
+        ));
+        let mut map = self.sessions.write();
+        let mut recipients = 0usize;
+        for session in map.values_mut() {
+            if !session.joined || !session.sent_chunks.contains(&chunk) {
+                continue;
+            }
+            session
+                .pending_outgoing
+                .push(OutgoingPacket::RawWire(wire.clone()));
+            recipients += 1;
+        }
+        recipients
+    }
+
+    pub(crate) fn broadcast_level_event(
         &self,
         event_id: i32,
         event_data: i32,
@@ -8137,7 +8573,7 @@ impl SessionManager {
         }
         drop(map);
         if recipients > 0 {
-            info!(
+            debug!(
                 "level_event: id={} data={} at ({},{},{}) recipients={}",
                 event_id, event_data, x, y, z, recipients
             );
@@ -8179,7 +8615,7 @@ impl SessionManager {
                 if dist2 > (handler.max_player_distance as f32).powi(2) {
                     let (x, y, z) = handler.pos;
                     session.break_handler = None;
-                    info!("break handler dropped: player walked away from ({},{},{})", x, y, z);
+                    debug!("break handler dropped: player walked away from ({},{},{})", x, y, z);
                     stops.push((x, y, z));
                     continue;
                 }
@@ -8198,7 +8634,7 @@ impl SessionManager {
                 let (x, y, z) = handler.pos;
                 let world_name = session.world.name.clone();
                 session.break_handler = None;
-                info!("break handler complete: ({},{},{}) breaking server-side", x, y, z);
+                debug!("break handler complete: ({},{},{}) breaking server-side", x, y, z);
                 completed.push((world_name, x, y, z));
                 stops.push((x, y, z));
             }
@@ -8222,6 +8658,11 @@ impl SessionManager {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         let world_time = self.tick_world_time();
+        // Sounds produced by scheduled block updates, e.g. a button releasing
+        // itself (`onScheduledUpdate` -> `World::addSound`).
+        for (sound, x, y, z) in self.world.take_pending_sounds() {
+            self.broadcast_sound(&sound, -1, x, y, z);
+        }
         // Dig handlers first: a completed dig edits the world, and the
         // broadcast poll below must ship that edit in this same tick.
         self.update_break_handlers();
@@ -8258,15 +8699,40 @@ impl SessionManager {
     /// (`do_chunk_requests` itself is a no-op for them, this guard just
     /// keeps the driver explicit).
     pub fn drive_chunk_requests(&self) -> usize {
+        let started = std::time::Instant::now();
+        let queued = self.drive_chunk_requests_inner();
+        self.lag.chunk_stream.record(started.elapsed());
+        queued
+    }
+
+    fn drive_chunk_requests_inner(&self) -> usize {
+        // Warm the columns each session is about to stream *before* locking
+        // the sessions map. `do_chunk_requests` generates payloads with rayon
+        // (~18 ms per cold column) and `drain_pending_outgoing_bytes` compresses
+        // them; doing either under `sessions.write()` blocked every packet
+        // handler in between — a break's particles/sound waited 60-160 ms, the
+        // tick drifted and fast breaking dropped the peer.
+        let pending: Vec<(i32, i32)> = {
+            let map = self.sessions.read();
+            let mut columns: Vec<(i32, i32)> = Vec::new();
+            for session in map.values() {
+                if !session.wants_chunk_streaming() {
+                    continue;
+                }
+                columns.extend(session.next_chunk_columns());
+            }
+            columns
+        };
+        if !pending.is_empty() {
+            pending.par_iter().for_each(|(cx, cz)| {
+                self.world.chunk_payload(*cx, *cz);
+            });
+        }
+
         let mut map = self.sessions.write();
         let mut queued = 0usize;
         for session in map.values_mut() {
-            if !session.view_distance_received {
-                continue;
-            }
-            if !(session.state == SessionState::PreSpawn
-                || session.state == SessionState::InGame)
-            {
+            if !session.wants_chunk_streaming() {
                 continue;
             }
             let out = session.do_chunk_requests();
@@ -8290,19 +8756,35 @@ impl SessionManager {
     /// one of the two paths, never both. Sessions with an empty queue
     /// produce no entry.
     pub fn drain_pending_outgoing_bytes(&self) -> Vec<(SocketAddr, Vec<bytes::Bytes>)> {
-        let mut map = self.sessions.write();
-        let mut drained = Vec::new();
-        for session in map.values_mut() {
-            if session.pending_outgoing.is_empty() {
-                continue;
-            }
-            let outgoing = std::mem::take(&mut session.pending_outgoing);
-            let compression_enabled = session.compression_enabled
-                || outgoing.iter().any(|packet| packet.packet_id() == 0x8F);
-            session.compression_enabled = compression_enabled;
+        let started = std::time::Instant::now();
+        let drained = self.drain_pending_outgoing_bytes_inner();
+        self.lag.drain.record(started.elapsed());
+        drained
+    }
+
+    fn drain_pending_outgoing_bytes_inner(&self) -> Vec<(SocketAddr, Vec<bytes::Bytes>)> {
+        // Take the queues under the lock, encode/compress outside it: a
+        // terrain chunk is ~62 KB and deflating it under `sessions.write()`
+        // stalled every packet handler (and so every block break ack) for
+        // milliseconds per batch.
+        let taken: Vec<(SocketAddr, Vec<OutgoingPacket>, bool)> = {
+            let mut map = self.sessions.write();
+            map.values_mut()
+                .filter(|session| !session.pending_outgoing.is_empty())
+                .map(|session| {
+                    let outgoing = std::mem::take(&mut session.pending_outgoing);
+                    let compression_enabled = session.compression_enabled
+                        || outgoing.iter().any(|packet| packet.packet_id() == 0x8F);
+                    session.compression_enabled = compression_enabled;
+                    (session.client_addr, outgoing, compression_enabled)
+                })
+                .collect()
+        };
+        let mut drained = Vec::with_capacity(taken.len());
+        for (peer, outgoing, compression_enabled) in taken {
             let bytes = self.encode_outgoing(outgoing, compression_enabled);
             if !bytes.is_empty() {
-                drained.push((session.client_addr, bytes));
+                drained.push((peer, bytes));
             }
         }
         drained
@@ -8347,24 +8829,13 @@ impl SessionManager {
     fn broadcast_block_change_ref(&self, change: &BlockChange) -> usize {
         let chunk = (change.x >> 4, change.z >> 4);
         let wire = update_block_wire(change.x, change.y, change.z, change.block_id);
-        let level_event_wire = if change.block_id == AIR {
-            change.previous_block_id.map(|prev| {
-                let mut w = Vec::with_capacity(16);
-                let mut writer = Writer::new();
-                writer.write_var_u32(LEVEL_EVENT_PACKET_ID);
-                w.extend_from_slice(&writer.into_bytes());
-                w.extend_from_slice(&level_packet_wire(
-                    LEVEL_EVENT_PARTICLE_DESTROY_BLOCK,
-                    prev as i32,
-                    change.x,
-                    change.y,
-                    change.z,
-                ));
-                w
-            })
-        } else {
-            None
-        };
+        // Only the `UpdateBlock`: PM's `changedBlocks` flush never carries the
+        // destroy particles. Whoever breaks the block broadcasts
+        // `PARTICLE_DESTROY_BLOCK` itself (`Session::handle_block_actions` for a
+        // Bedrock dig, `CoreHooks::break_block` for a Java one), exactly like
+        // `World::useBreakOn`. Emitting it here as well sent the client two
+        // particle bursts for the same block, one tick apart.
+        let level_event_wire: Option<Vec<u8>> = None;
         let mut map = self.sessions.write();
         let mut recipients = 0usize;
         for session in map.values_mut() {
@@ -8383,7 +8854,7 @@ impl SessionManager {
         }
         // Always log: `recipients=0` is the failure mode where the edit
         // exists but no viewer holds the chunk (nothing is sent, silently).
-        tracing::info!(
+        tracing::debug!(
             "broadcast_block_change: x={} y={} z={} block_id={} chunk={:?} recipients={}",
             change.x, change.y, change.z, change.block_id, chunk, recipients
         );
@@ -8409,9 +8880,16 @@ impl SessionManager {
     /// the next tick/packet. The Java queue
     /// (`world.take_block_changes`) is independent and untouched here.
     pub fn poll_block_changes(&self) -> usize {
+        let started = std::time::Instant::now();
+        let delivered = self.poll_block_changes_inner();
+        self.lag.poll.record(started.elapsed());
+        delivered
+    }
+
+    fn poll_block_changes_inner(&self) -> usize {
         let changes = self.world.take_broadcast_changes();
         if !changes.is_empty() {
-            tracing::info!("poll_block_changes: drained {} changes", changes.len());
+            tracing::debug!("poll_block_changes: drained {} changes", changes.len());
         }
         let mut delivered = 0usize;
         for change in &changes {
@@ -8452,13 +8930,6 @@ fn inventory_slot_wire(window_id: u32, slot: u32, item: &ItemStack) -> Vec<u8> {
 
 /// InventorySlot wire bytes from a `ContainerSlot` (ItemStackRequest
 /// container id -> InventorySlot window id).
-fn inventory_slot_wire_for_slot(
-    slot: bedrock_protocol::packets::item_stack_request::ItemStackContainerSlot,
-    item: &ItemStack,
-) -> Vec<u8> {
-    inventory_slot_wire(slot.container as u32, slot.slot as u32, item)
-}
-
 /// PHP's `(string) round($value, 3)`.
 fn format_seconds(value: f64) -> String {
     let rounded = (value * 1000.0).round() / 1000.0;
@@ -8575,6 +9046,60 @@ mod block_sync_tests {
         session.spawned = true;
         session.sent_chunks = chunks.iter().copied().collect();
         session
+    }
+
+    /// Chunk streaming must not hold the sessions lock while it builds
+    /// columns: a block break's `UpdateBlock` and destroy particles are queued
+    /// by a packet handler that needs that same lock, so a slow column used to
+    /// delay them by the whole build (60-160 ms in the production log, where
+    /// the tick held the lock while generating terrain).
+    #[test]
+    fn chunk_streaming_does_not_hold_the_sessions_lock() {
+        struct SlowGenerator;
+
+        impl WorldGenerator for SlowGenerator {
+            fn generator_type(&self) -> i32 {
+                1
+            }
+            fn spawn_position(&self) -> (i32, i32, i32) {
+                (0, 64, 0)
+            }
+            fn player_position(&self) -> (f32, f32, f32) {
+                (0.5, 64.0, 0.5)
+            }
+            fn generate_chunk(&self, _chunk_x: i32, _chunk_z: i32) -> (u32, Vec<u8>) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                (0, Vec::new())
+            }
+        }
+
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(SlowGenerator)));
+        let mut session = joined_session(1, &[]);
+        session.world = Arc::clone(manager.world());
+        session.view_distance_received = true;
+        session.chunk_radius = 4;
+        session.chunk_load_queue = vec![(0, 0), (1, 0)];
+        manager.add_session(session);
+
+        // Stand-in for a packet handler: it only needs the sessions lock.
+        let waiter = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let started = std::time::Instant::now();
+                let _guard = manager.sessions.write();
+                started.elapsed()
+            })
+        };
+
+        let queued = manager.drive_chunk_requests();
+        assert_eq!(queued, 2, "both queued columns are streamed");
+
+        let waited = waiter.join().expect("waiter thread");
+        assert!(
+            waited < std::time::Duration::from_millis(40),
+            "a packet handler waited {waited:?} for the sessions lock while chunks were built"
+        );
     }
 
     #[test]
@@ -8821,6 +9346,169 @@ mod block_sync_tests {
         assert!(map[&1].sent_chunks.contains(&(9, 9)));
     }
 
+    /// Dispatches the `UseItem` (CLICK_BLOCK) packet a client sends when it
+    /// right-clicks a block and returns the actions the session queued.
+    fn right_click_actions(
+        manager: &SessionManager,
+        block_position: (i32, i32, i32),
+        face: u8,
+        held: ItemStack,
+    ) -> Vec<PluginAction> {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position,
+                face,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 0,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes())
+            .expect("use item");
+        let mut map = manager.sessions.write();
+        let session = map.get_mut(&1).expect("session");
+        std::mem::take(&mut session.pending_actions)
+    }
+
+    /// PM `Lever::onInteract()`: the click toggles the lever and plays the
+    /// redstone sound; nothing is placed next to it.
+    #[test]
+    fn bedrock_click_on_a_lever_toggles_it() {
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, lever));
+        let on = bedrock_world::block_states::with_property(lever, "open_bit", "true").unwrap();
+
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        // `onInteract()` edits the world inline, like PM's `World::setBlock`.
+        assert_eq!(manager.world().block_at(2, 80, 3), on);
+        assert_eq!(
+            actions,
+            vec![PluginAction::BroadcastSound {
+                sound: LEVEL_SOUND_POWER_ON.to_string(),
+                extra_data: -1,
+                x: 2,
+                y: 80,
+                z: 3,
+            }]
+        );
+
+        // The held block was not placed on the face that was clicked.
+        assert_eq!(manager.world().block_at(2, 81, 3), AIR);
+    }
+
+    /// PM `Button::onInteract()` + `onScheduledUpdate()`: press, `power.on`,
+    /// and after `getActivationTime()` ticks the button releases itself with
+    /// `power.off`.
+    #[test]
+    fn a_pressed_button_releases_itself_through_the_tick() {
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let button = bedrock_world::block_states::network_id("stone_button").unwrap();
+        let pressed =
+            bedrock_world::block_states::with_property(button, "button_pressed_bit", "true")
+                .unwrap();
+        assert!(manager.world().set_block(2, 80, 3, button));
+
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        assert_eq!(manager.world().block_at(2, 80, 3), pressed);
+        assert_eq!(
+            actions,
+            vec![PluginAction::BroadcastSound {
+                sound: LEVEL_SOUND_POWER_ON.to_string(),
+                extra_data: -1,
+                x: 2,
+                y: 80,
+                z: 3,
+            }]
+        );
+        assert_eq!(manager.world().scheduled_block_update_count(), 1);
+
+        for _ in 0..19 {
+            manager.tick();
+        }
+        assert_eq!(manager.world().block_at(2, 80, 3), pressed);
+
+        manager.tick();
+        assert_eq!(manager.world().block_at(2, 80, 3), button);
+        assert_eq!(manager.world().scheduled_block_update_count(), 0);
+        let power_off = {
+            let map = manager.sessions.read();
+            map.get(&1)
+                .map(|session| {
+                    session.pending_outgoing.iter().any(|packet| match packet {
+                        OutgoingPacket::RawWire(bytes) => {
+                            bytes.windows(9).any(|window| window == b"power.off")
+                        }
+                        _ => false,
+                    })
+                })
+                .unwrap_or(false)
+        };
+        assert!(power_off, "the release must broadcast RedstonePowerOffSound");
+    }
+
+    /// PM `useItemOn`: sneaking with an item in hand skips `onInteract()` and
+    /// places the block instead.
+    #[test]
+    fn sneaking_with_a_block_places_against_a_lever() {
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        placer.is_sneaking = true;
+        manager.add_session(placer);
+
+        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, lever));
+
+        let mut held = ItemStack::new(1, 1);
+        held.block_runtime_id = 999;
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, held);
+        assert_eq!(
+            actions,
+            vec![
+                PluginAction::SetBlock {
+                    world: "world".to_string(),
+                    x: 2,
+                    y: 81,
+                    z: 3,
+                    block_id: 999,
+                },
+                PluginAction::BroadcastSound {
+                    sound: LEVEL_SOUND_PLACE.to_string(),
+                    extra_data: 999,
+                    x: 2,
+                    y: 81,
+                    z: 3,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn bedrock_use_item_place_reaches_both_queues_with_real_id() {
         use bedrock_protocol::packets::inventory_transaction::{
@@ -8877,13 +9565,23 @@ mod block_sync_tests {
         };
         assert_eq!(
             actions,
-            vec![PluginAction::SetBlock {
-                world: "world".to_string(),
-                x: 2,
-                y: 80,
-                z: 3,
-                block_id: 999,
-            }]
+            vec![
+                PluginAction::SetBlock {
+                    world: "world".to_string(),
+                    x: 2,
+                    y: 80,
+                    z: 3,
+                    block_id: 999,
+                },
+                // PM `BlockPlaceSound`: the place sound is broadcast too.
+                PluginAction::BroadcastSound {
+                    sound: LEVEL_SOUND_PLACE.to_string(),
+                    extra_data: 999,
+                    x: 2,
+                    y: 80,
+                    z: 3,
+                },
+            ]
         );
         manager.apply_actions(&actions, 0);
 
@@ -8894,11 +9592,29 @@ mod block_sync_tests {
         {
             let map = manager.sessions.read();
             let viewer = &map[&1];
-            assert_eq!(viewer.pending_outgoing.len(), 1);
-            assert_eq!(
-                viewer.pending_outgoing[0],
-                OutgoingPacket::RawWire(update_block_wire(2, 80, 3, 999))
-            );
+            assert_eq!(viewer.pending_outgoing.len(), 2, "block + place sound");
+            // The sound is broadcast while the action is applied, the block
+            // update is flushed by the `poll_block_changes` at the end, so the
+            // order is sound-then-update (assert by content, not index).
+            assert!(viewer
+                .pending_outgoing
+                .contains(&OutgoingPacket::RawWire(update_block_wire(
+                    2, 80, 3, 999
+                ))));
+            let mut sound = Vec::new();
+            {
+                let mut writer = Writer::new();
+                writer.write_var_u32(LEVEL_SOUND_EVENT_PACKET_ID);
+                sound.extend_from_slice(&writer.into_bytes());
+            }
+            sound.extend_from_slice(&level_sound_event_wire(
+                LEVEL_SOUND_PLACE,
+                2.5,
+                80.5,
+                3.5,
+                999,
+            ));
+            assert!(viewer.pending_outgoing.contains(&OutgoingPacket::RawWire(sound)));
         }
         // Fase 1: the same real id is queued for the Java bridge.
         assert_eq!(
@@ -8907,6 +9623,71 @@ mod block_sync_tests {
         );
         // A second poll re-sends nothing (no echo duplication).
         assert_eq!(manager.poll_block_changes(), 0);
+    }
+
+    /// PM `World::useItemOn` refuses a placement whose block boxes intersect an
+    /// entity: a player standing inside the target cell must not be able to
+    /// place a block into itself (the reported "player trapped inside the
+    /// block"). The client's prediction is undone by resending the column.
+    #[test]
+    fn bedrock_use_item_place_inside_the_player_is_refused() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+        use bedrock_protocol::ItemStack;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        // Standing in (2,80,3): the own hitbox overlaps the target cell.
+        placer.position = Vector3f::new(2.5, 80.0, 3.5);
+        manager.add_session(placer);
+
+        let mut held = ItemStack::new(1, 1);
+        held.block_runtime_id = bedrock_world::block_id::STONE;
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: (2, 79, 3),
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.0, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 123,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        let payload = writer.into_bytes().to_vec();
+        let out = manager
+            .handle_session_packet(1, 0x1E, &payload)
+            .expect("use item");
+
+        {
+            let mut map = manager.sessions.write();
+            let session = map.get_mut(&1).expect("placer session");
+            assert!(
+                session.pending_actions.is_empty(),
+                "no SetBlock/sound for a refused placement: {:?}",
+                session.pending_actions
+            );
+            // The refused cell is no longer marked as sent, so the column is
+            // streamed again and the client's predicted block disappears.
+            assert!(!session.sent_chunks.contains(&(0, 0)));
+        }
+        assert!(
+            out.iter()
+                .any(|outgoing| matches!(outgoing, OutgoingPacket::LevelChunk(_))),
+            "the predicted ghost block is undone with the column"
+        );
     }
 
     #[test]
@@ -9096,8 +9877,10 @@ mod block_sync_tests {
         assert!(hooks.break_block(2, 64, 3));
         assert_eq!(manager.world().block_at(2, 64, 3), AIR);
 
-        // The unified tick forwards it to the Bedrock viewer holding the
-        // chunk as a single UpdateBlockPacket with the AIR runtime id.
+        // `World::useBreakOn` order: the destroy particles go out with the
+        // break itself, and the tick forwards the AIR edit as a single
+        // `UpdateBlockPacket` (the `changedBlocks` flush never repeats the
+        // particles, which used to arrive twice, one tick apart).
         let report = manager.tick();
         assert_eq!(report.block_changes, 1);
         {
@@ -9105,12 +9888,12 @@ mod block_sync_tests {
             let viewer = &map[&1];
             assert_eq!(viewer.pending_outgoing.len(), 2);
             assert_eq!(
-                viewer.pending_outgoing[0],
-                OutgoingPacket::RawWire(update_block_wire(2, 64, 3, AIR))
+                viewer.pending_outgoing[0].packet_id(),
+                LEVEL_EVENT_PACKET_ID
             );
             assert_eq!(
-                viewer.pending_outgoing[1].packet_id(),
-                LEVEL_EVENT_PACKET_ID
+                viewer.pending_outgoing[1],
+                OutgoingPacket::RawWire(update_block_wire(2, 64, 3, AIR))
             );
         }
         // Fase 1 queue untouched by the Bedrock tick: Java viewers still

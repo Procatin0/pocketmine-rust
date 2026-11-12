@@ -366,6 +366,16 @@ async fn modern_player_info_update_gamemode_and_update_time() {
             .find(|(id, _)| *id == profile::packet_id(protocol, "player_info").unwrap())
             .unwrap();
         assert_eq!(info.1[0], 0x04, "player_info_update update_game_mode");
+        // `game_state_change` carries the gamemode as its float parameter
+        // (survival 0.0, creative 1.0, ...). Packing it as a byte left the
+        // value at 0.0, so Java clients stayed in survival after
+        // `/gamemode creative`.
+        let gsc = frames
+            .iter()
+            .find(|(id, _)| *id == profile::packet_id(protocol, "game_state_change").unwrap())
+            .expect("game_state_change");
+        assert_eq!(gsc.1[0], 3, "change_game_mode reason");
+        assert_eq!(&gsc.1[1..5], &1.0f32.to_be_bytes(), "gamemode as f32");
         let time = frames
             .iter()
             .find(|(id, _)| *id == profile::packet_id(protocol, "update_time").unwrap())

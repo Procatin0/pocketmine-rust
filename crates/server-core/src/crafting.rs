@@ -20,13 +20,14 @@
 //! models block items in `ItemStack`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use bedrock_protocol::ItemStack;
 use serde_json::Value;
 
 use crate::inventory::{
-    item_network_id, max_stack_size, PlayerInventory, WINDOW_ID_ARMOR,
-    WINDOW_ID_INVENTORY, WINDOW_ID_OFFHAND,
+    item_network_id, max_stack_size, PlayerInventory, WINDOW_ID_ARMOR, WINDOW_ID_CRAFT_BIG,
+    WINDOW_ID_CRAFT_SMALL, WINDOW_ID_CURSOR, WINDOW_ID_INVENTORY, WINDOW_ID_OFFHAND,
 };
 
 /// PocketMine `CraftingGrid::SIZE_SMALL` (player 2x2 crafting).
@@ -1071,35 +1072,56 @@ pub fn creative_groups() -> Vec<bedrock_protocol::packets::creative_content::Cre
 // ---------------------------------------------------------------------------
 
 pub use bedrock_protocol::packets::item_stack_request::{
-    ItemStackContainerSlot, ItemStackRequestAction, ItemStackRequestPacket,
-    ACTION_CRAFT_RECIPE, ACTION_CREATIVE_CREATE, ACTION_DESTROY, ACTION_DROP,
-    ACTION_PLACE, ACTION_SWAP, ACTION_TAKE,
+    ItemStackContainerSlot, ItemStackRequest, ItemStackRequestAction, ItemStackRequestPacket,
+    ACTION_CREATIVE_CREATE, ACTION_DESTROY, ACTION_DROP, ACTION_PLACE, ACTION_SWAP, ACTION_TAKE,
+    CREATED_ITEM_SLOT, UI_ARMOR, UI_COMBINED_HOTBAR_AND_INVENTORY, UI_CRAFTING_INPUT,
+    UI_CRAFT_2X2_SLOT, UI_CRAFT_3X3_SLOT, UI_CREATED_OUTPUT, UI_CURSOR, UI_HOTBAR, UI_INVENTORY,
+    UI_OFFHAND,
 };
 pub use bedrock_protocol::packets::item_stack_response::{
-    ItemStackResponseEntry, ItemStackResponsePacket, ItemStackResponseSlot, STATUS_ERROR,
-    STATUS_OK,
+    ItemStackResponseContainer, ItemStackResponseEntry, ItemStackResponsePacket,
+    ItemStackResponseSlot, STATUS_ERROR, STATUS_OK,
 };
 
-/// Containers the server models, by `ItemStackContainerSlot.container`.
-/// The ids are the window ids BDS uses (0 = inventory, 119 = offhand,
-/// 120 = armor, 124 = cursor, 125 = 2x2 crafting, 126 = 3x3 crafting).
-pub const CONTAINER_INVENTORY: u8 = 0;
-pub const CONTAINER_OFFHAND: u8 = 119;
-pub const CONTAINER_ARMOR: u8 = 120;
-pub const CONTAINER_CURSOR: u8 = 124;
-pub const CONTAINER_CRAFT_SMALL: u8 = 125;
-pub const CONTAINER_CRAFT_BIG: u8 = 126;
-
-/// Reads one slot of a modelled container (crafting result slots included).
-pub fn container_slot(inventory: &PlayerInventory, slot: &ItemStackContainerSlot) -> Option<ItemStack> {
-    match slot.container {
-        CONTAINER_INVENTORY => inventory.window_slot(WINDOW_ID_INVENTORY, slot.slot as u32).cloned(),
-        CONTAINER_OFFHAND => inventory.window_slot(WINDOW_ID_OFFHAND, slot.slot as u32).cloned(),
-        CONTAINER_ARMOR => inventory.window_slot(WINDOW_ID_ARMOR, slot.slot as u32).cloned(),
-        CONTAINER_CURSOR => Some(inventory.cursor_item()),
-        CONTAINER_CRAFT_SMALL => inventory.craft_slot(true, slot.slot as usize),
-        CONTAINER_CRAFT_BIG => inventory.craft_slot(false, slot.slot as usize),
+/// Maps a `ContainerUIIds` container id plus its UI slot to the window the
+/// server models, as `(window id, slot)`.
+///
+/// The client addresses `ItemStackRequest` slots with container *UI* ids
+/// (`UI_INVENTORY`, `UI_HOTBAR`, `UI_CRAFTING_INPUT`, ...), which are not
+/// window ids: treating them as windows (the previous behaviour) made every
+/// hotbar move fail. Offhand has a single slot (the client sends a bogus slot
+/// id, see PocketMine's `ItemStackContainerIdTranslator`) and the crafting
+/// grid uses the `UIInventorySlotOffset` slots 28..=31 (2x2) and 32..=40
+/// (3x3).
+pub fn ui_container_window(container: u8, slot: u8) -> Option<(u32, u32)> {
+    match container {
+        UI_COMBINED_HOTBAR_AND_INVENTORY | UI_HOTBAR | UI_INVENTORY => {
+            Some((WINDOW_ID_INVENTORY, slot as u32))
+        }
+        UI_ARMOR => Some((WINDOW_ID_ARMOR, slot as u32)),
+        UI_OFFHAND => Some((WINDOW_ID_OFFHAND, 0)),
+        UI_CURSOR => Some((WINDOW_ID_CURSOR, 0)),
+        UI_CRAFTING_INPUT if (UI_CRAFT_2X2_SLOT..UI_CRAFT_2X2_SLOT + 4).contains(&slot) => {
+            Some((WINDOW_ID_CRAFT_SMALL, (slot - UI_CRAFT_2X2_SLOT) as u32))
+        }
+        UI_CRAFTING_INPUT if (UI_CRAFT_3X3_SLOT..UI_CRAFT_3X3_SLOT + 9).contains(&slot) => {
+            Some((WINDOW_ID_CRAFT_BIG, (slot - UI_CRAFT_3X3_SLOT) as u32))
+        }
         _ => None,
+    }
+}
+
+/// Reads one slot of a modelled container (crafting grid slots included).
+pub fn container_slot(
+    inventory: &PlayerInventory,
+    slot: &ItemStackContainerSlot,
+) -> Option<ItemStack> {
+    let (window, index) = ui_container_window(slot.container, slot.slot)?;
+    match window {
+        WINDOW_ID_CURSOR => Some(inventory.cursor_item()),
+        WINDOW_ID_CRAFT_SMALL => inventory.craft_slot(true, index as usize),
+        WINDOW_ID_CRAFT_BIG => inventory.craft_slot(false, index as usize),
+        _ => inventory.window_slot(window, index).cloned(),
     }
 }
 
@@ -1108,24 +1130,25 @@ fn set_container_slot(
     slot: &ItemStackContainerSlot,
     item: ItemStack,
 ) -> bool {
-    match slot.container {
-        CONTAINER_INVENTORY => inventory.set_window_slot(WINDOW_ID_INVENTORY, slot.slot as u32, item),
-        CONTAINER_OFFHAND => inventory.set_window_slot(WINDOW_ID_OFFHAND, slot.slot as u32, item),
-        CONTAINER_ARMOR => inventory.set_window_slot(WINDOW_ID_ARMOR, slot.slot as u32, item),
-        CONTAINER_CURSOR => inventory.set_cursor(item),
-        CONTAINER_CRAFT_SMALL => inventory.set_craft_slot(true, slot.slot as usize, item),
-        CONTAINER_CRAFT_BIG => inventory.set_craft_slot(false, slot.slot as usize, item),
-        _ => false,
+    let Some((window, index)) = ui_container_window(slot.container, slot.slot) else {
+        return false;
+    };
+    match window {
+        WINDOW_ID_CURSOR => inventory.set_cursor(item),
+        WINDOW_ID_CRAFT_SMALL => inventory.set_craft_slot(true, index as usize, item),
+        WINDOW_ID_CRAFT_BIG => inventory.set_craft_slot(false, index as usize, item),
+        _ => inventory.set_window_slot(window, index, item),
     }
 }
 
-/// Outcome of one `ItemStackRequestPacket`: the response entry to send plus
-/// every item the server dropped into the world (Q key / container close).
+/// Outcome of one `ItemStackRequest`: the response entry to send, the items
+/// the server dropped into the world (Q key) and the slots that changed, as
+/// `(client slot, new contents)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemStackRequestOutcome {
     pub response: ItemStackResponseEntry,
     pub dropped: Vec<ItemStack>,
-    pub changed: Vec<ItemStackResponseSlot>,
+    pub changed: Vec<(ItemStackContainerSlot, ItemStack)>,
 }
 
 impl Default for ItemStackRequestOutcome {
@@ -1138,31 +1161,43 @@ impl Default for ItemStackRequestOutcome {
     }
 }
 
-fn empty_slot(slot: ItemStackContainerSlot) -> ItemStackResponseSlot {
-    ItemStackResponseSlot { slot, item: ItemStack::empty() }
+/// The "created item" output of a request: what a `CraftingRecipe` (crafted
+/// result) or `CreativeCreate` (creative catalog entry) action staged, which
+/// the client then moves out with a `Take` from `UI_CREATED_OUTPUT`.
+#[derive(Debug, Clone, Default)]
+struct CreatedItem {
+    stack: Option<ItemStack>,
+    from_creative: bool,
 }
 
-/// Applies one `ItemStackRequestPacket` to a player inventory, port of
-/// PocketMine's `Player::handleItemStackRequest`. Take/Place/Swap move the
-/// cursor, Drop/Destroy remove items, CreativeCreate adds them and
-/// CraftRecipe consumes ingredients from the main inventory. Any failure
-/// rolls the whole request back and answers with an error status.
+/// Applies one `ItemStackRequest` to a player inventory, port of PocketMine's
+/// `ItemStackRequestExecutor`. Take/Place transfer `count` items from the
+/// source to the destination slot the client names, Swap exchanges two slots,
+/// Drop/Destroy/CraftingConsumeInput remove items, CraftingRecipe and
+/// CreativeCreate stage the crafted/creative item in the created-item output.
+/// Any failure rolls the whole request back and answers with an error status
+/// (the client then drops its prediction).
+///
+/// `creative` is the creative catalog in `CreativeContentPacket` order: the
+/// `creative_item_id` of a `CreativeCreate` action is its 1-based index.
 pub fn apply_item_stack_request(
     inventory: &mut PlayerInventory,
     mgr: &CraftingManager,
-    packet: &ItemStackRequestPacket,
+    request: &ItemStackRequest,
     is_creative: bool,
+    creative: &[ItemStack],
 ) -> ItemStackRequestOutcome {
     let snapshot = inventory.clone();
     let mut outcome = ItemStackRequestOutcome {
-        response: ItemStackResponseEntry::ok(packet.request_id),
+        response: ItemStackResponseEntry::ok(request.request_id),
         ..Default::default()
     };
+    let mut created = CreatedItem::default();
 
-    for action in &packet.actions {
-        if !apply_one_action(inventory, mgr, action, is_creative, &mut outcome) {
+    for action in &request.actions {
+        if !apply_one_action(inventory, mgr, action, is_creative, creative, &mut created, &mut outcome) {
             *inventory = snapshot;
-            outcome.response = ItemStackResponseEntry::error(packet.request_id);
+            outcome.response = ItemStackResponseEntry::error(request.request_id);
             outcome.changed.clear();
             outcome.dropped.clear();
             return outcome;
@@ -1176,250 +1211,277 @@ fn apply_one_action(
     mgr: &CraftingManager,
     action: &ItemStackRequestAction,
     is_creative: bool,
+    creative: &[ItemStack],
+    created: &mut CreatedItem,
     outcome: &mut ItemStackRequestOutcome,
 ) -> bool {
     match action {
-        ItemStackRequestAction::Take { slot, count } => {
-            take_from_slot(inventory, slot, *count, &mut outcome.changed)
+        ItemStackRequestAction::Take { count, source, destination }
+        | ItemStackRequestAction::Place { count, source, destination } => {
+            transfer(inventory, *count, source, destination, created, outcome)
         }
-        ItemStackRequestAction::Place { slot, count } => {
-            place_to_slot(inventory, slot, *count, &mut outcome.changed)
-        }
-        ItemStackRequestAction::Swap { slot_a, slot_b } => {
-            let Some(a) = container_slot(inventory, slot_a) else { return false };
-            let Some(b) = container_slot(inventory, slot_b) else { return false };
-            if !set_container_slot(inventory, slot_a, b) {
+        ItemStackRequestAction::Swap { slot1, slot2 } => {
+                        let Some(first) = container_slot(inventory, slot1) else { return false };
+            let Some(second) = container_slot(inventory, slot2) else { return false };
+            if !set_container_slot(inventory, slot1, second) {
                 return false;
             }
-            set_container_slot(inventory, slot_b, a);
-            outcome.changed.push(ItemStackResponseSlot { slot: *slot_a, item: container_slot(inventory, slot_a).unwrap_or_else(ItemStack::empty) });
-            outcome.changed.push(ItemStackResponseSlot { slot: *slot_b, item: container_slot(inventory, slot_b).unwrap_or_else(ItemStack::empty) });
+            if !set_container_slot(inventory, slot2, first) {
+                return false;
+            }
+            notify(outcome, *slot1, inventory);
+            notify(outcome, *slot2, inventory);
             true
         }
-        ItemStackRequestAction::Drop { slot, count } => {
-            // PocketMine `removeItemFromSlot` requires `count >= 1` and
-            // `count <= stack count`; it routes through the same slot
-            // translation as every other action, so the crafting windows
-            // (125/126) must be handled here too instead of `drop_from_slot`
-            // (which only knows the 0/119/120/124 windows and always
-            // errored for the craft windows).
-            if *count == 0 {
-                return false;
-            }
-            let Some(item) = container_slot(inventory, slot) else { return false };
-            if item.is_empty() || (*count as u16) > item.count {
-                return false;
-            }
-            let dropped = ItemStack { count: *count as u16, ..item.clone() };
-            let mut updated = item;
-            updated.count -= *count as u16;
-            if !set_container_slot(inventory, slot, if updated.count == 0 { ItemStack::empty() } else { updated }) {
-                return false;
-            }
-            notify(outcome, *slot, inventory);
-            outcome.dropped.push(dropped);
+        ItemStackRequestAction::Drop { count, source, .. } => {
+            let Some(item) = remove_from_slot(inventory, source, *count) else { return false };
+            notify(outcome, *source, inventory);
+            outcome.dropped.push(item);
             true
         }
-        ItemStackRequestAction::Destroy { slot, count } => {
-            if *count == 0 {
+        ItemStackRequestAction::Destroy { count, source }
+        | ItemStackRequestAction::CraftingConsumeInput { count, source } => {
+            if remove_from_slot(inventory, source, *count).is_none() {
                 return false;
             }
-            let Some(item) = container_slot(inventory, slot) else { return false };
-            if item.is_empty() || (*count as u16) > item.count {
-                return false;
-            }
-            // destroyed items vanish (creative delete)
-            let remaining = item.count.saturating_sub(*count as u16);
-            let updated = if remaining == 0 { ItemStack::empty() } else { ItemStack { count: remaining, ..item } };
-            if !set_container_slot(inventory, slot, updated) {
-                return false;
-            }
-            notify(outcome, *slot, inventory);
+            notify(outcome, *source, inventory);
             true
         }
-        ItemStackRequestAction::CreativeCreate { item, count } => {
+        ItemStackRequestAction::CraftingRecipe { recipe_network_id, repetitions }
+        | ItemStackRequestAction::CraftingRecipeAuto { recipe_network_id, repetitions, .. } => {
+            // The recipe-book variant carries the ingredient list as well; the
+            // recipe id alone is enough for the server-side model.
+            begin_crafting(mgr, *recipe_network_id, *repetitions, created)
+        }
+        ItemStackRequestAction::CreativeCreate { creative_item_id, repetitions } => {
             if !is_creative {
                 // Creative-create is only trusted from creative players.
                 return false;
             }
+            let Some(item) = creative
+                .get(creative_item_id.saturating_sub(1) as usize)
+                .filter(|item| !item.is_empty())
+            else {
+                return false;
+            };
             let mut stack = item.clone();
-            stack.count = (*count as u16).min(max_stack_size(stack.network_id));
-            if inventory.add_item(&stack) == 0 {
-                // `add_item` already moved it; report the cursor as changed.
-                outcome.changed.push(empty_slot(ItemStackContainerSlot::new(CONTAINER_CURSOR, 0)));
-                true
-            } else {
-                false
-            }
+            stack.count = (*repetitions as u16).clamp(1, max_stack_size(stack.network_id));
+            created.stack = Some(stack);
+            created.from_creative = true;
+            true
         }
-        ItemStackRequestAction::CraftRecipe { recipe_id, count } => {
-            craft_recipe(inventory, mgr, recipe_id, *count, outcome)
-        }
+        // Accepted no-ops: this server models no durability, beacon, loom,
+        // anvil or grindstone state, and rejecting them would abort inventory
+        // moves that happen to travel in the same request.
+        ItemStackRequestAction::CraftingCreateSpecificResult { .. }
+        | ItemStackRequestAction::LabTableCombine
+        | ItemStackRequestAction::BeaconPayment { .. }
+        | ItemStackRequestAction::MineBlock { .. }
+        | ItemStackRequestAction::CraftingRecipeOptional { .. }
+        | ItemStackRequestAction::CraftingGrindstone { .. }
+        | ItemStackRequestAction::CraftingLoom { .. }
+        | ItemStackRequestAction::CraftingReserved { .. }
+        | ItemStackRequestAction::CraftingNonImplemented
+        | ItemStackRequestAction::CraftingResultsDeprecated { .. } => true,
     }
 }
 
-fn take_from_slot(
+/// Is this the "created item" output (`UIInventorySlotOffset::CREATED_ITEM_OUTPUT`)?
+fn is_created_output(slot: &ItemStackContainerSlot) -> bool {
+    slot.container == UI_CREATED_OUTPUT && slot.slot == CREATED_ITEM_SLOT
+}
+
+/// `transferItems`: moves `count` items from the source to the destination.
+fn transfer(
     inventory: &mut PlayerInventory,
-    slot: &ItemStackContainerSlot,
-    count: u32,
-    changed: &mut Vec<ItemStackResponseSlot>,
+    count: u8,
+    source: &ItemStackContainerSlot,
+    destination: &ItemStackContainerSlot,
+    created: &mut CreatedItem,
+    outcome: &mut ItemStackRequestOutcome,
 ) -> bool {
-    // PocketMine `removeItemFromSlot`: count < 1 or taking more than the
-    // stack holds is an error (not a silently clamped no-op).
     if count == 0 {
         return false;
     }
-    let Some(mut item) = container_slot(inventory, slot) else { return false };
-    if item.is_empty() || (count as u16) > item.count {
-        return false;
-    }
-    let taken = count as u16;
-    item.count -= taken;
-    let cursor = inventory.cursor_item();
-    let cursor_updated = if cursor.is_empty() {
-        ItemStack { count: taken, ..item.clone().with_count(taken) }
-    } else if cursor.network_id == item.network_id && cursor.meta == item.meta && cursor.nbt == item.nbt {
-        ItemStack { count: cursor.count + taken, ..cursor.clone() }
+    let item = if is_created_output(source) {
+        let Some(stack) = created.stack.clone() else { return false };
+        // Non-creative created items are finite (one craft); the creative
+        // catalog is an unlimited source, like PocketMine's
+        // `createdItemFromCreativeInventory`.
+        if !created.from_creative && count as u16 > stack.count {
+            return false;
+        }
+        if !created.from_creative {
+            let remaining = stack.count - count as u16;
+            created.stack = if remaining == 0 {
+                None
+            } else {
+                Some(ItemStack { count: remaining, ..stack.clone() })
+            };
+        }
+        ItemStack { count: count as u16, ..stack }
     } else {
-        return false;
+        match remove_from_slot(inventory, source, count) {
+            Some(item) => item,
+            None => return false,
+        }
     };
-    if cursor_updated.count > max_stack_size(cursor_updated.network_id) {
+    if !add_to_slot(inventory, destination, &item, count) {
         return false;
     }
-    if !set_container_slot(inventory, slot, if item.count == 0 { ItemStack::empty() } else { item }) {
-        return false;
-    }
-    inventory.set_cursor(cursor_updated.clone());
-    changed.push(ItemStackResponseSlot {
-        slot: *slot,
-        item: container_slot(inventory, slot).unwrap_or_else(ItemStack::empty),
-    });
-    changed.push(ItemStackResponseSlot {
-        slot: ItemStackContainerSlot::new(CONTAINER_CURSOR, 0),
-        item: cursor_updated,
-    });
+    notify(outcome, *source, inventory);
+    notify(outcome, *destination, inventory);
     true
 }
 
-fn place_to_slot(
+/// `removeItemFromSlot`: takes `count` items out of a modelled slot.
+fn remove_from_slot(
     inventory: &mut PlayerInventory,
     slot: &ItemStackContainerSlot,
-    count: u32,
-    changed: &mut Vec<ItemStackResponseSlot>,
+    count: u8,
+) -> Option<ItemStack> {
+    if count == 0 {
+        return None;
+    }
+    let item = container_slot(inventory, slot)?;
+    if item.is_empty() || count as u16 > item.count {
+        return None;
+    }
+    let mut remaining = item.clone();
+    remaining.count -= count as u16;
+    if !set_container_slot(
+        inventory,
+        slot,
+        if remaining.count == 0 { ItemStack::empty() } else { remaining },
+    ) {
+        return None;
+    }
+    Some(ItemStack { count: count as u16, ..item })
+}
+
+/// `addItemToSlot`: only into an empty slot, or one holding the same item.
+fn add_to_slot(
+    inventory: &mut PlayerInventory,
+    slot: &ItemStackContainerSlot,
+    item: &ItemStack,
+    count: u8,
 ) -> bool {
-    // PocketMine `addItemToSlot`: count < 1 or placing more than the cursor
-    // holds is an error (not a silently clamped no-op).
     if count == 0 {
         return false;
     }
-    let cursor = inventory.cursor_item();
-    if cursor.is_empty() || (count as u16) > cursor.count {
-        return false;
-    }
     let Some(mut target) = container_slot(inventory, slot) else { return false };
-    let placed = count as u16;
     if target.is_empty() {
-        target = ItemStack { count: placed, ..cursor.clone() };
-    } else if target.network_id == cursor.network_id
-        && target.meta == cursor.meta
-        && target.nbt == cursor.nbt
+        target = ItemStack { count: count as u16, ..item.clone() };
+    } else if target.network_id == item.network_id
+        && target.meta == item.meta
+        && target.nbt == item.nbt
     {
-        target.count += placed;
+        target.count += count as u16;
         if target.count > max_stack_size(target.network_id) {
             return false;
         }
     } else {
         return false;
     }
-    let mut cursor = cursor;
-    cursor.count -= placed;
-    if !set_container_slot(inventory, slot, target) {
-        return false;
-    }
-    inventory.set_cursor(if cursor.count == 0 { ItemStack::empty() } else { cursor.clone() });
-    changed.push(ItemStackResponseSlot {
-        slot: *slot,
-        item: container_slot(inventory, slot).unwrap_or_else(ItemStack::empty),
-    });
-    changed.push(ItemStackResponseSlot {
-        slot: ItemStackContainerSlot::new(CONTAINER_CURSOR, 0),
-        item: cursor,
-    });
-    true
+    set_container_slot(inventory, slot, target)
 }
 
-fn notify(outcome: &mut ItemStackRequestOutcome, slot: ItemStackContainerSlot, inventory: &PlayerInventory) {
-    // Report the *actual* final contents: a Destroy/Drop that only takes
-    // part of a stack leaves the remainder in the slot. The old code always
-    // reported an empty stack and desynced the client.
-    outcome.changed.push(ItemStackResponseSlot {
-        slot,
-        item: container_slot(inventory, &slot).unwrap_or_else(ItemStack::empty),
-    });
-}
-
-fn craft_recipe(
-    inventory: &mut PlayerInventory,
-    mgr: &CraftingManager,
-    recipe_id: &str,
-    count: u32,
+fn notify(
     outcome: &mut ItemStackRequestOutcome,
+    slot: ItemStackContainerSlot,
+    inventory: &PlayerInventory,
+) {
+    // Report the *actual* final contents, and skip slots the server does not
+    // model (the created-item output is staged in the request itself).
+    let Some(item) = container_slot(inventory, &slot) else {
+        return;
+    };
+    outcome.changed.push((slot, item));
+}
+
+/// `beginCrafting`: resolves the recipe by its network id and stages the
+/// result in the created-item output. The client then drains the grid with
+/// `CraftingConsumeInput` actions and takes the result with a `Take` from
+/// `UI_CREATED_OUTPUT`.
+fn begin_crafting(
+    mgr: &CraftingManager,
+    recipe_network_id: u32,
+    repetitions: u8,
+    created: &mut CreatedItem,
 ) -> bool {
-    // PocketMine `beginCrafting`: repetitions < 1 or > 256 are rejected.
-    // The old code clamped 0 to 1 and accepted anything else, so a crafted
-    // stack could be handed out without the client actually consuming its
-    // inputs.
-    if count == 0 || count > MAX_CRAFT_REPETITIONS {
+    // PocketMine `beginCrafting`: repetitions outside 1..=256 are rejected.
+    if repetitions == 0 || repetitions as u32 > MAX_CRAFT_REPETITIONS {
         return false;
     }
-    let Some(craft) = mgr.recipe_by_id(recipe_id) else { return false };
-    // For shapeless recipes the ingredient list tells what to consume.
-    let wanted = recipe_id.strip_prefix("minecraft:").unwrap_or(recipe_id);
-    let recipe = mgr
-        .shapeless
-        .iter()
-        .find(|r| r.id.strip_prefix(&format!("minecraft:{wanted}#")).is_some());
-    let mut result = craft.result.clone();
-    let times = count;
-    if let Some(recipe) = recipe {
-        // Consume one of every ingredient, then add `times` results.
-        for ingredient in &recipe.ingredients {
-            if !consume_ingredient(inventory, ingredient, &mgr.tags, times) {
-                return false;
-            }
-        }
-        result.count = result.count.saturating_mul(times as u16);
-    } else {
-        // Shaped recipe: consume one of every pattern cell from the main
-        // inventory (the grid path `take_result` stays authoritative for
-        // manual grid crafting).
-        let wanted = recipe_id.strip_prefix("minecraft:").unwrap_or(recipe_id);
-        let shaped = mgr
-            .shaped
-            .iter()
-            .find(|r| r.id.strip_prefix(&format!("minecraft:{wanted}#")).is_some());
-        if let Some(shaped) = shaped {
-            let mut pending: Vec<RecipeIngredient> = shaped
-                .shape
-                .iter()
-                .flatten()
-                .filter_map(|cell| cell.clone())
-                .collect();
-            for ingredient in pending.drain(..) {
-                if !consume_ingredient(inventory, &ingredient, &mgr.tags, times) {
-                    return false;
-                }
-            }
-        }
-        result.count = result.count.saturating_mul(times as u16);
-    }
-    if inventory.add_item(&result) != 0 {
+    let Some(recipe) = mgr.recipe_by_network_id(recipe_network_id) else {
+        return false;
+    };
+    let mut result = recipe.result();
+    result.count = result.count.saturating_mul(repetitions as u16);
+    if result.is_empty() || result.count == 0 {
         return false;
     }
-    outcome.changed.push(empty_slot(ItemStackContainerSlot::new(CONTAINER_INVENTORY, 0)));
+    created.stack = Some(result);
+    created.from_creative = false;
     true
 }
 
+/// Decoded form of the `CreativeContentPacket` sent at spawn
+/// (`StaticPackets::CREATIVE_CONTENT`): entry id, item, group index.
+const CREATIVE_CONTENT_JSON: &str =
+    include_str!("../../../data/bds-capture/creative_content/1.json");
+
+/// Creative catalog in `CreativeContentPacket` order.
+///
+/// `creative_item_id` in a `CreativeCreate` action is the entry id of the
+/// catalog the client received, so the list must mirror the exact packet sent
+/// at spawn (`data/bds-capture/creative_content/1.json` is its decoded form,
+/// entry ids 1..=1875), not `data/creative/`: that generated catalog has other
+/// ids/ordering and its block runtimes are not the BDS hashes.
+pub fn creative_catalog() -> &'static [ItemStack] {
+    static CATALOG: OnceLock<Vec<ItemStack>> = OnceLock::new();
+    CATALOG.get_or_init(|| parse_creative_catalog(CREATIVE_CONTENT_JSON))
+}
+
+/// Parses the decoded creative content capture into `creative_item_id - 1`
+/// order. The `extra` payload (NBT/flags) is not modelled by `ItemStack`, so
+/// those components are dropped; id, count, meta and block runtime are kept.
+fn parse_creative_catalog(source: &str) -> Vec<ItemStack> {
+    let Ok(value) = serde_json::from_str::<Value>(source) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut catalog = vec![ItemStack::empty(); items.len()];
+    for entry in items {
+        let Some(index) = entry.get("entry_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(item) = entry.get("item") else { continue };
+        let Some(slot) = catalog.get_mut(index.saturating_sub(1) as usize) else {
+            continue;
+        };
+        let network_id = item.get("network_id").and_then(Value::as_i64).unwrap_or(0) as i16;
+        if network_id == 0 {
+            continue;
+        }
+        *slot = ItemStack {
+            network_id,
+            count: item.get("count").and_then(Value::as_u64).unwrap_or(1) as u16,
+            meta: item.get("metadata").and_then(Value::as_u64).unwrap_or(0) as u32,
+            stack_id: 0,
+            block_runtime_id: item
+                .get("block_runtime_id")
+                .and_then(Value::as_i64)
+                .unwrap_or(0) as u32,
+            nbt: Vec::new(),
+        };
+    }
+    catalog
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn consume_ingredient(
     inventory: &mut PlayerInventory,
     ingredient: &RecipeIngredient,
@@ -1612,24 +1674,28 @@ mod tests {
     fn take_place_swap_move_items_with_cursor() {
         let mut inventory = PlayerInventory::new();
         inventory.set_window_slot(WINDOW_ID_INVENTORY, 0, stack(1, 64));
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             1,
-            vec![
-                ItemStackRequestAction::Take { slot: slot(0, 0), count: 32 },
-                ItemStackRequestAction::Place { slot: slot(0, 5), count: 32 },
-            ],
+            vec![ItemStackRequestAction::Take {
+                count: 32,
+                source: slot(UI_INVENTORY, 0),
+                destination: slot(UI_HOTBAR, 5),
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_OK);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().count, 32);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count, 32);
         assert!(inventory.cursor_item().is_empty());
 
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             2,
-            vec![ItemStackRequestAction::Swap { slot_a: slot(0, 0), slot_b: slot(0, 5) }],
+            vec![ItemStackRequestAction::Swap {
+                slot1: slot(UI_INVENTORY, 0),
+                slot2: slot(UI_INVENTORY, 5),
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_OK);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().count, 32);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count, 32);
@@ -1639,11 +1705,15 @@ mod tests {
     fn drop_removes_items_and_reports_them() {
         let mut inventory = PlayerInventory::new();
         inventory.set_window_slot(WINDOW_ID_INVENTORY, 2, stack(1, 64));
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             3,
-            vec![ItemStackRequestAction::Drop { slot: slot(0, 2), count: 10 }],
+            vec![ItemStackRequestAction::Drop {
+                count: 10,
+                source: slot(UI_HOTBAR, 2),
+                randomly: false,
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_OK);
         assert_eq!(outcome.dropped, vec![stack(1, 10)]);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 2).unwrap().count, 54);
@@ -1652,13 +1722,26 @@ mod tests {
     #[test]
     fn creative_create_adds_items_for_creative_players() {
         let mut inventory = PlayerInventory::new();
-        let packet = ItemStackRequestPacket::new(
+        // The creative catalog the client received: entry 1 = the item.
+        let catalog = vec![stack(1, 64)];
+        let request = ItemStackRequest::new(
             4,
-            vec![ItemStackRequestAction::CreativeCreate { item: stack(1, 64), count: 64 }],
+            vec![
+                ItemStackRequestAction::CreativeCreate {
+                    creative_item_id: 1,
+                    repetitions: 64,
+                },
+                ItemStackRequestAction::Take {
+                    count: 64,
+                    source: slot(UI_CREATED_OUTPUT, CREATED_ITEM_SLOT),
+                    destination: slot(UI_HOTBAR, 0),
+                },
+            ],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, true);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, true, &catalog);
         assert_eq!(outcome.response.status, STATUS_OK);
         assert_eq!(inventory.total_items(), 64);
+        assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().count, 64);
     }
 
     #[test]
@@ -1818,36 +1901,72 @@ mod tests {
         assert_eq!(kind.ingredients().len(), 1);
     }
 
-    /// PocketMine `beginCrafting` rejects repetitions outside `1..=256`.
+    /// PocketMine `beginCrafting` rejects repetitions below 1 and recipe ids
+    /// outside the crafting book.
     #[test]
-    fn craft_recipe_rejects_zero_and_over_256_repetitions() {
+    fn craft_recipe_rejects_zero_repetitions_and_unknown_recipes() {
         let mgr = manager();
-        let recipe = mgr
-            .shapeless
-            .iter()
-            .find(|r| r.ingredients.len() >= 1)
-            .expect("a shapeless recipe");
-        // Build a request that would craft without the guard: count 0.
         let mut inventory = PlayerInventory::new();
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             90,
-            vec![ItemStackRequestAction::CraftRecipe {
-                recipe_id: recipe.id.clone(),
-                count: 0,
+            vec![ItemStackRequestAction::CraftingRecipe {
+                recipe_network_id: 1,
+                repetitions: 0,
             }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, mgr, &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, mgr, &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_ERROR);
-        let mut inventory = PlayerInventory::new();
-        let packet = ItemStackRequestPacket::new(
+        let unknown = mgr.recipe_count() as u32 + 100;
+        let request = ItemStackRequest::new(
             91,
-            vec![ItemStackRequestAction::CraftRecipe {
-                recipe_id: recipe.id.clone(),
-                count: 300,
+            vec![ItemStackRequestAction::CraftingRecipe {
+                recipe_network_id: unknown,
+                repetitions: 1,
             }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, mgr, &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, mgr, &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_ERROR);
+    }
+
+    /// `CreativeCreate` resolves items by the creative item network id the
+    /// client saw in `CreativeContentPacket`, so the catalog must be parsed
+    /// from the exact wire sent at spawn.
+    #[test]
+    fn creative_catalog_parses_the_sent_wire() {
+        let catalog = creative_catalog();
+        assert!(catalog.len() > 100, "catalog entries: {}", catalog.len());
+        assert!(
+            catalog.iter().filter(|item| !item.is_empty()).count() > 100,
+            "the catalog must hold real stacks"
+        );
+    }
+
+    /// A crafted result is staged in the created-item output and only appears
+    /// in the inventory when the client takes it from `UI_CREATED_OUTPUT`.
+    #[test]
+    fn crafting_recipe_stages_the_result_for_the_created_output_slot() {
+        let mgr = manager();
+        let mut inventory = PlayerInventory::new();
+        let request = ItemStackRequest::new(
+            95,
+            vec![
+                ItemStackRequestAction::CraftingRecipe {
+                    recipe_network_id: 1,
+                    repetitions: 1,
+                },
+                ItemStackRequestAction::Take {
+                    count: 1,
+                    source: slot(UI_CREATED_OUTPUT, CREATED_ITEM_SLOT),
+                    destination: slot(UI_HOTBAR, 0),
+                },
+            ],
+        );
+        let outcome = apply_item_stack_request(&mut inventory, mgr, &request, false, &[]);
+        assert_eq!(outcome.response.status, STATUS_OK);
+        let expected = mgr.recipe_by_network_id(1).unwrap().result();
+        let placed = inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap();
+        assert_eq!(placed.network_id, expected.network_id);
+        assert_eq!(placed.count, expected.count.min(1));
     }
 
     /// PocketMine's `CraftingTransaction` balances across the whole
@@ -1876,49 +1995,50 @@ mod tests {
     fn take_place_reject_impossible_counts() {
         let mut inventory = PlayerInventory::new();
         inventory.set_window_slot(WINDOW_ID_INVENTORY, 0, stack(1, 5));
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             92,
-            vec![ItemStackRequestAction::Take { slot: slot(0, 0), count: 0 }],
+            vec![ItemStackRequestAction::Take {
+                count: 0,
+                source: slot(UI_INVENTORY, 0),
+                destination: slot(UI_HOTBAR, 1),
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_ERROR);
         assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().count, 5);
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             93,
-            vec![ItemStackRequestAction::Take { slot: slot(0, 0), count: 6 }],
+            vec![ItemStackRequestAction::Take {
+                count: 6,
+                source: slot(UI_INVENTORY, 0),
+                destination: slot(UI_HOTBAR, 1),
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_ERROR);
     }
 
-    /// A Drop must be reportable in the crafting windows too (container
-    /// 125/126); the old code routed drops through `drop_from_slot`, which
-    /// only knows windows 0/119/120/124 and always errored there. A partial
-    /// drop must also report the remainder, not an empty stack.
+    /// A Drop must reach the crafting grid too: the client names it with the
+    /// `UI_CRAFTING_INPUT` container and the `UIInventorySlotOffset` slots
+    /// (28..=31 for the 2x2 grid). A partial drop must also report the
+    /// remainder, not an empty stack.
     #[test]
-    fn drop_reports_remainder_and_works_in_craft_windows() {
+    fn drop_reports_remainder_and_works_in_the_crafting_grid() {
         let mut inventory = PlayerInventory::new();
         inventory.set_craft_slot(true, 0, stack(1, 64));
-        let packet = ItemStackRequestPacket::new(
+        let request = ItemStackRequest::new(
             94,
-            vec![ItemStackRequestAction::Drop { slot: slot(CONTAINER_CRAFT_SMALL, 0), count: 10 }],
+            vec![ItemStackRequestAction::Drop {
+                count: 10,
+                source: slot(UI_CRAFTING_INPUT, UI_CRAFT_2X2_SLOT),
+                randomly: false,
+            }],
         );
-        let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+        let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
         assert_eq!(outcome.response.status, STATUS_OK);
         assert_eq!(outcome.dropped, vec![stack(1, 10)]);
         assert_eq!(inventory.craft_slot(true, 0).unwrap().count, 54);
         assert_eq!(outcome.changed.len(), 1);
-        assert_eq!(outcome.changed[0].item.count, 54);
-    }
-}
-
-// `ItemStack::with_count` is a test-only helper kept here so the Take path
-// reads cleanly; it mirrors `ItemStack { count, ..clone() }`.
-trait WithCount {
-    fn with_count(self, count: u16) -> Self;
-}
-impl WithCount for ItemStack {
-    fn with_count(self, count: u16) -> Self {
-        ItemStack { count, ..self }
+        assert_eq!(outcome.changed[0].1.count, 54);
     }
 }

@@ -49,11 +49,37 @@ regresión comparan alturas de piedra/dirt/agua contra el PHP.
   - `broadcast_changes` → `take_broadcast_changes()`
     (`SessionManager::poll_block_changes` → `UpdateBlockPacket
     0x15` a sesiones con la columna en vista).
+  - **Vecinos**: tras escribir, `set_block` ejecuta el cascada de
+    PocketMine (`World::internalNotifyNeighbourBlockUpdate` →
+    `Block::onNearbyBlockChange`): el bloque y sus 6 vecinos
+    recalculan conexiones (`bedrock_world::block_states::recalculate_connections`,
+    reglas de `Fence`/`Thin`/`Wall`) y, si el estado cambia, se
+    reescriben y se vuelve a propagar (máx. 4 pasadas hasta el punto
+    fijo, con deduplicado por celda como
+    `neighbourBlockUpdateQueueIndex`). Así una valla colocada al lado
+    de otra actualiza **las dos** en ambas colas, y romper un bloque
+    desconecta las vallas/paredes/paneles vecinos.
+  - **Coalescing**: las escrituras del cascada no se encolan una a
+    una. Se acumulan en un mapa `(x,y,z) -> (id previo, id final)` y
+    se vuelcan al final, **un `BlockChange` por celda con el estado
+    final** (equivalente a `changedBlocks` de PM, que se envía una vez
+    por tick). Antes cada paso intermedio salía como paquete propio y
+    el cliente veía las conexiones parpadear antes de estabilizarse.
   Cada cola está capada a `BLOCK_CHANGE_QUEUE_CAP = 512` y
   descarta lo **más antiguo** (nunca el más nuevo: reejecutar
   los supervivientes converge a la última edición). Un
   `set_block` sin cambio no encola nada. Rango Y
   `WORLD_MIN_Y = -64` … `WORLD_MAX_Y = 320`.
+- **Interacción**: `WorldState::interact_block` aplica `Block::onInteract()`
+  (botones, palancas, puertas de valla) sobre esta misma ruta de `set_block`,
+  así que el cambio se difunde igual y dispara el cascada de vecinos. Ver
+  `16-java-bridge.md`.
+- **Actualizaciones programadas**: `schedule_delayed_block_update(x, y, z,
+  block_id, ticks, sound)` es el `World::scheduleDelayedBlockUpdate` de PM.
+  La cola se vacía al principio de `WorldState::tick` con un contador propio
+  (sigue corriendo con `/time stop`); cada entrada se aplica con `set_block` y
+  su sonido queda en `pending_sounds`, que `SessionManager::tick` difunde a los
+  viewers. Hoy el único productor es el botón pulsado, que se suelta solo.
 - **Cachés**: `chunk_cache` (payload serializado, FIFO
   `CHUNK_PAYLOAD_CACHE_CAP = 512` — p. ej. el área de
   `view-distance:6`, 169 columnas, con hueco para dos jugadores)
@@ -66,6 +92,33 @@ regresión comparan alturas de piedra/dirt/agua contra el PHP.
   `main.rs` consulta `has_chunk_cached` para saltar columnas ya
   calientes. Sin caché, generar una columna cuesta ~18 ms; eso
   desplomaba el TPS en la carga inicial, de ahí las cachés.
+- **Consultas de bloque sueltas**: `WorldState::block_at` cae al generador
+  cuando la celda no está editada, y `propagate_connections` hace decenas de
+  consultas por edición. `NormalGenerator::block_at`/`highest_block_at`
+  guardan la columna en una caché FIFO de 32 entradas
+  (`COLUMN_CACHE_CAP`) porque `generate_chunk_internal` construye un barrio 3x3
+  con todos los populators (~12 ms medidos): sin ella, una sola rotura costaba
+  125–665 ms de generación repetida (`[lag-slow] actions=4 total=665.4ms
+  slowest=665.2ms: SetBlock`). Con caché, 200 consultas en la misma columna
+  tardan ~40 µs. La caché es solo para consultas sueltas: el streaming sigue
+  generando con ediciones aplicadas (`generate_chunk_with_edits`).
+- **Streaming y locks**: `SessionManager::drive_chunk_requests` calienta
+  antes las columnas que cada sesión va a enviar (fuera del lock de
+  sesiones) y solo después lo toma para montar los paquetes;
+  `drain_pending_outgoing_bytes` saca las colas bajo el lock y codifica
+  y comprime fuera. Generar una columna (~18 ms) o deflactar sus 62 KB
+  con `sessions.write()` tomado bloqueaba a cualquier manejador de
+  paquetes: la rotura de un bloque esperaba 60-160 ms (sonido y
+  partículas incluidos), el tick derivaba y romper rápido tiraba el
+  peer. El test `chunk_streaming_does_not_hold_the_sessions_lock` lo
+  fija.
+- **Orden por tick**: `main.rs` vacía la cola de salida *antes* del
+  tick (que hace el streaming de chunks) y otra vez después, así un ack
+  de rotura nunca espera detrás de la generación de terreno.
+- **Partículas una sola vez**: el flush de `changedBlocks` solo manda
+  el `UpdateBlock`; `PARTICLE_DESTROY_BLOCK` lo emite quien rompe
+  (`handle_block_actions` en Bedrock, `CoreHooks::break_block` en
+  Java), como `World::useBreakOn`.
 - **Edición contada**: `edited_chunk_count()` para diagnóstico.
 
 ## `world.json` v2

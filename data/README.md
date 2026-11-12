@@ -158,3 +158,31 @@ Blobs of data generated from Minecraft: Bedrock Edition used by PocketMine-MP
   </tr>
  </tbody>
 </table>
+
+## `java/`
+
+Tablas derivadas de [PrismarineJS/minecraft-data](https://github.com/PrismarineJS/minecraft-data)
+para el puente Java, una por protocolo (769 = 1.21.4, 770 = 1.21.5,
+773 = 1.21.9, 774 = 1.21.11, 775 = 26.1):
+
+- `java/blocks/<protocol>.json` — `{ "bloque": defaultState }` de todos los
+  bloques de la versión. Traduce un bloque de Bedrock a su estado global de
+  Java (`ModernProfile::block_state`).
+- `java/items/<protocol>.json` — `{ id: "item" }` con el registro de items de
+  la versión. Permite saber qué bloque coloca un jugador Java en creativo
+  (`set_creative_slot` → item → bloque).
+- `java/connections/<protocol>.json` — `{ "bloque": [estados Java] }` para los
+  bloques con conexiones (vallas, paneles, barras, paredes). El índice es el
+  layout de conexiones: 16 entradas (`north=1|east=2|south=4|west=8`) para
+  vallas/paneles/barras y 162 para paredes
+  (`east*54 + north*18 + south*6 + west*2 + up`, con `none/low/tall` = 0/1/2).
+  El índice 0 es siempre el `defaultState` del bloque. Sin esta tabla un
+  cliente Java recibía el estado por defecto y la valla se veía sin brazos.
+
+Los ids de estado de Java siguen el orden de declaración de cada bloque con la
+última propiedad variando más rápido (los booleanos valen `true=0`, `false=1`);
+la tabla se validó calculando el `defaultState` de todos los bloques conectables
+de las cinco versiones. Cada `[estado]` está listo para enviarse como id global.
+
+Se generan desde `data/pc/<versión>/blocks.json` e `items.json` del repo de
+minecraft-data (solo nombre y `defaultState` / nombre por id).

@@ -121,6 +121,12 @@ pub struct JavaSession {
     /// forwarded like sneak for Bedrock viewers.
     pub is_sprinting: bool,
     pub gamemode: i32,
+    /// Creative hotbar content set by the client (`set_creative_slot`):
+    /// Java inventory slot -> item id. The client never reports which item it
+    /// is placing, so this is the only source for `place_block`.
+    pub creative_slots: HashMap<i16, i32>,
+    /// Selected hotbar index from `held_item_slot` (0..=8).
+    pub held_slot: i16,
     pub health: f32,
     /// Chunks already sent (`sentChunks`).
     pub sent_chunks: HashSet<(i32, i32)>,
@@ -173,6 +179,8 @@ impl JavaSession {
             is_sneaking: false,
             is_sprinting: false,
             gamemode: 0,
+            creative_slots: HashMap::new(),
+            held_slot: 0,
             health: 20.0,
             sent_chunks: HashSet::new(),
             pending_chunks: VecDeque::new(),
@@ -827,6 +835,13 @@ impl JavaSession {
             self.handle_block_dig(hooks, payload, false);
         } else if packet_id == self.pid("block_place") {
             self.handle_block_place(hooks, payload, false);
+        } else if packet_id == self.pid("set_creative_slot") {
+            self.handle_creative_slot(payload);
+        } else if packet_id == self.pid("held_item_slot") {
+            let mut r = wire::Reader::new(payload);
+            if let Some(slot) = r.read_u16() {
+                self.held_slot = slot as i16;
+            }
         } else if packet_id == self.pid("entity_action") {
             self.handle_entity_action(hooks, payload);
         } else if packet_id == self.pid("player_input") {
@@ -919,12 +934,6 @@ impl JavaSession {
     }
 
     fn handle_block_place(&mut self, hooks: &dyn ServerHooks, payload: &[u8], legacy: bool) {
-        if self.gamemode != 1 {
-            self.send_chat(
-                "Colocar bloques desde Java solo está disponible en modo creativo por ahora (sin inventario). Usa /gamemode creative.",
-            );
-            return;
-        }
         let mut r = wire::Reader::new(payload);
         let (position, face, block_id) = if !legacy {
             let (Some(_hand), Some(pos), Some(face)) =
@@ -932,7 +941,7 @@ impl JavaSession {
             else {
                 return;
             };
-            (pos, face, hooks.stone_network_id())
+            (pos, face, self.held_block_network_id(hooks))
         } else {
             let Some(pos) = r.read_position() else { return };
             let Some(&face_byte) = payload.get(r.pos) else {
@@ -948,6 +957,24 @@ impl JavaSession {
             };
             (pos, face_byte as i32, block_id)
         };
+        // PM `World::useItemOn()`: the clicked block's `onInteract()` runs
+        // before item placement and consumes the click (buttons, levers,
+        // fence gates). It needs no inventory, so it also works outside
+        // creative — the gate below only guards the placement itself.
+        let (cx, cy, cz) = if legacy {
+            (position.0, position.1 - 64, position.2)
+        } else {
+            position
+        };
+        if hooks.interact_block(cx, cy, cz) {
+            return;
+        }
+        if self.gamemode != 1 {
+            self.send_chat(
+                "Colocar bloques desde Java solo está disponible en modo creativo por ahora (sin inventario). Usa /gamemode creative.",
+            );
+            return;
+        }
         let offsets = [
             (0, -1, 0),
             (0, 1, 0),
@@ -970,6 +997,43 @@ impl JavaSession {
         if !hooks.place_block(tx, ty, tz, block_id) {
             self.send_block_change(hooks, tx, ty, tz, "", None);
         }
+    }
+
+    /// Records a creative inventory slot (`SetCreativeModeSlot`):
+    /// `slot i16`, then a `Slot` (`count` varint, and only when non-zero the
+    /// item id varint; the component lists are not read).
+    fn handle_creative_slot(&mut self, payload: &[u8]) {
+        let mut r = wire::Reader::new(payload);
+        let Some(slot) = r.read_u16() else { return };
+        let slot = slot as i16;
+        let Some(count) = r.read_varint() else { return };
+        let item = if count > 0 {
+            r.read_varint().unwrap_or(0)
+        } else {
+            0
+        };
+        if item == 0 {
+            self.creative_slots.remove(&slot);
+        } else {
+            self.creative_slots.insert(slot, item);
+        }
+    }
+
+    /// Bedrock network id of the block the player is holding.
+    ///
+    /// Java inventory slots 36..=44 are the hotbar, so the selected
+    /// `held_item_slot` index picks the creative item that was set there; the
+    /// hook translates that item id into a Bedrock block. Until the client has
+    /// reported the slot the old fallback (stone) is used.
+    fn held_block_network_id(&self, hooks: &dyn ServerHooks) -> u32 {
+        let index = self.held_slot.clamp(0, 8) as i16;
+        let item = self
+            .creative_slots
+            .get(&(36 + index))
+            .or_else(|| self.creative_slots.get(&(36 + self.held_slot)))
+            .copied();
+        item.and_then(|item_id| hooks.block_network_id_for_item(self.protocol, item_id))
+            .unwrap_or_else(|| hooks.stone_network_id())
     }
 
     // ------------------------------------------------------------------
@@ -1213,8 +1277,17 @@ impl JavaSession {
             return;
         }
         self.gamemode = gamemode;
-        if let Some(name) = &self.username {
-            if let Some(entry) = self.tab_listed.get_mut(&lower(name)) {
+        // The Java player's name already carries its `.` prefix
+        // (`crate::display::java_player_name`), so both the TAB entry this
+        // client holds for itself and the `player_info` entry must use that
+        // same name: the wire UUID derives from it (`offline_uuid(name)`), and
+        // a mismatched UUID is silently ignored by the client.
+        let display = self
+            .username
+            .as_deref()
+            .map(|name| crate::display::java_player_name(name));
+        if let Some(display) = &display {
+            if let Some(entry) = self.tab_listed.get_mut(&lower(display)) {
                 entry.gamemode = gamemode;
             }
         }
@@ -1223,18 +1296,24 @@ impl JavaSession {
         }
         if self.is_modern() {
             let id = self.pid("player_info_update");
-            self.send(id, &self.modern_player_info_gamemode(gamemode, None));
-            let gsc = self.pid("game_state_change");
             self.send(
-                gsc,
-                &[wire::GAME_EVENT_CHANGE_GAMEMODE, gamemode as u8, 0, 0, 0],
+                id,
+                &self.modern_player_info_gamemode(gamemode, display.as_deref()),
             );
+            // `game_state_change` carries the gamemode as the packet's
+            // **float** parameter (survival 0.0, creative 1.0, ...). Sending
+            // it as a byte + 0.0 made the client drop back to survival, so
+            // `/gamemode creative` never showed up on the Java client.
+            let gsc = self.pid("game_state_change");
+            let mut payload = vec![wire::GAME_EVENT_CHANGE_GAMEMODE];
+            payload.extend_from_slice(&wire::float(gamemode as f32));
+            self.send(gsc, &payload);
             let abilities = self.pid("abilities");
             self.send(abilities, &abilities_payload(gamemode));
         } else {
             self.send(
                 wire::S2C_PLAYER_INFO,
-                &self.legacy_player_info_gamemode(gamemode, None),
+                &self.legacy_player_info_gamemode(gamemode, display.as_deref()),
             );
             self.send(wire::S2C_ABILITIES, &abilities_payload(gamemode));
         }
@@ -2639,7 +2718,7 @@ mod tests {
             session.seen_entities.contains_key("alex"),
             "seen key is the display name"
         );
-        // Java snapshot in the same view stays verbatim (no dot).
+        // A Java snapshot keeps its `.` prefix in the Java view too.
         let hooks_java = StubHooks {
             snapshots: vec![PlayerSnapshot {
                 name: "Procatin0".to_string(),
@@ -2656,12 +2735,12 @@ mod tests {
             }],
         };
         let tabs = tab_targets(&hooks_java, None);
-        assert_eq!(tabs[0].name, "Procatin0");
+        assert_eq!(tabs[0].name, ".Procatin0");
         // Observer is Steve, so Procatin0 is a visible target here.
         session.username = Some("Steve".to_string());
         let entities = entity_targets_for(&hooks_java, &session, &hooks_java.snapshots());
         assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].name, "Procatin0");
+        assert_eq!(entities[0].name, ".Procatin0");
     }
 
     /// Snapshots carry sneak for the Bedrock -> Java flags byte: a
@@ -2805,6 +2884,55 @@ mod tests {
         payload.extend_from_slice(&wire::varint(0)); // jumpBoost
         session.handle_entity_action(&hooks, &payload);
         assert!(session.is_sneaking);
+    }
+
+    /// The block a Java creative player places comes from the creative slot
+    /// they set (`set_creative_slot`) plus the selected hotbar index
+    /// (`held_item_slot`): the client never sends the item itself. Before this
+    /// the bridge always placed stone.
+    #[test]
+    fn creative_slot_item_decides_the_placed_block() {
+        struct PlaceHooks {
+            placed: std::sync::Mutex<Vec<u32>>,
+        }
+        impl ServerHooks for PlaceHooks {
+            fn view_distance(&self) -> i32 {
+                1
+            }
+            fn spawn(&self) -> (f64, f64, f64) {
+                (0.5, 5.62, 0.5)
+            }
+            fn snapshots(&self) -> Vec<PlayerSnapshot> {
+                vec![]
+            }
+            fn block_network_id_for_item(&self, _protocol: i32, item_id: i32) -> Option<u32> {
+                (item_id == 5).then_some(0xC0F6_8F2A)
+            }
+            fn place_block(&self, _x: i32, _y: i32, _z: i32, network_id: u32) -> bool {
+                self.placed.lock().unwrap().push(network_id);
+                true
+            }
+        }
+        let hooks = PlaceHooks {
+            placed: Default::default(),
+        };
+        let mut session = modern_session(775);
+        session.gamemode = 1;
+
+        // set_creative_slot: hotbar slot 36, one item, item id 5.
+        let mut creative = wire::short(36);
+        creative.extend_from_slice(&wire::varint(1));
+        creative.extend_from_slice(&wire::varint(5));
+        session.handle_creative_slot(&creative);
+        session.held_slot = 0;
+
+        // block_place: hand, clicked position (0,0,0), face 1 (top).
+        let mut place = wire::varint(0);
+        place.extend_from_slice(&wire::position(0, 0, 0));
+        place.extend_from_slice(&wire::varint(1));
+        session.handle_block_place(&hooks, &place, false);
+
+        assert_eq!(*hooks.placed.lock().unwrap(), vec![0xC0F6_8F2A]);
     }
 
     /// Vanilla creative breaking sends `START_DESTROY_BLOCK` (status 0) and

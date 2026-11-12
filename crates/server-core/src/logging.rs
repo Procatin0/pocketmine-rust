@@ -34,8 +34,8 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::field::{Field, Visit};
@@ -68,6 +68,36 @@ const MAIN_THREAD_NAME: &str = "Server";
 /// Initialised `server.log` writer (None when logging to file is disabled).
 static LOG_FILE: std::sync::OnceLock<Mutex<Option<LogFileWriter>>> =
     std::sync::OnceLock::new();
+
+/// One formatted event, already split for the console and `server.log`.
+struct LogLine {
+    console: String,
+    file: Option<String>,
+}
+
+enum LogMsg {
+    Line(LogLine),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Bounded queue drained by the logger thread: PocketMine's
+/// `MainLoggerThread` message queue.
+///
+/// Formatting and I/O used to run on the calling thread, so every `info!`
+/// performed a synchronous stdout write (a pipe or console handle, both
+/// blocking on Windows) plus a `server.log` write under a global mutex.
+/// In bursts — a player breaking blocks a few times per second, each break
+/// logging `level_event`, `broadcast_block_change` and `world.set_block` —
+/// that inserted 100-160 ms stalls into the game thread (measured: two
+/// adjacent statements in `apply_actions` appeared 158 ms apart), delaying
+/// break sounds/particles and eventually dropping the Bedrock connection.
+static LOG_TX: OnceLock<std::sync::mpsc::SyncSender<LogMsg>> = OnceLock::new();
+
+/// Lines dropped because the writer could not keep up.
+static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Queue depth (lines). At ~120 bytes/line this is ~1 MB of backlog.
+const LOG_QUEUE_CAP: usize = 8192;
 
 struct LogFileWriter {
     file: std::fs::File,
@@ -186,6 +216,12 @@ pub fn init() {
 
     init_log_file();
 
+    // `MainLoggerThread`: one dedicated writer for the console and
+    // `server.log`, so a slow console never stalls the game thread.
+    let (tx, rx) = std::sync::mpsc::sync_channel(LOG_QUEUE_CAP);
+    let _ = LOG_TX.set(tx);
+    spawn_log_writer(rx);
+
     tracing_subscriber::fmt()
         .event_format(ConsoleFormat {
             timer: Clock,
@@ -205,14 +241,16 @@ pub fn is_log_debug() -> bool {
     LOG_DEBUG.load(Ordering::Relaxed)
 }
 
-/// Flushes `server.log` (PM's `syncFlushBuffer()`).
+/// Flushes `server.log` (PM's `syncFlushBuffer()`): asks the logger thread to
+/// drain its queue and sync the file, waiting briefly for it.
 pub fn flush_log_file() {
-    if let Some(cell) = LOG_FILE.get() {
-        if let Ok(mut guard) = cell.lock() {
-            if let Some(writer) = guard.as_mut() {
-                let _ = writer.file.flush();
-            }
-        }
+    let Some(tx) = LOG_TX.get() else {
+        flush_file_now();
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if tx.send(LogMsg::Flush(done_tx)).is_ok() {
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
     }
 }
 
@@ -259,7 +297,8 @@ fn init_log_file() {
 }
 
 /// Writes one line to `server.log` (already `YYYY-MM-DD [..] [..]: msg\n`,
-/// stripped). File writes never affect console output.
+/// stripped). File writes never affect console output. Called from the logger
+/// thread only, so the game thread never touches the file.
 fn write_log_file_line(line: String) {
     if let Some(cell) = LOG_FILE.get() {
         if let Ok(mut guard) = cell.lock() {
@@ -268,6 +307,75 @@ fn write_log_file_line(line: String) {
             }
         }
     }
+}
+
+/// Flushes the log file (`MainLoggerThread::syncFlush`).
+fn flush_file_now() {
+    if let Some(cell) = LOG_FILE.get() {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(writer) = guard.as_mut() {
+                let _ = writer.file.flush();
+            }
+        }
+    }
+}
+
+/// Hands one formatted line to the logger thread. Never blocks the caller:
+/// a full queue drops the line (and counts it) instead of stalling the tick.
+fn emit_line(console: String, file: Option<String>) {
+    let line = LogLine { console, file };
+    let Some(tx) = LOG_TX.get() else {
+        // Before `init()` (unit tests, very early startup): write inline.
+        write_direct(line);
+        return;
+    };
+    match tx.try_send(LogMsg::Line(line)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        // Writer thread already gone (shutdown): do not lose the line.
+        Err(std::sync::mpsc::TrySendError::Disconnected(LogMsg::Line(line))) => {
+            write_direct(line);
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(LogMsg::Flush(_))) => {}
+    }
+}
+
+/// Inline write used before the logger thread exists and after it exits.
+fn write_direct(line: LogLine) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(line.console.as_bytes());
+    let _ = out.flush();
+    if let Some(file) = line.file {
+        write_log_file_line(file);
+    }
+}
+
+/// `MainLoggerThread::run()`: the only thread that writes the console and
+/// `server.log`, so game threads never wait on either.
+fn spawn_log_writer(rx: std::sync::mpsc::Receiver<LogMsg>) {
+    let _ = std::thread::Builder::new()
+        .name("Logger".to_string())
+        .spawn(move || {
+            let mut out = std::io::stdout();
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    LogMsg::Line(line) => {
+                        let _ = out.write_all(line.console.as_bytes());
+                        let _ = out.flush();
+                        if let Some(file) = line.file {
+                            write_log_file_line(file);
+                        }
+                    }
+                    LogMsg::Flush(done) => {
+                        let _ = out.flush();
+                        flush_file_now();
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
 }
 
 /// PocketMine `MainLogger` file date (`Y-m-d`).
@@ -304,16 +412,19 @@ pub fn console_message(text: &str) {
     // that opens a colour (`§c...` from `red()`, `§e...`, ...) and never
     // closes it must not tint the next line, which may not even start with
     // the AQUA prefix (PHP `Logger` writes to the same terminal).
-    let reset = if ansi { RESET } else { "" };
-    println!("{prefix}{body}{reset}");
-    let _ = std::io::stdout().flush();
+    let reset_tail = if ansi { RESET } else { "" };
+    let mut console = String::with_capacity(prefix.len() + body.len() + reset_tail.len() + 1);
+    console.push_str(&prefix);
+    console.push_str(&body);
+    console.push_str(reset_tail);
+    console.push('\n');
 
     let plain = to_plain(text);
     let file_line = format!(
         "{}[{hour:02}:{minute:02}:{second:02}.{millis:03}] [{MAIN_THREAD_NAME} thread/INFO]: {plain}\n",
         file_date_prefix(),
     );
-    write_log_file_line(file_line);
+    emit_line(console, Some(file_line));
 }
 
 /// Strips every `§` colour code (PM `TextFormat::clean`); used for files.
@@ -639,9 +750,10 @@ where
     fn format_event(
         &self,
         _ctx: &FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
+        writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        let _ = &writer;
         let level = *event.metadata().level();
         let mut collector = FieldCollector::default();
         event.record(&mut collector);
@@ -658,31 +770,34 @@ where
         let thread = thread_label();
         let (hour, minute, second, millis) = local_time();
 
-        if self.ansi {
-            let color = prefix_color(prefix);
-            write!(writer, "{AQUA}[")?;
-            self.timer.format_time(&mut writer)?;
-            write!(writer, "] {RESET}{color}[{thread}/{prefix}]:")?;
-            write!(writer, " {}{RESET}", to_ansi(&message))?;
-            writeln!(writer)
-        } else {
-            // Non-terminal: strip `§` codes like PM's `TextFormat::clean`
-            // (consoles never render `§`; files are always stripped).
-            let plain_message = to_plain(&message);
-            write!(writer, "[")?;
-            self.timer.format_time(&mut writer)?;
-            write!(writer, "] [{thread}/{prefix}]: {plain_message}\n")
+        // Format into a buffer and hand it to the logger thread: the caller
+        // must never wait on the console or the log file (see `LOG_TX`).
+        let mut console = String::with_capacity(160);
+        {
+            let mut buffer = Writer::new(&mut console);
+            if self.ansi {
+                let color = prefix_color(prefix);
+                write!(buffer, "{AQUA}[")?;
+                self.timer.format_time(&mut buffer)?;
+                write!(buffer, "] {RESET}{color}[{thread}/{prefix}]:")?;
+                write!(buffer, " {}{RESET}", to_ansi(&message))?;
+                writeln!(buffer)?;
+            } else {
+                // Non-terminal consoles never render colour codes.
+                let plain_message = to_plain(&message);
+                write!(buffer, "[")?;
+                self.timer.format_time(&mut buffer)?;
+                write!(buffer, "] [{thread}/{prefix}]: {plain_message}\n")?;
+            }
         }
-        .and_then(|()| {
-            // File copy: `Y-m-d [..] [..]: msg\n`, never ANSI.
-            let plain = to_plain(&message);
-            let file_line = format!(
-                "{}[{hour:02}:{minute:02}:{second:02}.{millis:03}] [{thread}/{prefix}]: {plain}\n",
-                file_date_prefix(),
-            );
-            write_log_file_line(file_line);
-            Ok(())
-        })
+        // File copy: `Y-m-d [..] [..]: msg`, never ANSI.
+        let plain = to_plain(&message);
+        let file_line = format!(
+            "{}[{hour:02}:{minute:02}:{second:02}.{millis:03}] [{thread}/{prefix}]: {plain}\n",
+            file_date_prefix(),
+        );
+        emit_line(console, Some(file_line));
+        Ok(())
     }
 }
 

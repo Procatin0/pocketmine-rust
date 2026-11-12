@@ -177,6 +177,18 @@ pub enum PluginAction {
         y: i32,
         z: i32,
     },
+    /// `World::addSound()`: a `LevelSoundEventPacket` to every viewer of the
+    /// chunk. Emitted by the core itself after a successful Bedrock block
+    /// placement (`LevelSoundEvent::PLACE`, mirroring PM's `BlockPlaceSound`),
+    /// and available to plugins.
+    #[serde(rename = "broadcast_sound")]
+    BroadcastSound {
+        sound: String,
+        extra_data: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
 }
 
 /// Wire form of one per-player `DiverseBossBar` override (only set

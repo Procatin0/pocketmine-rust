@@ -48,6 +48,7 @@ pub mod set_display_objective;
 pub mod set_score;
 pub mod set_scoreboard_identity;
 pub mod level_event;
+pub mod level_sound_event;
 
 pub use network_settings::{NetworkSettingsPacket, RequestNetworkSettingsPacket};
 pub use play_status::PlayStatusPacket;
@@ -123,4 +124,7 @@ pub use set_scoreboard_identity::{ScoreboardIdentityPacketEntry, SetScoreboardId
 pub use level_event::{
     level_event_wire, LEVEL_EVENT_BLOCK_BREAK_SPEED, LEVEL_EVENT_BLOCK_START_BREAK,
     LEVEL_EVENT_BLOCK_STOP_BREAK, LEVEL_EVENT_PACKET_ID,
+};
+pub use level_sound_event::{
+    level_sound_event_wire, LEVEL_SOUND_EVENT_PACKET_ID, LEVEL_SOUND_PLACE,
 };

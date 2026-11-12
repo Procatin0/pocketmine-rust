@@ -28,7 +28,7 @@
 //! `WorldManager::generateWorld`/`loadWorld(string)` therefore fall back to
 //! the single overworld and are documented as best-effort in `world.php`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
@@ -38,6 +38,9 @@ use parking_lot::{Mutex, RwLock};
 
 /// Absolute block coordinate -> network block id.
 type BlockEdits = HashMap<(i32, i32, i32), u32>;
+
+/// One coalesced edit: the id before the call and the final id.
+type Edit = (u32, u32);
 
 /// Maximum entries kept in each block-change queue (Fase 1/2 sync).
 ///
@@ -132,6 +135,17 @@ pub struct WorldState {
     auto_save_interval: std::sync::atomic::AtomicI32,
     /// Last tick recorded from PHP (`World::doTick`/`WorldManager::tick`).
     tick_count: std::sync::atomic::AtomicI32,
+    /// PM `World::scheduleDelayedBlockUpdate()` queue: `(due tick, position,
+    /// block id, sound)`. Pressed buttons are its only producer today, so a
+    /// linear scan beats a heap. Each entry restores a block state and queues
+    /// the sound PM plays from `onScheduledUpdate()`.
+    scheduled_block_updates: Mutex<Vec<(i32, (i32, i32, i32), u32, Option<String>)>>,
+    /// Tick counter driving the scheduled queue. It advances even with
+    /// `/time stop`, because scheduled updates are counted in ticks.
+    scheduled_tick: AtomicI32,
+    /// Sounds produced while the queue fired, drained once per tick by
+    /// `SessionManager::tick` (PM `World::addSound` from `onScheduledUpdate`).
+    pending_sounds: Mutex<Vec<(String, i32, i32, i32)>>,
     edits: RwLock<HashMap<(i32, i32), BlockEdits>>,
     /// Fase 1 (Bedrock -> Java): changes waiting for
     /// `world.take_block_changes`. Drained by that host call (1x/tick from
@@ -207,6 +221,9 @@ impl WorldState {
             auto_save: std::sync::atomic::AtomicBool::new(true),
             auto_save_interval: std::sync::atomic::AtomicI32::new(6000),
             tick_count: std::sync::atomic::AtomicI32::new(0),
+            scheduled_block_updates: Mutex::new(Vec::new()),
+            scheduled_tick: AtomicI32::new(0),
+            pending_sounds: Mutex::new(Vec::new()),
             edits: RwLock::new(HashMap::new()),
             block_changes: RwLock::new(VecDeque::new()),
             broadcast_changes: RwLock::new(VecDeque::new()),
@@ -292,11 +309,103 @@ impl WorldState {
     /// after hours both platforms were frozen at the join time and
     /// diverged from each other as soon as one side ran `/time`.
     pub fn tick(&self) -> i32 {
+        // Scheduled block updates count ticks, not world time, so the queue
+        // keeps running under `/time stop` (PM `World::doTick` order:
+        // scheduled updates first, then the clock).
+        let now = self.scheduled_tick.fetch_add(1, Ordering::Relaxed) + 1;
+        self.run_scheduled_block_updates(now);
         if self.is_time_running() {
             self.set_time(self.time().saturating_add(1))
         } else {
             self.time()
         }
+    }
+
+    /// PM `World::scheduleDelayedBlockUpdate($pos, $delay)`: `delay` ticks from
+    /// now the position is set back to `block_id`, and `sound` (if any) is
+    /// queued for the viewers of that chunk.
+    pub fn schedule_delayed_block_update(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        delay: i32,
+        sound: Option<&str>,
+    ) {
+        let due = self.scheduled_tick.load(Ordering::Relaxed) + delay.max(1);
+        self.scheduled_block_updates.lock().push((
+            due,
+            (x, y, z),
+            block_id,
+            sound.map(str::to_string),
+        ));
+    }
+
+    /// Applies every scheduled update that is due (PM `World::doTick` draining
+    /// `scheduledBlockUpdateQueue`). Each entry goes through [`Self::set_block`],
+    /// so viewers get the change and the Java queue sees it too.
+    fn run_scheduled_block_updates(&self, now: i32) {
+        let ready = {
+            let mut queue = self.scheduled_block_updates.lock();
+            let mut ready = Vec::new();
+            let mut index = 0;
+            while index < queue.len() {
+                if queue[index].0 <= now {
+                    ready.push(queue.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            ready
+        };
+        for (_, (x, y, z), block_id, sound) in ready {
+            self.set_block(x, y, z, block_id);
+            if let Some(sound) = sound {
+                self.pending_sounds.lock().push((sound, x, y, z));
+            }
+        }
+    }
+
+    /// Sounds queued by scheduled block updates, in firing order.
+    pub fn take_pending_sounds(&self) -> Vec<(String, i32, i32, i32)> {
+        std::mem::take(&mut *self.pending_sounds.lock())
+    }
+
+    /// PM `World::useItemOn()` interaction half: `$blockClicked->onInteract()`.
+    /// Buttons press (and schedule their own release), levers toggle and fence
+    /// gates open/close. Returns the interaction so the caller can broadcast
+    /// the matching sound (`power.on`, `power.off`, `SOUND_DOOR`); `None` when
+    /// the block has no `onInteract()` and the click must fall through to item
+    /// placement.
+    pub fn interact_block(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<bedrock_world::block_states::Interaction> {
+        let current = self.block_at(x, y, z);
+        let interaction = bedrock_world::block_states::interact(current)?;
+        if interaction.new_state != current {
+            self.set_block(x, y, z, interaction.new_state);
+            if let Some(delay) = interaction.reset_after_ticks {
+                // `Button::onScheduledUpdate()` plays `RedstonePowerOffSound`.
+                self.schedule_delayed_block_update(
+                    x,
+                    y,
+                    z,
+                    current,
+                    delay,
+                    Some(bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_POWER_OFF),
+                );
+            }
+        }
+        Some(interaction)
+    }
+
+    /// Number of block updates waiting in the scheduled queue (tests).
+    pub fn scheduled_block_update_count(&self) -> usize {
+        self.scheduled_block_updates.lock().len()
     }
 
     pub fn is_time_running(&self) -> bool {
@@ -372,6 +481,33 @@ impl WorldState {
         if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
             return false;
         }
+        // PocketMine records the touched cells in `changedBlocks`, a set keyed
+        // by position that is flushed to clients once per tick, so a block is
+        // broadcast **once with its final state**. Enqueueing every write of the
+        // neighbour cascade made a fence that connects on several sides flicker
+        // (raw placement -> correction -> neighbours fighting over the arms).
+        let mut changes: HashMap<(i32, i32, i32), Edit> = HashMap::with_capacity(8);
+        if !self.write_block(x, y, z, block_id, &mut changes) {
+            return false;
+        }
+        self.propagate_connections(x, y, z, &mut changes);
+        self.flush_changes(changes);
+        true
+    }
+
+    /// Writes one edit without broadcasting it: the change is recorded in
+    /// `changes` (first previous id + last state) for [`WorldState::flush_changes`].
+    fn write_block(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        changes: &mut HashMap<(i32, i32, i32), Edit>,
+    ) -> bool {
+        if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
+            return false;
+        }
 
         let previous = self.block_at(x, y, z);
         if previous == block_id {
@@ -397,11 +533,117 @@ impl WorldState {
             .entry((x >> 4, z >> 4))
             .or_insert(0) += 1;
 
-        let change = BlockChange::with_previous(x, y, z, block_id, previous);
-        push_capped(&mut self.block_changes.write(), change);
-        push_capped(&mut self.broadcast_changes.write(), change);
-        tracing::info!("world.set_block: ({},{},{}) id={:#010X} enqueued", x, y, z, block_id);
+        let entry = changes.entry((x, y, z)).or_insert((previous, block_id));
+        entry.1 = block_id;
         true
+    }
+
+    /// Enqueues one [`BlockChange`] per touched cell, in coordinate order.
+    ///
+    /// This is PocketMine's `changedBlocks` flush: intermediate states of the
+    /// neighbour cascade never reach clients, only the final one.
+    fn flush_changes(&self, changes: HashMap<(i32, i32, i32), Edit>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut entries: Vec<((i32, i32, i32), Edit)> = changes.into_iter().collect();
+        entries.sort_unstable_by_key(|(position, _)| *position);
+        let mut java = self.block_changes.write();
+        let mut broadcast = self.broadcast_changes.write();
+        for ((x, y, z), (previous, block_id)) in entries {
+            if previous == block_id {
+                continue;
+            }
+            let change = BlockChange::with_previous(x, y, z, block_id, previous);
+            push_capped(&mut java, change);
+            push_capped(&mut broadcast, change);
+            tracing::debug!("world.set_block: ({},{},{}) id={:#010X} enqueued", x, y, z, block_id);
+        }
+    }
+
+    /// PocketMine's `World::internalNotifyNeighbourBlockUpdate()` cascade.
+    ///
+    /// `setBlockAt($update = true)` queues the block itself plus its six
+    /// neighbours; in the tick each queued block runs `onNearbyBlockChange()`,,
+    /// and connectables (`Fence`/`Thin` via `HorizontalConnectableTrait`,
+    /// `Wall`) recompute their horizontal connections and re-set themselves when
+    /// the state changed, which queues them again. Replicating it here means a
+    /// fence placed next to another fence updates *both*: the placed one gets
+    /// its connections and the existing one connects to it, and every state
+    /// change is enqueued for Bedrock (`UpdateBlockPacket`) and Java
+    /// (`block_change`) instead of only the original cell.
+    ///
+    /// Runs synchronously right after the edit (one tick earlier than PM, same
+    /// observable result) and is bounded so a long fence line cannot loop.
+    fn propagate_connections(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        changes: &mut HashMap<(i32, i32, i32), Edit>,
+    ) {
+        use bedrock_world::block_states;
+
+        const NEIGHBOURS: [(i32, i32, i32); 6] = [
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+            (-1, 0, 0),
+            (1, 0, 0),
+        ];
+        /// A fence chain settles in two passes; this only bounds pathological
+        /// layouts (the states are a pure function of the neighbours, so the
+        /// loop reaches a fixed point).
+        const MAX_PASSES: usize = 4;
+
+        let mut frontier: Vec<(i32, i32, i32)> = Vec::with_capacity(32);
+        frontier.push((x, y, z));
+        for (dx, dy, dz) in NEIGHBOURS {
+            frontier.push((x + dx, y + dy, z + dz));
+        }
+
+        for _ in 0..MAX_PASSES {
+            // PM dedupes the neighbour queue with `neighbourBlockUpdateQueueIndex`:
+            // each block is recomputed at most once per drain.
+            let mut visited: HashSet<(i32, i32, i32)> = HashSet::with_capacity(frontier.len());
+            let mut changed: Vec<(i32, i32, i32)> = Vec::new();
+            for (bx, by, bz) in frontier.drain(..) {
+                if !visited.insert((bx, by, bz)) || !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&by) {
+                    continue;
+                }
+                let current = self.block_at(bx, by, bz);
+                let Some(updated) = block_states::recalculate_connections(current, |dx, dy, dz| {
+                    self.block_at(bx + dx, by + dy, bz + dz)
+                }) else {
+                    continue;
+                };
+                if !self.write_block(bx, by, bz, updated, changes) {
+                    continue;
+                }
+                tracing::debug!(
+                    "world.connection_update: ({},{},{}) {:#010X} -> {:#010X}",
+                    bx,
+                    by,
+                    bz,
+                    current,
+                    updated
+                );
+                changed.push((bx, by, bz));
+            }
+            if changed.is_empty() {
+                return;
+            }
+            // `setBlockAt($update = true)` re-queues the block and its six
+            // neighbours, which settles a chain (only the final states are
+            // broadcast, so passes cannot be seen as flicker).
+            for (bx, by, bz) in changed {
+                frontier.push((bx, by, bz));
+                for (dx, dy, dz) in NEIGHBOURS {
+                    frontier.push((bx + dx, by + dy, bz + dz));
+                }
+            }
+        }
     }
 
     /// Drains the Java-facing queue (Fase 1), oldest first.
@@ -827,6 +1069,95 @@ mod tests {
         assert_eq!(world.pending_block_changes(), 0);
     }
 
+    /// PocketMine's neighbour cascade (`internalNotifyNeighbourBlockUpdate`):
+    /// placing a fence next to an existing fence must update *both* states and
+    /// queue both for broadcast, otherwise the old fence keeps rendering
+    /// without its new connection on every client.
+    /// True when a Bedrock connectable state has the given horizontal connection.
+    fn connected(id: u32, dir: &str) -> bool {
+        let key = format!("minecraft:connection_{dir}");
+        bedrock_world::block_states::state_properties(id).is_some_and(|props| {
+            props.iter().any(|(name, value)| {
+                name == &key && *value == bedrock_world::block_states::Value::Byte(1)
+            })
+        })
+    }
+
+    /// A fence placed between two fences touches three cells. Like PM's
+    /// `changedBlocks` flush, each cell is broadcast once with its **final**
+    /// state: the intermediate states of the cascade (what made the client
+    /// flicker while arms fought over connections) never leave the server.
+    #[test]
+    fn a_fence_between_two_fences_broadcasts_each_cell_once() {
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let fence = block_states::network_id("jungle_fence").expect("jungle_fence");
+        assert!(world.set_block(0, 80, 0, fence));
+        assert!(world.set_block(2, 80, 0, fence));
+        world.take_changes();
+        world.take_broadcast_changes();
+
+        assert!(world.set_block(1, 80, 0, fence));
+        let changes = world.take_changes();
+        let mut positions: Vec<i32> = changes.iter().map(|change| change.x).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1, 2], "one change per cell: {changes:?}");
+
+        let middle = changes
+            .iter()
+            .find(|change| change.x == 1)
+            .expect("middle fence")
+            .block_id;
+        assert!(connected(middle, "east") && connected(middle, "west"));
+
+        // Idempotent: the cascade reached its fixed point, a second identical
+        // set is a no-op (nothing left to flicker).
+        assert!(!world.set_block(1, 80, 0, middle));
+        assert!(world.take_changes().is_empty());
+    }
+
+    #[test]
+    fn placing_a_fence_updates_the_neighbour_fence_too() {
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let fence = block_states::network_id("jungle_fence").expect("jungle_fence");
+        let (x, y, z) = (4, 80, 4);
+
+        // Lone fence: whatever the client predicted, it ends up disconnected.
+        assert!(world.set_block(x, y, z, fence));
+        let changes = world.take_changes();
+        let placed = changes.iter().find(|change| change.x == x).expect("placed").block_id;
+        assert!(!connected(placed, "east") && !connected(placed, "west"));
+        world.take_broadcast_changes();
+
+        // Fence to its east: the placed one connects west and the existing one
+        // connects east, both in the same batch.
+        assert!(world.set_block(x + 1, y, z, fence));
+        let changes = world.take_changes();
+        // Like PM, the placement is written first and then corrected by the
+        // neighbour update, so the *last* change per cell is the final state.
+        let last = |cell_x: i32| {
+            changes
+                .iter()
+                .rev()
+                .find(|change| change.x == cell_x)
+                .expect("a change for this cell")
+                .block_id
+        };
+        assert!(connected(last(x + 1), "west"), "placed fence connects west");
+        assert!(connected(last(x), "east"), "existing fence connects east");
+        assert!(
+            changes.iter().all(|change| change.x == x || change.x == x + 1),
+            "no other cell may change: {changes:?}"
+        );
+
+        // Bedrock viewers get the same updates (`UpdateBlockPacket`).
+        let broadcast = world.take_broadcast_changes();
+        assert_eq!(broadcast, changes, "both queues carry the same changes");
+    }
+
     #[test]
     fn java_and_bedrock_queues_are_independent() {
         let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
@@ -906,5 +1237,44 @@ mod tests {
         assert_eq!(world.chunk_cache.lock().entries.len(), 1);
         // And the edited payload is itself cached again.
         assert_eq!(world.chunk_payload(3, -2), edited);
+    }
+
+    #[test]
+    fn a_scheduled_update_restores_the_block_and_queues_its_sound() {
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let button = bedrock_world::block_states::network_id("stone_button").unwrap();
+        let pressed =
+            bedrock_world::block_states::with_property(button, "button_pressed_bit", "true")
+                .unwrap();
+        world.set_block(4, 80, 4, pressed);
+        // PM `World::scheduleDelayedBlockUpdate($pos, Button::getActivationTime())`.
+        world.schedule_delayed_block_update(4, 80, 4, button, 20, Some("power.off"));
+        for _ in 0..19 {
+            world.tick();
+        }
+        assert_eq!(world.block_at(4, 80, 4), pressed);
+        assert!(world.take_pending_sounds().is_empty());
+
+        world.tick();
+        // `Button::onScheduledUpdate()`: released state plus `RedstonePowerOffSound`.
+        assert_eq!(world.block_at(4, 80, 4), button);
+        assert_eq!(
+            world.take_pending_sounds(),
+            vec![("power.off".to_string(), 4, 80, 4)]
+        );
+        assert_eq!(world.scheduled_block_update_count(), 0);
+    }
+
+    #[test]
+    fn a_scheduled_update_runs_with_the_clock_stopped() {
+        // `/time stop` must not freeze scheduled block updates: they count
+        // ticks, not world time (PM keeps ticking the scheduled queue).
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        world.stop_time();
+        world.set_block(6, 80, 6, 42);
+        world.schedule_delayed_block_update(6, 80, 6, 0, 1, None);
+        world.tick();
+        assert!(world.take_pending_sounds().is_empty());
+        assert_eq!(world.block_at(6, 80, 6), 0);
     }
 }

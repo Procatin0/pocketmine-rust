@@ -1,15 +1,15 @@
 # PocketMine-Rust — Estado del port de axolotl-pm y hoja de ruta
 
-Última actualización: 2026-11-05
+Última actualización: 2026-11-12
 Referencia de comportamiento: `target/axolotl-pm` (PocketMine-MP 5 / axolotl) y
 `target/axolotl-bedrock-protocol` (protocolo 2225). Ambos clones viven en
 `target/` y **no se versionan**: se recrean cuando hacen falta.
 
 Regla del port: cada comando y cada paquete se traduce **uno a uno** desde el
 PHP. Mismos nombres, mismos argumentos, mismos límites, mismos mensajes
-(claves de traducción de PocketMine, locale español) y mismos efectos. Si algo
-no se puede replicar todavía, se documenta en la fase correspondiente en vez de
-inventar un comportamiento distinto.
+(claves de traducción de PocketMine) y mismos efectos. Si algo no se puede
+replicar todavía, se documenta en la fase correspondiente en vez de inventar un
+comportamiento distinto.
 
 ---
 
@@ -17,403 +17,363 @@ inventar un comportamiento distinto.
 
 ```
 pocketmine-rust/
-├── Cargo.toml                     workspace: 6 crates, resolver 2
+├── Cargo.toml                     workspace: 8 crates, resolver 2
 ├── HANDOFF.md                     estado previo del puente PHP
 ├── server.properties              config del servidor (allow-cheats, view-distance, ...)
 ├── pocketmine.yml                 config estilo PM (generadores, etc.)
-├── allowlist.json / white-list.txt / ops.txt (se crea al usar /op)
+├── allowlist.json / white-list.txt / ops.txt
 ├── docs/
 │   ├── plugin-api-contract.md     contrato del puente Rust ↔ PHP
-│   └── PORT-ROADMAP.md            ESTE documento
+│   ├── PORT-ROADMAP.md            ESTE documento
+│   └── wiki/                      13 páginas (comandos, eventos, permisos,
+│                                  scheduler, inventario/crafteo, scoreboard,
+│                                  puente Java, mundo/persistencia, deploy)
 ├── data/                          datos extraídos de BDS / BedrockData
-│   ├── item_ids.txt               [nuevo] 834 items clásicos: identifier<TAB>id
-│   ├── bds-capture/               38 capturas reales de paquetes (login, chunks,
-│   │                              inventario, respawn, comandos, item registry...)
-│   ├── canonical_block_states.nbt, block_properties_table.json, item_tags.json,
-│   │   biome_definitions.json, biome_id_map.json, entity_id_map.json,
-│   │   required_item_list.json, creative/, recipes/, enums/
+│   ├── item_ids.txt               834 items clásicos: identifier<TAB>id
+│   ├── bds-capture/               38 capturas reales de paquetes
+│   ├── canonical_block_states.nbt block_properties_table.json
+│   ├── biome_definitions.json, biome_id_map.json, entity_id_map.json
+│   ├── required_item_list.json, creative/, recipes/, enums/
+│   ├── java/                      tablas del puente Java:
+│   │   ├── blocks/                 estados de bloque por protocolo
+│   │   ├── items/                  items por protocolo
+│   │   ├── connections/            estados de conexión (vallas, muros, ...)
+│   │   └── 769.json 770.json 773.json 774.json 775.json
 │   └── README.md                  procedencia de cada blob
-├── plugins/                       plugins PHP de prueba
-│   ├── ExamplePlugin/  ChatGuard/  TestKit/  EconomyLite/
+├── plugins/                       6 plugins PHP de prueba + ScoreHud.phar
 ├── plugin_data/                   datos generados por los plugins (no versionar)
 └── crates/
-    ├── bedrock-protocol/          (≈3.700 líneas) protocolo 2225
-    │   ├── src/lib.rs
+    ├── bedrock-protocol/          ≈11.400 líneas, protocolo 2225
     │   ├── src/binary.rs          Reader/Writer (varint, zigzag, LE, strings)
     │   ├── src/batch.rs           batch/zlib por frame
+    │   ├── src/nbt.rs             NBT de red
     │   ├── src/types.rs           BlockPos, Vector3f, ...
-    │   ├── src/packets/           [25 módulos]
-    │   │   ├── mod.rs
-    │   │   ├── login.rs                    0x01 Login
-    │   │   ├── play_status.rs              0x02
-    │   │   ├── resource_packs.rs           0x06 / 0x07 / 0x08
-    │   │   ├── start_game.rs               0x0B
-    │   │   ├── set_spawn_position.rs       0x43
-    │   │   ├── level_chunk.rs              0x3A
-    │   │   ├── network_chunk_publisher_update.rs  0x79
-    │   │   ├── chunk_radius.rs             0x5A
-    │   │   ├── network_settings.rs         0x8F
-    │   │   ├── request_ability.rs          0xBA
-    │   │   ├── player_auth_input.rs        0x90
-    │   │   ├── set_player_game_type.rs     0x3E
-    │   │   ├── update_player_game_type.rs  0x97
-    │   │   ├── update_abilities.rs         0xBC
-    │   │   ├── text.rs                     0x09
-    │   │   ├── command_request.rs          0x4D
-    │   │   ├── available_commands.rs       0x4C
-    │   │   ├── disconnect.rs               0x05
-    │   │   ├── packet_violation_warning.rs 0x9C
-    │   │   ├── item_stack.rs               ItemStack de red (2225)
-    │   │   ├── inventory_content.rs        0x31
-    │   │   ├── inventory_slot.rs           0x32
-    │   │   ├── inventory_transaction.rs    0x1E
-    │   │   ├── set_health.rs               0x2A
-    │   │   ├── set_title.rs                0x58
-    │   │   ├── remove_actor.rs             0x0E
-    │   │   ├── move_actor_absolute.rs      0x12
-    │   │   ├── transfer.rs                0x55
-    │   │   ├── actor_event.rs              0x1B (DEATH_ANIMATION)
-    │   │   └── respawn.rs                  0x2D
-    │   └── tests/session_packets_test.rs   (11 tests de roundtrip)
-    ├── bedrock-world/             (≈3.400 líneas)
+    │   └── src/packets/           52 módulos con 54 paquetes implementados
+    ├── bedrock-world/             ≈6.800 líneas
     │   ├── src/chunk.rs, subchunk.rs, paletted_block_array.rs
     │   ├── src/block_id.rs        registro de bloques
-    │   ├── src/network.rs         serialización de subchunks
-    │   ├── src/generator/         flat, normal, biome, noise/simplex,
-    │   │                          populators/{tree,ore,ground_cover,tall_grass}
-    │   └── tests/{block_access,generator,subchunk_network}_test.rs
-    ├── server-core/               (≈6.500 líneas) servidor
+    │   ├── src/block_states.rs    tabla canónica, propiedades, `interact`
+    │   ├── src/java_chunk.rs      serialización de chunk Java (moderno y legacy)
+    │   ├── src/network.rs         serialización de subchunks Bedrock
+    │   └── src/generator/         flat, normal, biome, noise/simplex, populators
+    ├── server-core/               ≈32.100 líneas, servidor
     │   ├── src/main.rs            arranque, config, consola, tick loop 20 TPS
     │   ├── src/session.rs         PlayerSession + SessionManager (login → juego)
-    │   ├── src/command.rs         framework + 22 comandos nativos
-    │   ├── src/inventory.rs       PlayerInventory (36 slots) + registro de items
-    │   ├── src/world_state.rs     mundo mutable, spawn, hora, clima, ediciones
-    │   ├── src/config.rs          server.properties / pocketmine.yml
+    │   ├── src/world_state.rs     mundo mutable, ediciones, hora, clima, guardado
+    │   ├── src/command.rs         49 comandos nativos + framework
+    │   ├── src/inventory.rs       PlayerInventory (cuatro ventanas)
+    │   ├── src/crafting.rs        CraftingManager, recetas, ItemStackRequest
+    │   ├── src/permission.rs      PermissionManager (nodos + attachments)
+    │   ├── src/scoreboard.rs      scoreboards por jugador
+    │   ├── src/bossbar.rs         boss bars (apiBossBar)
     │   ├── src/plugin_host.rs     PlayerRegistry + ServerPluginHost
-    │   ├── src/identity.rs        JWT de login → nombre/XUID
-    │   ├── src/static_packets.rs  StartGame y compañía
-    │   ├── src/logging.rs
-    │   └── tests/{session_lifecycle,item_health_commands}_test.rs
-    ├── nethernet-rs/              (≈1.500 líneas) transporte NetherNet
-    │   ├── src/signaling.rs, negotiation.rs, identity.rs, info.rs
-    │   └── tests/{signaling,nat,reconnect}_test.rs
-    ├── raklib-rs/                 (≈890 líneas) RakNet (unconnected ping/pong)
-    │   └── src/{lib,offline}.rs + tests/offline_test.rs
-    └── php-plugin-bridge/         (≈3.700 líneas Rust + PHP embebido)
-        ├── php/*.php              API PM5 en PHP (math, text, block, world,
-        │                          player, item, command, scheduler, event,
-        │                          plugin, ipc, bootstrap)
-        ├── src/runtime/{php,bootstrap,native}.rs
-        ├── src/{manager,plugin,event,context,host,command,error}.rs
-        └── src/events/{player,block,server,mod}.rs
+    │   ├── src/java_hooks.rs      hooks del mundo hacia el puente Java
+    │   ├── src/java_sync.rs       gamemode/teleport/tiempo/tab/entidades Java
+    │   ├── src/anvil.rs           lógica del yunque (4 etapas de daño)
+    │   ├── src/nbt_json.rs        NBT de `/give [...tags]`
+    │   ├── src/access.rs          ban/whitelist/ops
+    │   ├── src/query.rs           GS4 Query
+    │   ├── src/crash.rs           crash dumps
+    │   ├── src/updater.rs         comprobación de actualizaciones
+    │   ├── src/metrics.rs         TPS (`/tps`) + sonda de latencia `[lag]`
+    │   ├── src/translations.rs    catálogo `eng.ini` embebido
+    │   └── src/logging.rs         hilo escritor de logs
+    ├── java-bridge/               ≈5.900 líneas, servidor Java Edition
+    │   ├── src/server.rs, session.rs, wire.rs
+    │   ├── src/hooks.rs           mundo/entidades desde el núcleo Rust
+    │   ├── src/display.rs         scoreboard, boss bar, tab
+    │   └── src/profile.rs         skins/perfiles
+    ├── java-protocol/             ≈3.000 líneas, paquetes Java (775 y anteriores)
+    ├── nethernet-rs/              ≈1.700 líneas, transporte NetherNet (WebRTC)
+    ├── raklib-rs/                 ≈690 líneas, RakNet (offline ping/pong)
+    └── php-plugin-bridge/         ≈5.500 líneas Rust + PHP embebido
+        ├── php/*.php              API PM5 en PHP (block, world, player, item,
+        │                          command, scheduler, event, plugin, ipc, ...)
+        └── src/events/{player,block,server}.rs
 ```
 
-Comprobaciones actuales (2026-11-05):
+---
+
+## 2. Comprobaciones actuales (2026-11-12)
 
 ```
-cargo check --workspace                      → OK
-cargo test -p bedrock-protocol -p server-core → 85 tests OK
+cargo check --workspace --all-targets        → OK (0 errores)
+cargo test -p server-core --lib              → 240 OK
+cargo test -p bedrock-protocol --lib         → 109 OK
+cargo test -p bedrock-world --lib            →  41 OK
+cargo test -p java-bridge                    →  37 + 3 doctests OK
 php -l sobre crates/php-plugin-bridge/php/*.php → OK (ver HANDOFF.md)
 ```
 
+Recuento de `#[test]` por crate (unitarios + integración):
+`server-core` ≈300, `bedrock-protocol` ≈120, `bedrock-world` ≈80,
+`java-protocol` ≈65, `java-bridge` 37, `php-plugin-bridge` ≈36,
+`nethernet-rs` 8, `raklib-rs` (tests de integración aparte).
+
+Nota operativa: los tests de integración de `server-core` necesitan otro
+`CARGO_TARGET_DIR` si hay un servidor en marcha, porque Windows bloquea
+`target/debug/server-core.exe`.
+
 ---
 
-## 2. Cobertura por subsistema
+## 3. Cobertura por subsistema
 
 | Subsistema de axolotl-pm | Archivos PHP | Dónde vive en Rust | Estado |
 |---|---:|---|---|
-| `network/` (sesiones, sesión de jugador, raknet, compresión) | 109 | `server-core/session.rs`, `nethernet-rs`, `raklib-rs` | 🟡 login, chunks y chat funcionan; falta el resto |
-| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 29 de 248 |
-| `world/` (chunks, generadores, luz, formatos) | 278 | `bedrock-world` | 🟡 generación sin luz ni persistencia |
-| `block/` (402 bloques) | 402 | `bedrock-world/block_id.rs` | 🔴 ids planos, sin estados ni comportamientos |
-| `entity/` + `player/` | 93 | parcial en `session.rs` | 🔴 un solo jugador visible para sí mismo |
-| `inventory/` | 35 | `server-core/inventory.rs` | 🟡 cuatro ventanas + `InventoryTransaction` |
-| `item/` | 154 | `inventory.rs` (registro) | 🟡 834 items por id, sin NBT/data-driven |
-| `command/` (41 comandos + framework) | 53 | `server-core/command.rs` | 🟡 22 comandos, sin nodos de permiso |
-| `permission/` | 14 | `CommandSource::can_use_privileged` | 🔴 op/allow-cheats, sin `PermissionManager` real |
-| `event/` | 152 | `php-plugin-bridge/events/` | 🟡 subconjunto (join, quit, move, chat, command) |
-| `plugin/`, `scheduler/` | 37 | `php-plugin-bridge` | 🟢 funcional para plugins PHP simples |
-| `crafting/` | 25 | — | 🔴 sin empezar |
-| `form/` | 2 | — | 🔴 sin empezar |
+| `network/` (sesiones, raknet, compresión) | 109 | `session.rs`, `nethernet-rs`, `raklib-rs` | 🟢 login, chunks, chat, inventario; sin rate limiting |
+| `protocol/` (248 paquetes) | 248 | `bedrock-protocol/packets/` | 🟡 54 de 248; faltan `AddPlayer`, `PlayerList`, `AddActor` |
+| `world/` (chunks, generadores, luz, formatos) | 278 | `bedrock-world` | 🟡 generación sin luz; persistencia propia (JSON) |
+| `block/` (402 bloques) | 402 | `block_states.rs` + `block_id.rs` | 🟢 estados canónicos, propiedades, interacción, conexiones |
+| `entity/` + `player/` | 93 | `session.rs`, `java_sync.rs` | 🔴 sin entidades vivas ni visibilidad entre jugadores |
+| `inventory/` | 35 | `inventory.rs` | 🟢 cuatro ventanas + transacciones atómicas |
+| `item/` | 154 | `inventory.rs`, `nbt_json.rs` | 🟡 items por id + NBT JSON; sin data-driven completo |
+| `crafting/` | 25 | `crafting.rs` + `data/recipes/` | 🟢 shaped/shapeless/furnace/potion, rejillas 2x2 y 3x3 |
+| `command/` (41 comandos + framework) | 53 | `command.rs` | 🟢 49 registrados, permisos por nodo |
+| `permission/` | 14 | `permission.rs` | 🟢 nodos, defaults, attachments |
+| `event/` | 152 | `php-plugin-bridge/events/` | 🟡 jugador, bloque, servidor, mundo, inventario |
+| `plugin/`, `scheduler/` | 37 | `php-plugin-bridge` | 🟢 directorios y `.phar`, tareas, autoload PSR-4 |
+| `scoreboard/` | 3 | `scoreboard.rs` + `java-bridge/display.rs` | 🟢 por jugador, también para clientes Java |
+| `form/` | 2 | `php/player.php::sendForm` | 🔴 stub documentado (sin paquete de formularios) |
 | `resourcepacks/` | 9 | `resource_packs.rs` | 🟡 handshake básico |
-| `lang/` (traducciones) | 3 + .ini | `translations.rs` + `resources/spa.ini` | 🟡 locale embebido y 25 constantes verificadas; migración completa pendiente |
-| `utils/`, `console/`, `timings/`, `crash/`, `wizard/`, `data/` | 240 | disperso | 🔴 mínimo |
+| `lang/` | 3 + .ini | `translations.rs` | 🟡 `eng.ini` embebido; locale configurable pendiente |
+| `utils/`, `console/`, `timings/`, `crash/`, `wizard/`, `data/` | 240 | disperso | 🟡 consola ✅, crash ✅, update checker ✅, `/timings` básico |
 
 ---
 
-## 3. Estado de los comandos nativos
+## 4. Estado de los comandos nativos — 49/49 portados
 
-### Portados (40 registrados, con alias)
+No queda ningún comando de `command/defaults/*.php` sin portar. Los ocho que
+faltaban (`status`, `effect`, `enchant`, `xp`, `particle`, `timings`, `gc`,
+`dumpmemory`) ya están registrados con sus nodos de permiso y sus mensajes.
 
-| Comando | Alias | Notas |
-|---|---|---|
-| `/help` | `?` | tabla local |
-| `/tp` | `teleport` | coordenadas absolutas y relativas |
-| `/gamemode` | `gm` | survival/creative/adventure/spectator; `gameMode.changed` al objetivo y `chat.type.admin` a ops, como `GamemodeCommand` |
-| `/gmc` `/gms` `/gma` `/gmsp` | — | atajos |
-| `/spawn` | — | propios de Bedrock, no de PM |
-| `/setworldspawn` | — | persiste en `WorldState` |
-| `/say` `/me` | — | chat |
-| `/msg` | `tell`, `w`, `whisper` | privado |
-| `/list` | `players` | |
-| `/kick` | — | |
-| `/give` | — | claves vanilla, `item[:meta]`, 1..32767 |
-| `/clear` | — | `maxCount -1/0/n`, cuatro ventanas; `clear.self`/`clear.other` |
-| `/kill` | `suicide` | mensaje `commands.kill.successful` |
-| `/time` | — | set/add/query |
-| `/weather` | — | propio de Bedrock |
-| `/op` `/deop` | — | escribe `ops.txt` |
-| `/version` | `ver` | |
-| `/spawnpoint` | — | `getRelativeDouble`, reaparición por sesión |
-| `/defaultgamemode` | — | gamemode por defecto de sesiones nuevas |
-| `/difficulty` | — | `SetDifficultyPacket` (0x3C) a todos |
-| `/seed` | — | semilla del `WorldGenerator` |
-| `/ban` | — | `banned-players.txt`, expulsa si está en línea |
-| `/ban-ip` | — | `banned-ips.txt`, expulsa la IP |
-| `/banlist` | — | `ips` / `players` |
-| `/pardon` | `unban` | |
-| `/pardon-ip` | `unban-ip` | |
-| `/whitelist` | — | `on/off/list/add/remove/reload` + expulsión, un nodo por subcomando |
-| `/stop` | — | activa el apagado ordenado |
-| `/plugins` | `pl` | `load_order()` del `PluginManager` |
-| `/save-all` | — | `world.json` + `players/<nombre>.json` |
-| `/save-on` `/save-off` | — | bandera de autoguardado (6000 ticks) |
-| `/tps` | — | extensión nativa estilo PaperMC (1m/5m/15m) |
-| `/title` | — | `SetTitlePacket` (0x58): `clear`, `reset`, `title`, `subtitle`, `actionbar`, `times` |
-| `/transferserver` | — | `TransferPacket` (0x55); sólo jugadores y sin mensaje de éxito, como `TransferServerCommand` |
+| Grupo | Comandos |
+|---|---|
+| Núcleo | `/help` `?`, `/version` `ver`, `/plugins` `pl`, `/list` `players`, `/stop`, `/tps`, `/timings`, `/status`, `/gc`, `/dumpmemory` |
+| Jugador | `/gamemode` `gm` + `/gmc` `/gms` `/gma` `/gmsp`, `/defaultgamemode`, `/tp` `teleport`, `/spawn`, `/spawnpoint`, `/setworldspawn`, `/kill` `suicide`, `/effect`, `/enchant`, `/xp`, `/give`, `/clear` |
+| Mundo | `/time`, `/weather`, `/difficulty`, `/seed`, `/particle` |
+| Chat | `/say`, `/me`, `/msg` `tell`/`w`/`whisper`, `/title` |
+| Administración | `/op`, `/deop`, `/ban`, `/ban-ip`, `/banlist`, `/pardon` `unban`, `/pardon-ip` `unban-ip`, `/whitelist`, `/kick`, `/transferserver`, `/save-all`, `/save-on`, `/save-off`, `/scoreboard` `sb` |
 
-### Pendientes de axolotl-pm (8)
+Notas de paridad de los últimos portados:
 
-`dumpmemory`, `effect`, `enchant`, `gc`, `particle`, `status`, `timings`, `xp`.
-Estos necesitan sistemas que aún no existen: métricas de tick/red,
-`TransferPacket`, efectos de entidad, experiencia, encantamientos (NBT),
-partículas y volcados de memoria.
+- `/status` y `/timings` leen `TickMetrics`; `/tps` mantiene las ventanas de
+  1/5/15 min estilo PaperMC.
+- `/gc` emite `CommandAction::GarbageCollect` y `/dumpmemory` escribe el volcado (con ruta opcional), como `GarbageCollectCommand`/`DumpMemoryCommand`.
+- `/xp` emite `CommandAction::AddXp` (niveles con sufijo `L`, como
+  `XpCommand::getInteger`), `/effect` y `/enchant` validan y aplican al estado
+  de la sesión.
+- `/particle` resuelve nombres de `ParticleCommand::getParticle`; la emisión
+  depende del `LevelEvent` de partículas (`KNOWN_PARTICLES` documenta el mapeo).
+- `/scoreboard` (`sb`) usa `scoreboard.rs`: objetivos, líneas y slots, con
+  difusión a clientes Bedrock (`SetDisplayObjective`) y Java.
 
 ---
 
-## 4. Fases
+## 5. Fases
 
-Cada fase termina con código compilando, tests en verde y una nota de paridad
-(qué se puede y qué no). El orden respeta dependencias: no se puede portar
-`/effect` sin entidades, ni `/xp` sin salud/experiencia, ni `ItemStackRequest`
-sin inventario completo.
+Cada fase termina con código compilando, tests en verde y una nota de paridad.
 
 ### Fase 0 — Cimientos (✅ completada)
 
 Transporte NetherNet y RakNet, login con identidad real, chunks y generación,
-sesión de jugador, chat, comandos base, salud, inventario de 36 slots,
-`/give`, `/clear`, `/kill`.
+sesión de jugador, chat, comandos base, salud, inventario de 36 slots.
 
-**Criterio de salida:** un cliente Bedrock 1.26.60 entra, ve terreno, recibe
-mensajes del chat, ejecuta comandos con `CommandRequestPacket` y muere/resucita
-con paquetes reales. Cumplido y cubierto por 74 tests.
+**Criterio de salida:** un cliente Bedrock entra, ve terreno, recibe chat,
+ejecuta comandos y muere/resucita con paquetes reales. Cumplido.
 
-### Fase 1 — Inventario y objetos completos (🟡 en curso)
+### Fase 1 — Inventario y objetos (✅ completada)
 
-Objetivo: que mover cosas en el cliente cambie el estado del servidor.
+`InventoryTransaction` (0x1E) con los cinco tipos y límite de 50 acciones,
+`InventorySlotPacket`, `ItemStackRequest` (0x93) con respuestas, `PlayerInventory`
+con cuatro ventanas (0/36, 120/4, 119/1, 124/1), aplicación atómica con resync
+de las cuatro ventanas, `/give` con NBT JSON (`nbt_json.rs`), `/clear` sobre
+todas las ventanas.
 
-- [x] `InventoryTransactionPacket` (0x1E) con los cinco tipos de transacción y
-  `NetworkInventoryAction`; `request_id`, `requestChangedSlots` y límite de 50
-  acciones como PM.
-- [x] `InventorySlotPacket` (0x32) para corregir ranuras sueltas.
-- [x] `PlayerInventory` con las cuatro ventanas: inventario (0, 36), armadura
-  (120, 4), offhand (119, 1) y cursor (124, 1).
-- [x] Aplicación atómica de transacciones: si una acción no coincide con el
-  estado del servidor se rechaza la transacción entera y se reenvían las cuatro
-  ventanas; las acciones creativas también fuerzan resync.
-- [x] `/clear` recorre las cuatro ventanas con el límite compartido, como el
-  `ClearCommand` de PM.
-- [ ] `ItemStackRequestPacket` (0x93) y respuestas, si el cliente lo usa para
-  contenedores.
-- [ ] NBT mínimo (TAG_Compound/String/Int/List) para `/give [... tags]` y para
-  conservar `nbt` al mover objetos.
-- [ ] Items data-driven: mapear identificadores string del registro de BDS a
-  `network_id` + NBT, en vez de rechazarlos.
-- [ ] Entidades de objeto para que los drops no desaparezcan (depende de fase 4).
+Pendiente dentro de la fase: drops como entidades de objeto (depende de la
+fase 4) y persistencia del inventario en `players/*.json`.
 
-**Archivos nuevos:** `packets/inventory_transaction.rs`,
-`packets/item_stack_request.rs`, `packets/inventory_slot.rs`,
-`crates/bedrock-protocol/src/nbt.rs`, ampliaciones de `inventory.rs`.
-**Criterio de salida:** mover un stack en el cliente y leerlo igual desde el
-servidor; `/give Steve diamond_sword 1` y `/clear` cubren armadura y offhand;
-tests de roundtrip con capturas reales de `data/bds-capture/`.
+### Fase 2 — Comandos (✅ completada)
 
-### Fase 2 — Los 25 comandos restantes (🟡 17/25)
+49/49 registrados, con alias, nodos `pocketmine.command.*.self/.other`,
+mensajes de `eng.ini` y tests de parseo. Ver sección 4.
 
-Traducir uno a uno `command/defaults/*.php`:
+### Fase 3 — Permisos, traducciones y consola (🟡 3/4)
 
-- **Jugador:** `spawnpoint` ✅, `defaultgamemode` ✅, `difficulty` ✅,
-  `seed` ✅, `title` ✅, `effect`, `enchant`, `xp`, `particle`.
-- **Servidor:** `stop` ✅, `plugins` ✅, `save-all` ✅, `save-on` ✅,
-  `save-off` ✅, `status`, `gc`, `dumpmemory`, `timings`, `transfer-server` ✅.
-- **Administración:** `ban` ✅, `ban-ip` ✅, `banlist` ✅, `pardon` ✅,
-  `pardon-ip` ✅, `whitelist` ✅.
-
-Notas de paridad de lo portado: `/difficulty` guarda el valor en `WorldState`
-y envía `SetDifficultyPacket` (0x3C) a todos; `/spawnpoint` guarda un punto de
-reaparición por sesión que `handle_respawn` respeta; `/seed` lee la semilla del
-`WorldGenerator` (`NormalGenerator` la expone, `FlatGenerator` devuelve 0);
-las listas de acceso viven en `server-core/src/access.rs`, se persisten en
-`banned-players.txt`, `banned-ips.txt` y `white-list.txt` (formato
-`entrada|razón`, desviación del YAML de PM), se comprueban en el login y
-expulsan a los jugadores afectados. Los operadores siguen saltándose la
-whitelist, como `Server::isWhitelisted()`.
-
-Persistencia: `WorldState::save_to` escribe `world.json` (hora, clima,
-dificultad, spawn, semilla y ediciones), `PlayerSession::save_player_data`
-escribe `players/<nombre>.json` (posición, rotación, gamemode, salud y punto de
-spawn), se cargan al hacer login y al arrancar, y `/save-all` más el
-autoguardado de 6000 ticks las escriben. PM usa NBT (`level.dat`, `player.dat`);
-aquí es JSON a propósito, para no necesitar serializador NBT todavía. El
-inventario aún no se persiste.
-
-Cada uno necesita su acción en `CommandAction` y su rama en
-`SessionManager::apply_command_actions`, más los mensajes de `spa.ini` que use.
-Antes de empezar la fase, portar `PermissionManager` (fase 3.1) para que los
-nodos `pocketmine.command.*.self/.other` dejen de ser un booleano.
-
-**Criterio de salida:** `/help` lista los 41 comandos de PM + los propios de
-Bedrock, y cada uno tiene test de parseo con sus errores exactos.
-
-### Fase 3 — Permisos, traducciones y consola (🟡 2/4)
-
-1. [x] `PermissionManager` real: registro, herencia, `default: true|false|op|notop`,
-   `PermissionAttachment` para plugins, `DefaultPermissionNames`.
-   (`crates/server-core/src/permission.rs`: nodos, hijos, defaults de PM y
-   adjuntos por jugador; el despacho comprueba el nodo antes de ejecutar y los
-   comandos de objetivo usan `.self`/`.other`. `/clear`, `/gamemode` y `/tp`
-   comprueban el nodo `other` sólo cuando el objetivo no es quien ejecuta, y
-   `/whitelist` elige el nodo por subcomando en vez de un guard global, como
-   `WhitelistCommand::onRun`.)
-2. [ ] Motor de traducciones: leer un subconjunto de `spa.ini` (o tabla embebida)
-   en vez de constantes sueltas; `Translatable` con parámetros.
-3. [ ] Consola completa: `ServerCommandEvent`, `BroadcastLoggerForwarder`,
-   colores por canal (`§7§o[fuente: mensaje]`, `chat.type.admin`). Ya existe
-   el reenvío a operadores (`SessionManager::broadcast_command_message`) usado
-   por `/say`, `/me`, bans y cambios de modo de juego.
-4. [x] `AvailableCommandsPacket` generado desde `COMMANDS` con alias por
-   comando (ya se construye desde la tabla; faltan los flags de permiso que
-   PocketMine envía al cliente, que hoy no son necesarios).
-
-**Criterio de salida:** un jugador sin permisos recibe exactamente el mensaje
-de PM; los plugins pueden conceder permisos y eso cambia lo que ve el cliente.
+✅ `permission.rs`: nodos con default (`true`/`false`/`op`/`notop`), hijos y
+`PermissionAttachment` por jugador. ✅ consola de comandos por stdin, con las
+mismas rutas de permisos que el chat. ✅ `translations.rs` con el catálogo
+`eng.ini` embebido.
+🟡 Falta el selector de locale (`pocketmine.yml` → `spa.ini`).
 
 ### Fase 4 — Entidades, combate y experiencia (🟡 en curso)
 
-Ya modelados: `RemoveActorPacket` (0x0E) y `MoveActorAbsolutePacket` (0x12),
-con tests de ida y vuelta. Siguen faltando `AddPlayerPacket` (0x0C),
-`PlayerListPacket` (0x3F) —que necesita el serializador de skins— y
-`AddActorPacket`. Sin ellos no hay visibilidad entre jugadores ni entidades de
-objeto para drops.
+Ya modelados: `RemoveActorPacket` (0x0E), `MoveActorAbsolutePacket` (0x12),
+`ActorEventPacket` (animación de muerte), salud, muerte y respawn por sesión,
+`/xp`, `/effect` y `/enchant` sobre el estado del jugador.
 
-1. Entidades en el mundo: `AddPlayerPacket`, `AddActorPacket`,
-   `RemoveActorPacket`, `MoveActorAbsolutePacket`, `PlayerListPacket`.
-2. Visibilidad entre jugadores (skin, nametag, lista de jugadores).
-3. Daño real: `EntityDamageEvent` con causas (caída, ahogo, fuego, vacío,
-   ataque), armadura, invulnerabilidad tras golpe, regeneración de salud.
-4. Muerte completa: drops del inventario, `ActorEvent`, pantalla de muerte,
-   respawn en el spawn real, `SetSpawnPosition`.
-5. Experiencia: `SetPlayerGameType` no basta; `UpdateAbilities`, niveles y
-   `AddPlayerPacket` con `xp` real.
-6. Eventos PHP correspondientes (`EntityDamageEvent`, `EntityDeathEvent`).
+Falta:
 
-**Criterio de salida:** dos clientes se ven, se hacen daño y mueren con drops
-y respawn; `/kill` y `/xp` coherentes con el estado.
+1. `AddPlayerPacket` (0x0C), `PlayerListPacket` (0x3F) con skins y
+   `AddActorPacket` → **sin esto dos clientes no se ven entre sí**.
+2. Daño real con causas (`EntityDamageEvent`), armadura, invulnerabilidad y
+   regeneración.
+3. Muerte completa: drops, pantalla de muerte, respawn en el spawn real.
+4. Experiencia visible (`UpdateAbilities` + `xp` en `AddPlayer`).
+5. Mobs: no hay IA ni spawner.
 
-### Fase 5 — Crafteo, contenedores y uso de objetos
+**Criterio de salida:** dos clientes se ven, se hacen daño y mueren con drops y
+respawn; `/kill` y `/xp` coherentes con el estado.
 
-1. `CraftingDataPacket` desde `data/recipes/` y `data/creative/`.
-2. Contenedores: cofres, hornos, mesas de crafteo (`ContainerOpen/Close`,
-   `ContainerSetData`, `InventoryContent` por ventana).
-3. `ItemStackRequest` completo (si 2225 lo requiere) y validación servidor.
-4. Durabilidad, comida, pociones base, colocar bloques desde el inventario con
-   el `block_runtime_id` correcto.
+### Fase 5 — Crafteo, contenedores y uso de objetos (🟡 2/3)
 
-**Criterio de salida:** craftear en una mesa, abrir un cofre y comer funcionan
-sin desincronizar el inventario.
+✅ `crafting.rs` con `CraftingManager`, ingredientes `Exact`/`MetaWildcard`/
+`TagWildcard`, rejillas 2x2 y 3x3 y el motor de `ItemStackRequest`
+(Take/Place/Swap/...). ✅ `/give` con `block_runtime_id` correcto al colocar.
+🟡 Falta: ventanas de contenedor (cofre, horno: `ContainerOpen/Close`,
+`ContainerSetData`, `InventoryContent` por ventana) y durabilidad/comida.
 
-### Fase 6 — Mundo completo
+### Fase 6 — Mundo completo (🔴 la más grande que queda)
 
-1. Luz de cielo y de bloque (`data/bds-capture/level_chunk` ya trae la
-   estructura); `UpdateBlockPacket`, `BlockEventPacket`.
-2. Estados de bloque reales: `canonical_block_states.nbt`,
-   `block_properties_table.json`, `block_state_meta_map.json`.
-3. Física barata: arena/grava que caen, agua y lava básicas, crecimiento.
-4. Persistencia: guardar/cargar chunks y entidades (`world/format`), `level.dat`.
-5. Biomas reales (`biome_definitions.json`) y populators que los respeten.
+1. **Luz**: motor de luz de cielo y de bloque. Hoy los chunks Java declaran
+   sky light 15 y block light vacío (`java_chunk.rs::light()`) y los subchunks
+   Bedrock no llevan capa de luz → cuevas iluminadas y antorchas sin efecto.
+2. Física barata: arena/grava, agua y lava, crecimiento.
+3. Persistencia real: hoy `world.json` v2 (hora, clima, dificultad, spawn,
+   semilla, ediciones) y `players/*.json`; **no** se guardan chunks generados
+   ni existe `level.dat`, y no se leen mundos PM existentes (decisión
+   consciente, ver `world_state.rs`).
+4. Biomas reales y populators que los respeten.
+5. Multimundo: `SessionManager` tiene **un** `WorldState`; el `Teleport` con
+   otro nombre crea un mundo nuevo con el mismo generador.
 
-**Criterio de salida:** romper y colocar bloques se guarda al reiniciar, con
-luz y bioma correctos.
+### Fase 7 — API de plugins a la par de PM (🟡)
 
-### Fase 7 — API de plugins a la par de PM
+Cubierto: eventos de jugador/bloque/servidor/mundo, comandos con permisos,
+scheduler, `World`/`Player`/`Item`/`Block`, scoreboard, boss bar, tareas,
+carga de directorios y `.phar` con autoload PSR-4.
 
-Ampliar el puente ya existente (hoy cubre join/quit/move/chat/comando):
+Falta: inventario desde PHP (`PlayerInventory` completo), entidades, formularios
+(`ModalForm`/`SimpleForm`/`CustomForm` + paquete de respuesta; hoy
+`sendForm()` es un stub), `AsyncPool` real.
 
-1. Inventario y mundo reales desde PHP (`PlayerInventory`, `Block`, `World`).
-2. Entidades y eventos de combate/muerte.
-3. Formularios: `ModalForm`, `SimpleForm`, `CustomForm` + paquete de respuesta.
-4. Scoreboard, boss bar, `Title`, `Particle`.
-5. Tareas asíncronas reales y `AsyncPool`.
+### Fase 8 — Red, escalado y compatibilidad (🟡)
 
-**Criterio de salida:** los 4 plugins de prueba usan inventario y formularios
-sin cambios en su código, y un plugin nuevo de PM 5 arranca sin adaptaciones.
+✅ RakNet + NetherNet en el mismo puerto, cinco versiones Java con tablas
+propias, batch con zlib, `[lag]` para diagnosticar.
+🟡 Falta: rate limiting y `PacketViolationWarning` efectivo, multiworld,
+`transfer-server` completo, benchmark de 20 bots.
 
-### Fase 8 — Red, escalado y compatibilidad
+### Fase 9 — Operación y cierre (🟡)
 
-1. `InventoryTransaction` bajo carga, límites de batch, compresión configurable.
-2. Rate limiting de paquetes y `PacketViolationWarning` (ya existe el paquete).
-3. Multiworld y `transfer-server` reales.
-4. Negociación de versión y mensajes de rechazo limpios.
-5. Métricas (`timings`) y benchmark de generación.
-
-**Criterio de salida:** 20 bots conectados sin fugas ni desincronización,
-`timings` con datos reales.
-
-### Fase 9 — Operación y cierre
-
-1. Comandos de administración persistentes: `ban`, `whitelist`, `ops.txt`,
-   `allowlist.json` con recarga en caliente.
-2. Crash dumps legibles y logs rotativos.
-3. CI: `cargo fmt --check`, `clippy`, `cargo test --workspace`, `php -l`.
-4. Documentación final de paridad por comando y por paquete.
+✅ crash dumps (`crash.rs`), GS4 Query (`query.rs`), update checker
+(`updater.rs`), logs con hilo escritor propio, `/save-all` + autoguardado.
+🟡 Falta: CI (`fmt`, `clippy`, `cargo test --workspace`, `php -l`), rotación de
+logs y documentación de paridad por paquete.
 
 ---
 
-## 5. Convenciones de trabajo
+## 6. Arquitectura y limitantes
 
-- Sin dependencias nuevas salvo que una fase las justifique explícitamente
-  (hoy: tokio, bytes, thiserror, serde, serde_json, flate2, tracing,
-  parking_lot).
-- Todo paquete nuevo se valida contra una captura real de `data/bds-capture/`
-  antes de escribir el codificador.
-- Los mensajes al jugador salen de las claves de PocketMine; nada de textos
-  inventados.
-- Los comandos devuelven `CommandOutput`/`CommandAction`; sólo
-  `SessionManager` toca sesiones, mundo y registro.
-- Antes de dar una fase por cerrada: `cargo check --workspace` y los tests de
-  los crates tocados en verde.
-- `target/axolotl-pm` y `target/axolotl-bedrock-protocol` son la fuente de
-  verdad; si no están, clonarlos de nuevo.
+Lo que sigue no es deuda de port, es el diseño actual y dónde se rompe.
+Ordenado por impacto.
+
+### 6.1 Modelo de ejecución
+
+- **Un proceso Rust** (servidor) + **un proceso PHP** (plugins) unidos por IPC
+  de canal (`php-plugin-bridge`).
+- **Un bucle de tick de 50 ms** en `main.rs`: vaciado temprano de salida →
+  `SessionManager::tick()` → vaciado + `send_to_peer` → tick del conector Java
+  (en el blocking pool, pero *awaited*) → tick PHP → autoguardado.
+- **Un lock global de sesiones** (`RwLock<HashMap<u64, PlayerSession>>`).
+- **Un `WorldState`** por servidor, con cachés de payload Bedrock y de objetos
+  Java (512 y 1024 entradas) e invalidación por `chunk_versions`.
+- Un hilo escritor de logs con cola acotada (`logging.rs`), separado del juego.
+
+### 6.2 Limitantes
+
+| # | Limitante | Dónde | Consecuencia | Arreglo |
+|---|---|---|---|---|
+| 1 | Eventos PHP **síncronos** en el hilo del paquete. `BlockBreakEvent` se dispara **siempre** por IPC (a diferencia de `BlockPlaceEvent`/`PlayerInteractEvent`, que saltan si `has_listeners` es falso) | `session.rs:2727`, `plugin_host.rs` | Un plugin pesado mete su latencia en cada rotura | Gatear por `has_listeners` y despachar asíncrono lo no cancelable |
+| 2 | Lock global de sesiones | `session.rs` | Un `write()` frena a todos los peers | Slots por peer o actor por sesión |
+| 3 | Generación de terreno en el tick (rayon, `CHUNK_SENDING_PER_TICK = 4` por sesión, ~18 ms/columna) | `world_state.rs`, `drive_chunk_requests` | El tick se llena al cruzar chunks | Pool de generación con cola por distancia |
+| 4 | Cada edición invalida la columna entera y se re-serializa en **dos** formatos | `WorldState::set_block` | ~18 ms por columna editada bajo demanda | Parchear subchunk en memoria, un solo árbol + dos serializadores |
+| 5 | Sin motor de luz | `java_chunk.rs`, subchunks Bedrock | Cuevas iluminadas, antorchas sin efecto | Fase 6 |
+| 6 | Sin entidades vivas ni visibilidad entre jugadores | `packets/` incompleto | Dos jugadores no se ven | Fase 4 |
+| 7 | Ancho de banda por peer: `DataChannel::send` con control de flujo SCTP (~62 KB por chunk) | `nethernet-rs/signaling.rs` | Un canal saturado para el tick | Prioridad para paquetes pequeños, límite por tick configurable |
+| 8 | Sin anticheat: la posición del cliente se acepta | `handle_auth_input` | Movimiento libre salvo `force_move_sync` | Validación de velocidad |
+| 9 | Persistencia propia (JSON, sin chunks ni `level.dat`) | `world_state.rs` | El mundo se regenera y solo se aplican deltas | Fase 6 |
+| 10 | Un solo mundo y un solo protocolo Bedrock (2225) | `SessionManager` | Multiworld y versiones nuevas requieren tablas | Fase 8 |
+| 11 | Cobertura end-to-end escasa | `tests/` | El lag se diagnosticó con logs manuales, no con un test | Cliente/robot automatizado |
+
+### 6.3 Instrumentación de latencia
+
+Cada segundo, `metrics::LagProbe` escribe en el log:
+
+```
+[lag] tick=50.1/52.0ms(n=20) body=6.2/44.0ms(n=20) session=1.4/12.0ms(n=20)
+      flush=0.5/9.0ms(n=20) send=0.2/6.0ms(n=48) java=3.9/31.0ms(n=20)
+      dispatch=1.9/60.0ms(n=20) packets=1.6/58.0ms(n=20) actions=0.2/3.0ms(n=20)
+      chunk=0.3/20.0ms(n=4) drain=0.4/2.0ms(n=20) poll=0.1/2.0ms(n=20)
+```
+
+`tick` es el periodo real, `body` la iteración completa, `dispatch` un lote
+entrante (con `packets` = parseo + manejadores y `actions` = aplicar lo
+encolado), `lock` la espera por el lock de sesiones, `ipc` los eventos de
+plugin (roundtrip al proceso PHP), `flush`/`send` el transporte y
+`chunk`/`drain`/`poll` las tres rutas calientes del mundo.
+
+Un lote de más de 20 ms deja además un `[lag-slow]` con `npk`, el paquete
+más caro, y otro con la acción más cara si `apply_actions` pasa de 20 ms;
+los envíos SCTP de más de 20 ms dejan `[:WebRTC] slow data channel send`.
+Referencia completa en `docs/wiki/18-deploy.md`.
+
+**Siguiente paso recomendado:** la limitante 1 (gatear `BlockBreakEvent` por
+`has_listeners`), porque es la única que hoy se paga en cada rotura y es un
+cambio localizado; después la 3, que es la que más crece con jugadores.
 
 ---
 
-## 6. Riesgos y decisiones abiertas
+## 7. Riesgos y decisiones abiertas
 
 | Tema | Riesgo | Decisión actual |
 |---|---|---|
-| Items data-driven | No tienen id numérico en 2225 | Rechazados por `/give`; se resuelven en fase 1 con id + NBT |
-| `InventoryTransaction` | Sin él, el cliente y el servidor divergen | Fase 1, prioridad máxima |
-| Luz | Chunks oscuros o con luz incorrecta | Fase 6 |
-| Plugins PHP | Un plugin que use inventario/entidades falla | Fase 7; hoy el contrato lo excluye |
-| Persistencia | El mundo se regenera al reiniciar | Fase 6 |
-| Permisos | `allow-cheats` simula op para todo | Fase 3 con `PermissionManager` real |
-| Compatibilidad Java | Coexistencia multiversión Java | **Prioridad para la versión 26.1** (protocolo 775); luego se irá añadiendo soporte a las más antiguas |
+| Eventos PHP | Un plugin lento degrada el tick | IPC síncrono, con `has_listeners` en la mayoría de eventos; pendiente en `BlockBreakEvent` |
+| Luz | Chunks oscuros o planos | Fase 6; hoy sky 15 / block 0 |
+| Entidades | Sin visibilidad ni combate real | Fase 4 |
+| Persistencia | El mundo se regenera al reiniciar; solo se guardan deltas | JSON deliberado hasta tener NBT/Anvil |
+| Mundos PM existentes | No se pueden abrir | Documentado: no se implementa LevelDB |
+| Formularios | Un plugin con UI no funciona | Stub en `sendForm()`; falta el paquete |
+| Compatibilidad Java | Coexistencia multiversión | 775 principal; 769/770/773/774 con tablas propias; 340 solo en ids legacy |
+| Escalado | Lock global + generación en el tick | Fase 8 |
+| Tests E2E | Regresiones de latencia invisibles | `[lag]` + `/tps`; robot pendiente |
 
 ---
 
-## 7. Compatibilidad Minecraft: Java Edition
+## 8. Convenciones de trabajo
 
-La implementación del listener y protocolo de Minecraft: Java Edition (crates/java-bridge y crates/java-protocol) está **priorizada para la versión 26.1 (protocolo 775)** como versión principal y de desarrollo activo.
+- Un cambio = una referencia a `target/axolotl-pm`; si el PHP y el Rust
+  discrepan, gana el PHP o se documenta la desviación.
+- Rutas calientes en `debug!` (login, acciones de bloque, sonidos, poll de
+  bloques, `set_block`); `info!` solo para eventos de operador.
+- Nada de lógica de juego en `main.rs`: el bucle solo orquesta.
+- Cada subsistema con su doc de wiki; `PORT-ROADMAP.md` es el índice de estado,
+  no la referencia de comportamiento.
 
-- **Objetivo principal**: Paridad completa de juego (chunks, movimiento, rotura y colocación de bloques, scoreboard, chat, comandos e inventario) en la versión **26.1**.
-- **Versiones previas**: Una vez consolidada la versión 26.1, se irá ampliando y refinando progresivamente el soporte hacia versiones anteriores (1.21.11 / 774, 1.21.9 / 773, 1.21.5 / 770, 1.21.4 / 769 y legacy 1.12.2 / 340).
+---
+
+## 9. Compatibilidad Minecraft: Java Edition
+
+El listener Java (`crates/java-protocol`, `crates/java-bridge`) está priorizado
+para **1.21.11 / protocolo 775**, con tablas de bloques, items y conexiones
+propias para 774, 773, 770 y 769. El 340 (1.12.2) solo tiene de momento el
+mapeo de ids legacy de algunos paquetes (p. ej. `boss_bar`), no tablas de mundo.
+
+Cubierto hoy: handshake y login (perfiles, skins), chunks modernos y legacy con
+conversión de bloques y estados de conexión, movimiento y rotación
+bidireccionales, romper y colocar bloques (colocación en creativo), chat,
+comandos con permisos, gamemode, teleport, sincronización de hora, tab list,
+scoreboard, boss bar y entidades básicas (`remove_actor`, movimiento).
+
+Pendiente: inventario de supervivencia y ventanas de contenedor, formularios,
+y la versión mínima de compatibilidad hacia atrás (el resto de protocolos se
+añade sobre las tablas ya presentes).

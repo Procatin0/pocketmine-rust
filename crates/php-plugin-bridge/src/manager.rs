@@ -480,13 +480,25 @@ impl PluginManager {
         let mut actions = self.dispatcher.dispatch(event)?;
 
         if !self.php_worker.is_shutting_down() && self.php_worker.is_available() {
-            match self.php_worker.request_sync(
+            let ipc_started = std::time::Instant::now();
+            let response = self.php_worker.request_sync(
                 "dispatch_event",
                 json!({
                     "event": event.name(),
                     "data": event.to_json()
                 }),
-            ) {
+            );
+            let ipc_elapsed = ipc_started.elapsed();
+            // The round-trip runs on the caller's (packet or tick) thread, so a
+            // slow event is server lag: name it here, where the event is known.
+            if ipc_elapsed > std::time::Duration::from_millis(20) {
+                warn!(
+                    "[lag-ipc] {} took {:.1}ms in the PHP worker",
+                    event.name(),
+                    (ipc_elapsed.as_secs_f64() * 10000.0).round() / 10.0
+                );
+            }
+            match response {
                 Ok(response) => {
                     if response.status != "ok" {
                         warn!(

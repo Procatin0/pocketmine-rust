@@ -9,9 +9,31 @@
 /// Position of an online player, used to resolve command targets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnlinePlayer {
+    /// Canonical identity: what command actions carry and what the registry
+    /// is keyed by (the raw wire username of a Java player).
     pub name: String,
+    /// Name shown to players: a Java player already carries its `.` prefix
+    /// here (`java_bridge::display::java_player_name`), so every surface
+    /// (chat, TAB, nametags, `/list`, feedback) shows the same name.
+    pub display_name: String,
     pub position: (f64, f64, f64),
     pub gamemode: i32,
+}
+
+/// Strips the Java display prefix (`JAVA_PREFIX_IN_BEDROCK`), so `.Steve`
+/// and `Steve` name the same player in command input.
+fn java_name_without_prefix(name: &str) -> &str {
+    match name.strip_prefix(java_bridge::display::JAVA_PREFIX_IN_BEDROCK) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => name,
+    }
+}
+
+/// Name comparison that ignores the Java `.` display prefix: a Java player is
+/// named `.Steve`, so both `/gamemode creative Steve` and
+/// `/gamemode creative .Steve` must resolve to that same target.
+fn same_player_name(left: &str, right: &str) -> bool {
+    java_name_without_prefix(left).eq_ignore_ascii_case(java_name_without_prefix(right))
 }
 
 /// Who executed a command (a player or the server console).
@@ -1061,10 +1083,10 @@ fn teleport_permission_error(
 ) -> Option<CommandOutput> {
     let has_self = target_names
         .iter()
-        .any(|name| name.eq_ignore_ascii_case(&source.name));
+        .any(|name| same_player_name(name, &source.name));
     let has_other = target_names
         .iter()
-        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+        .any(|name| !same_player_name(name, &source.name));
     if (has_self && !source.can(crate::permission::COMMAND_TELEPORT_SELF))
         || (has_other && !source.can(crate::permission::COMMAND_TELEPORT_OTHER))
     {
@@ -1083,7 +1105,7 @@ fn teleport_feedback(
     pitch: Option<f32>,
 ) -> String {
     let (x, y, z) = position;
-    if target.eq_ignore_ascii_case(&source.name) {
+    if same_player_name(target, &source.name) {
         match destination_name {
             Some(name) => format!("§aTeleported to §f{}.", name),
             None => match (yaw, pitch) {
@@ -1145,19 +1167,25 @@ fn change_gamemode(
     // Selector-aware target list (`@a`, `@p`, `@e`, `@r`, ...). Silently
     // resolves through `resolve_players` then applies the same self/other
     // split as the single-target path.
-    let targets: Vec<String> = match target_arg {
+    // (identity, display name): actions carry the identity the registry is
+    // keyed by, feedback shows the name the player actually has (a Java
+    // player already carries its `.` prefix in `display_name`).
+    let targets: Vec<(String, String)> = match target_arg {
         Some(query) => {
             let resolved = resolve_players(source, players, query);
             if resolved.is_empty() {
                 return player_not_found(query);
             }
-            resolved.iter().map(|player| player.name.clone()).collect()
+            resolved
+                .iter()
+                .map(|player| (player.name.clone(), player.display_name.clone()))
+                .collect()
         }
         None => {
             if source.is_console {
                 return error("§cYou must specify a player.");
             }
-            vec![source.name.clone()]
+            vec![(source.name.clone(), source.name.clone())]
         }
     };
 
@@ -1165,10 +1193,10 @@ fn change_gamemode(
     // `other` target needs `.other`, any self target needs `.self`.
     let has_self = targets
         .iter()
-        .any(|name| name.eq_ignore_ascii_case(&source.name));
+        .any(|(name, _)| same_player_name(name, &source.name));
     let has_other = targets
         .iter()
-        .any(|name| !name.eq_ignore_ascii_case(&source.name));
+        .any(|(name, _)| !same_player_name(name, &source.name));
     if (has_self && !source.can(crate::permission::COMMAND_GAMEMODE_SELF))
         || (has_other && !source.can(crate::permission::COMMAND_GAMEMODE_OTHER))
     {
@@ -1178,20 +1206,20 @@ fn change_gamemode(
     let mode_name = gamemode_translatable(gamemode);
     let mut feedback_lines = Vec::new();
     let mut actions = Vec::new();
-    for target in targets {
+    for (target, display) in targets {
         // PocketMine reports a failure when the target already has that mode.
         let current = players
             .iter()
-            .find(|player| player.name.eq_ignore_ascii_case(&target))
+            .find(|player| same_player_name(&player.name, &target))
             .map(|player| player.gamemode);
         if current == Some(gamemode) {
-            feedback_lines.push(lang::GAMEMODE_FAILURE.replace("{%playerName}", &target));
+            feedback_lines.push(lang::GAMEMODE_FAILURE.replace("{%playerName}", &display));
             continue;
         }
-        let success = if target.eq_ignore_ascii_case(&source.name) {
+        let success = if same_player_name(&target, &source.name) {
             fill_template(lang::GAMEMODE_SUCCESS_SELF, &[mode_name])
         } else {
-            fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &target])
+            fill_template(lang::GAMEMODE_SUCCESS_OTHER, &[mode_name, &display])
         };
         let message = success.clone();
         feedback_lines.push(success);
@@ -1239,7 +1267,7 @@ fn spawn(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Com
     for target in targets {
         feedback.push(format!(
             "§a{} to the world spawn point.",
-            if target.eq_ignore_ascii_case(&source.name) {
+            if same_player_name(&target, &source.name) {
                 "Teleported"
             } else {
                 "Player teleported"
@@ -1326,7 +1354,7 @@ fn whisper(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> C
     let Some(target) = resolve_player(source, players, args[0]) else {
         return player_not_found(args[0]);
     };
-    if target.name.eq_ignore_ascii_case(&source.name) {
+    if same_player_name(&target.name, &source.name) {
         return feedback(lang::MESSAGE_SAME_TARGET.to_string());
     }
     let text = args[1..].join(" ");
@@ -1349,7 +1377,12 @@ fn whisper(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> C
 /// `/list`, ported from `pocketmine\command\defaults\ListCommand`: the count
 /// line and then the names sorted with `SORT_STRING`, as two messages.
 fn list(source: &CommandSource, players: &[OnlinePlayer]) -> CommandOutput {
-    let mut names: Vec<&str> = players.iter().map(|player| player.name.as_str()).collect();
+    // Java players are listed with the same `.`-prefixed name they carry in
+    // chat, TAB and nametags (`display_name`).
+    let mut names: Vec<&str> = players
+        .iter()
+        .map(|player| player.display_name.as_str())
+        .collect();
     names.sort_unstable();
 
     CommandOutput {
@@ -1621,14 +1654,14 @@ fn php_int_cast(input: &str) -> i64 {
 /// `Server::getPlayerByPrefix`: an exact name wins, otherwise the first
 /// case-insensitive prefix match.
 fn player_by_prefix<'a>(players: &'a [OnlinePlayer], name: &str) -> Option<&'a OnlinePlayer> {
-    let needle = name.to_lowercase();
+    let needle = java_name_without_prefix(name).to_lowercase();
     let mut prefixed: Option<&OnlinePlayer> = None;
     for player in players {
-        let candidate = player.name.to_lowercase();
+        let candidate = java_name_without_prefix(&player.name).to_lowercase();
         if candidate == needle {
             return Some(player);
         }
-        if prefixed.is_none() && candidate.starts_with(&needle) {
+        if prefixed.is_none() && !needle.is_empty() && candidate.starts_with(&needle) {
             prefixed = Some(player);
         }
     }
@@ -1869,12 +1902,12 @@ fn resolve_selector_targets<'a>(
     let mut pool: Vec<&OnlinePlayer> = match kind {
         SelectorKind::Self_ => players
             .iter()
-            .filter(|player| player.name.eq_ignore_ascii_case(&source.name))
+            .filter(|player| same_player_name(&player.name, &source.name))
             .collect(),
         _ => players.iter().collect(),
     };
     if let Some(name_filter) = &args.name {
-        pool.retain(|player| player.name.eq_ignore_ascii_case(name_filter));
+        pool.retain(|player| same_player_name(&player.name, name_filter));
     }
     if let Some(type_filter) = &args.type_ {
         let lowered = type_filter.to_lowercase();
@@ -1959,7 +1992,7 @@ fn fetch_permitted_player_targets<'a>(
             }
             match players
                 .iter()
-                .find(|player| player.name.eq_ignore_ascii_case(&source.name))
+                .find(|player| same_player_name(&player.name, &source.name))
             {
                 Some(player) => vec![player],
                 None => {
@@ -1999,10 +2032,10 @@ fn fetch_permitted_player_targets<'a>(
 
     let has_self = targets
         .iter()
-        .any(|player| player.name.eq_ignore_ascii_case(&source.name));
+        .any(|player| same_player_name(&player.name, &source.name));
     let has_other = targets
         .iter()
-        .any(|player| !player.name.eq_ignore_ascii_case(&source.name));
+        .any(|player| !same_player_name(&player.name, &source.name));
     if has_self && !self_allowed {
         let message = lang::PERMISSION.replace("{%commandName}", command);
         return Err(error(red(message)));
@@ -2161,8 +2194,8 @@ fn kill(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> Comm
     let mut actions = Vec::new();
     for player in targets {
         let target = player.name.clone();
-        let message = fill_template(lang::KILL_SUCCESSFUL, &[&target]);
-        let broadcast = !target.eq_ignore_ascii_case(&source.name);
+        let message = fill_template(lang::KILL_SUCCESSFUL, &[&player.display_name]);
+        let broadcast = !same_player_name(&target, &source.name);
         feedback.push(message.clone());
         actions.push(CommandAction::Kill {
             target,
@@ -2974,16 +3007,19 @@ fn resolve_player<'a>(
         let (kind, args) = parse_selector(query, source.position)?;
         return resolve_selector_targets(source, players, kind, &args).into_iter().next();
     }
-    let query_lower = query.to_lowercase();
-    if let Some(exact) = players
-        .iter()
-        .find(|player| player.name.to_lowercase() == query_lower)
-    {
+    let query_lower = java_name_without_prefix(query).to_lowercase();
+    if let Some(exact) = players.iter().find(|player| {
+        java_name_without_prefix(&player.name).to_lowercase() == query_lower
+    }) {
         return Some(exact);
     }
     let matches: Vec<&OnlinePlayer> = players
         .iter()
-        .filter(|player| player.name.to_lowercase().starts_with(&query_lower))
+        .filter(|player| {
+            java_name_without_prefix(&player.name)
+                .to_lowercase()
+                .starts_with(&query_lower)
+        })
         .collect();
     if matches.len() == 1 {
         matches.first().copied()
@@ -3840,11 +3876,13 @@ mod tests {
         vec![
             OnlinePlayer {
                 name: "Steve".to_string(),
+                display_name: "Steve".to_string(),
                 position: (10.0, 64.0, -5.0),
                 gamemode: 0,
             },
             OnlinePlayer {
                 name: "Alex".to_string(),
+                display_name: "Alex".to_string(),
                 position: (-20.0, 70.0, 8.5),
                 gamemode: 1,
             },
@@ -5011,6 +5049,7 @@ mod tests {
         let mut list = players();
         list.push(OnlinePlayer {
             name: "Zombie".to_string(),
+            display_name: "Zombie".to_string(),
             position: (2.0, 64.0, 2.0),
             gamemode: 0,
         });
@@ -5145,11 +5184,13 @@ mod tests {
         let players = vec![
             OnlinePlayer {
                 name: "Guest".to_string(),
+                display_name: "Guest".to_string(),
                 position: (0.0, 64.0, 0.0),
                 gamemode: 0,
             },
             OnlinePlayer {
                 name: "Alex".to_string(),
+                display_name: "Alex".to_string(),
                 position: (5.0, 64.0, 5.0),
                 gamemode: 0,
             },

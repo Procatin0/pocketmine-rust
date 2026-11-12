@@ -23,6 +23,26 @@ use crate::generator::populators::{
 use crate::generator::random::Random;
 use crate::generator::structures::{self, StructurePosition};
 use crate::generator::WorldGenerator;
+use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+
+/// Columns kept for single-block queries.
+///
+/// [`NormalGenerator::generate_chunk_internal`] builds a 3x3 neighbourhood and
+/// runs every populator (~18 ms), so asking it for one block is unaffordable:
+/// `WorldState::propagate_connections` alone reads dozens of cells per edit,
+/// which turned a single block break into 100-600 ms of terrain generation
+/// (`[lag-slow] actions=4 total=665.4ms slowest=665.2ms: SetBlock`). A column is
+/// a pure function of the seed (edits live in `WorldState`), so caching one is
+/// safe; the bound keeps it to a few MB.
+const COLUMN_CACHE_CAP: usize = 32;
+
+#[derive(Default)]
+struct ColumnCache {
+    entries: HashMap<(i32, i32), Arc<Chunk>>,
+    order: VecDeque<(i32, i32)>,
+}
 
 pub struct NormalGenerator {
     seed: i64,
@@ -46,6 +66,8 @@ pub struct NormalGenerator {
     tall_grass_ice_plains: TallGrassPopulator,
     cave_populator: CavePopulator,
     spawn_pos: (i32, i32, i32),
+    /// See [`COLUMN_CACHE_CAP`]; only `block_at`/`highest_block_at` use it.
+    column_cache: Mutex<ColumnCache>,
 }
 
 impl NormalGenerator {
@@ -100,6 +122,7 @@ impl NormalGenerator {
             tall_grass_ice_plains,
             cave_populator,
             spawn_pos: (0, Self::SEA_LEVEL + 2, 0),
+            column_cache: Mutex::new(ColumnCache::default()),
         };
 
         // Search for nearest solid land above sea level (safe spawn point matching PocketMine getSafeSpawn)
@@ -318,6 +341,27 @@ impl NormalGenerator {
         structures::structure_positions_for_chunk(self.seed, chunk_x, chunk_z)
     }
 
+    /// Column for a single-block query, generating (and caching) on a miss.
+    fn cached_column(&self, chunk_x: i32, chunk_z: i32) -> Arc<Chunk> {
+        let key = (chunk_x, chunk_z);
+        if let Some(chunk) = self.column_cache.lock().entries.get(&key) {
+            return Arc::clone(chunk);
+        }
+        // Generated outside the lock: another thread may win the insert, which
+        // is harmless (same seed, same column).
+        let chunk = Arc::new(self.generate_chunk_internal(chunk_x, chunk_z));
+        let mut cache = self.column_cache.lock();
+        if cache.entries.insert(key, Arc::clone(&chunk)).is_none() {
+            cache.order.push_back(key);
+            while cache.order.len() > COLUMN_CACHE_CAP {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.entries.remove(&oldest);
+                }
+            }
+        }
+        chunk
+    }
+
     pub fn generate_chunk_internal(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
         let mut manager = ChunkManager3x3::new(chunk_x, chunk_z);
 
@@ -370,13 +414,12 @@ impl WorldGenerator for NormalGenerator {
     /// for occasional plugin `getBlock` queries; prefer reading from a cached
     /// `Chunk` when the server already holds one.
     fn block_at(&self, x: i32, y: i32, z: i32) -> u32 {
-        let chunk = self.generate_chunk_internal(x >> 4, z >> 4);
-        chunk.get_block((x & 15) as usize, y, (z & 15) as usize)
+        self.cached_column(x >> 4, z >> 4)
+            .get_block((x & 15) as usize, y, (z & 15) as usize)
     }
 
     fn highest_block_at(&self, x: i32, z: i32) -> i32 {
-        let chunk = self.generate_chunk_internal(x >> 4, z >> 4);
-        chunk
+        self.cached_column(x >> 4, z >> 4)
             .get_highest_block_at((x & 15) as usize, (z & 15) as usize)
             .unwrap_or(-64)
     }

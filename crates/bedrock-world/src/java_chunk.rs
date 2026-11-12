@@ -212,6 +212,13 @@ impl ModernProfile {
     /// `ModernProfile.php::blockState()`: version overrides first,
     /// then the stable table, unknown names fall back to air.
     pub fn block_state(&self, name: &str) -> i32 {
+        // Full per-version block list first: the hand-written tables below
+        // only name a few dozen blocks, and every other block coming from a
+        // Bedrock player used to translate to air (invisible on the Java
+        // client).
+        if let Some(state) = crate::block_states::java_block_state(self.protocol, name) {
+            return state;
+        }
         for &(protocol, n, state) in BLOCKS_BY_PROTOCOL_ROWS {
             if protocol == self.protocol && n == name {
                 return state;
@@ -313,25 +320,50 @@ impl ModernChunk {
     }
 
     /// Java block name for a Bedrock network id, or `None` if unknown.
+    ///
+    /// The hand-written table above only names a few dozen blocks, so every
+    /// other id falls back to the full canonical-state table
+    /// ([`crate::block_states`]): without it a block placed by a Bedrock
+    /// player arrived as `kind=block` / Java state 0 (air) and was invisible.
     pub fn block_name(bedrock_id: u32) -> Option<&'static str> {
-        BEDROCK_BLOCKS
-            .iter()
-            .find(|(id, _)| *id == bedrock_id)
-            .map(|(_, name)| *name)
+        // Canonical table first: one hash lookup covers every real block, so
+        // the chunk hot path (one call per block) never walks the short
+        // hand-written list; that list is only the fallback for the few ids
+        // that are not canonical states.
+        crate::block_states::state_name(bedrock_id).or_else(|| {
+            BEDROCK_BLOCKS
+                .iter()
+                .find(|(id, _)| *id == bedrock_id)
+                .map(|(_, name)| *name)
+        })
     }
 
     /// Java state equivalent to a Bedrock network id for this version.
     /// Unknown ids map to `air`, like the PHP original.
     pub fn bedrock_state(bedrock_id: u32, profile: &ModernProfile) -> i32 {
-        profile.block_state(Self::block_name(bedrock_id).unwrap_or("air"))
+        // One name lookup per block; connectable blocks (fences, panes, bars,
+        // walls) then map to the exact Java variant with its connections
+        // (`data/java/connections/<protocol>.json`) instead of the block
+        // default, which is what made a placed fence render without arms.
+        let name = Self::block_name(bedrock_id).unwrap_or("air");
+        if let Some(state) =
+            crate::block_states::java_connection_state_for_name(profile.protocol, bedrock_id, name)
+        {
+            return state;
+        }
+        profile.block_state(name)
     }
 
     /// Bedrock network id for a Java block name, or `None`.
+    ///
+    /// Falls back to the canonical-state table for blocks outside the
+    /// hand-written one, so a Java player can place any block.
     pub fn bedrock_network_id_for_name(name: &str) -> Option<u32> {
         BEDROCK_BLOCKS
             .iter()
             .find(|(_, n)| *n == name)
             .map(|(id, _)| *id)
+            .or_else(|| crate::block_states::network_id(name))
     }
 
     /// Java block name for a global Java state under this version, or

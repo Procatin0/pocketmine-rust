@@ -6,6 +6,7 @@
 //! 20 like Spigot/Paper do.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -98,6 +99,150 @@ impl TickMetrics {
     }
 }
 
+/// Accumulated latency of one stage: count, total and max, in microseconds.
+///
+/// Always-on and cheap (three relaxed atomics per sample) so the numbers are
+/// there in `server.log` when someone reports lag, instead of needing a
+/// profiler attached to a live server.
+#[derive(Default)]
+pub struct Stage {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl Stage {
+    /// Records one sample.
+    pub fn record(&self, duration: Duration) {
+        let us = duration.as_micros().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// `(samples, total)` without resetting: lets a caller measure the IPC it
+    /// caused by taking a snapshot before and after.
+    pub fn snapshot(&self) -> (u64, Duration) {
+        (
+            self.count.load(Ordering::Relaxed),
+            Duration::from_micros(self.total_us.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// `(samples, avg_ms, max_ms)` for the window just closed; resets it.
+    pub fn take(&self) -> Window {
+        let count = self.count.swap(0, Ordering::Relaxed);
+        let total = self.total_us.swap(0, Ordering::Relaxed);
+        let max = self.max_us.swap(0, Ordering::Relaxed);
+        Window {
+            samples: count,
+            avg_ms: if count == 0 {
+                0.0
+            } else {
+                total as f64 / count as f64 / 1000.0
+            },
+            max_ms: max as f64 / 1000.0,
+        }
+    }
+}
+
+/// One closed measurement window.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Window {
+    pub samples: u64,
+    pub avg_ms: f64,
+    pub max_ms: f64,
+}
+
+impl Window {
+    /// `avg/max ms` with the sample count appended when non-empty.
+    fn render(&self, name: &str) -> String {
+        if self.samples == 0 {
+            return String::new();
+        }
+        format!(
+            " {name}={:.1}/{:.1}ms(n={})",
+            self.avg_ms, self.max_ms, self.samples
+        )
+    }
+}
+
+static IPC_STAGE: std::sync::OnceLock<Stage> = std::sync::OnceLock::new();
+
+/// Time spent inside a plugin event round-trip (`dispatch_event_sync`).
+///
+/// Global rather than per-`SessionManager` so the hot path
+/// (`PlayerSession::fire_event`) can record without reaching for the manager.
+pub fn ipc() -> &'static Stage {
+    IPC_STAGE.get_or_init(Stage::default)
+}
+
+/// Every stage the 50 ms tick and the packet path can spend time in.
+///
+/// The point is to answer "why is breaking a block laggy?" from a log line:
+/// `body` is the whole tick loop, and the rest splits it into the Bedrock
+/// tick (`session`), the flush+send (`flush`, `send`), the Java connector
+/// (`java`), packet dispatch (`dispatch` -> `packets` parse/handlers +
+/// `actions`), chunk streaming (`chunk`) and the block-change poll (`poll`).
+#[derive(Default)]
+pub struct LagProbe {
+    /// Start-to-start time of the tick loop (should sit at 50 ms).
+    pub tick_period: Stage,
+    /// Whole tick loop body.
+    pub tick_body: Stage,
+    /// `SessionManager::tick()`.
+    pub tick_session: Stage,
+    /// Draining and writing every session's outgoing batches.
+    pub tick_flush: Stage,
+    /// One `send_to_peer` (SCTP data-channel write; blocks under backpressure).
+    pub send: Stage,
+    /// Java connector tick.
+    pub tick_java: Stage,
+    /// Waiting for the sessions lock in `dispatch_webrtc_packet`.
+    pub lock: Stage,
+    /// `SessionManager::dispatch_webrtc_packet` (one inbound batch).
+    pub dispatch: Stage,
+    /// Parsing + handlers for the packets of one batch.
+    pub packets: Stage,
+    /// `apply_actions` for what those handlers queued.
+    pub actions: Stage,
+    /// `drive_chunk_requests` (payload warm-up included).
+    pub chunk_stream: Stage,
+    /// `drain_pending_outgoing_bytes` (encode + compress).
+    pub drain: Stage,
+    /// `poll_block_changes`.
+    pub poll: Stage,
+}
+
+impl LagProbe {
+    /// Formats and resets the window. `None` when nothing was measured.
+    pub fn report(&self) -> Option<String> {
+        let mut line = String::with_capacity(320);
+        for (name, window) in [
+            ("tick", self.tick_period.take()),
+            ("body", self.tick_body.take()),
+            ("session", self.tick_session.take()),
+            ("flush", self.tick_flush.take()),
+            ("send", self.send.take()),
+            ("lock", self.lock.take()),
+            ("ipc", ipc().take()),
+            ("java", self.tick_java.take()),
+            ("dispatch", self.dispatch.take()),
+            ("packets", self.packets.take()),
+            ("actions", self.actions.take()),
+            ("chunk", self.chunk_stream.take()),
+            ("drain", self.drain.take()),
+            ("poll", self.poll.take()),
+        ] {
+            line.push_str(&window.render(name));
+        }
+        if line.trim().is_empty() {
+            return None;
+        }
+        Some(format!("[lag]{line}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +300,26 @@ mod tests {
         assert_eq!(one, 0.0);
         assert_eq!(five, 0.0);
         assert!((fifteen - 1.0 / 900.0).abs() < 1e-9, "15m was {fifteen}");
+    }
+
+    #[test]
+    fn lag_probe_reports_avg_and_max_and_resets() {
+        let probe = LagProbe::default();
+        assert_eq!(probe.report(), None, "nothing measured yet");
+
+        probe.tick_body.record(Duration::from_millis(10));
+        probe.tick_body.record(Duration::from_millis(30));
+        probe.send.record(Duration::from_millis(5));
+
+        let line = probe.report().expect("first window");
+        assert!(line.starts_with("[lag]"), "{line}");
+        assert!(line.contains("body=20.0/30.0ms(n=2)"), "{line}");
+        assert!(line.contains("send=5.0/5.0ms(n=1)"), "{line}");
+        // Stages with no samples are omitted instead of printing zeros.
+        assert!(!line.contains("java="), "{line}");
+
+        // `take` resets every window, so the next report starts clean.
+        assert_eq!(probe.report(), None);
     }
 
     #[test]

@@ -187,6 +187,8 @@ producción lo implementa `server-core/src/java_hooks.rs`
 | `Server::addPlayer` + anuncio de join | `join_api` / `leave_api` |
 | chat / `PlayerChatEvent` | `handle_chat` → `ChatOutcome` (líneas + teleporte/gamemode del remitente) |
 | `placeBlock` | encola en `drain_block_changes` (`broadcastBlockChange` en PHP iba inline); la sesión solo reenvía el estado real ante fallo para deshacer predicción del cliente |
+| `interact_block` | `Block::onInteract()` del bloque cliqueado (`World::useItemOn`): botones, palancas y puertas de valla. Si consume el clic no se coloca nada; funciona en cualquier gamemode porque no toca inventario |
+| `block_network_id_for_item` | id de item Java → nombre (`data/java/items/<protocol>.json`) → bloque (`bedrock_world::block_states`) → id de red Bedrock. Es lo que decide **qué** bloque coloca el jugador Java |
 | chunks legados/modernos | `legacy_chunk` / `modern_chunk` (de `Protocol`/`ModernChunk`); en el tick solo `try_modern_chunk` / `try_legacy_chunk` (sin generar: una columna fría cuesta ~18 ms y rompe el presupuesto) |
 | `registry_data`, `tags` | `registry_payloads` / `tags_payload` |
 | bossbar / scoreboard Java | `take_bossbar_frames` / `take_scoreboard_frames` (frames ya enmarcados por protocolo —340 string, 769+ NBT—, drenados cada tick como mensajes de plugin) |
@@ -251,6 +253,92 @@ tick, `tick_time_sync()` cada 20 ticks o salto,
 ticks. El payload de bloques se lee una sola vez en
 `tick_block_changes` y se envía en broadcast a los clientes con
 la columna ya enviada.
+
+### Bloques entre ediciones
+
+Ambos sentidos se apoyan en tablas completas, no en las listas cortas
+de `ModernProfile`/`ModernChunk`:
+
+- **Bedrock → Java**: el cliente manda el hash FNV-1a del estado
+  canónico (`block_runtime_id`). `bedrock_world::block_states` reconstruye
+  la tabla de `data/canonical_block_states.nbt` (23960 estados) al
+  arrancar, `ModernChunk::block_name` la consulta y `ModernProfile::block_state`
+  traduce el nombre con `data/java/blocks/<protocol>.json`. Sin esto el
+  nombre quedaba desconocido y el cliente Java recibía aire (bloque invisible).
+- **Java → Bedrock**: el cliente Java nunca manda el item que coloca.
+  La sesión recuerda los slots creativos (`set_creative_slot`, ids 54/54/55/55/56)
+  y la hotbar seleccionada (`held_item_slot`, 51/51/52/52/53), y el hook
+  `block_network_id_for_item` traduce ese item a un bloque. Antes `placeBlock`
+  enviaba piedra fija, así que todo lo que colocaba un jugador Java se veía
+  como piedra en Bedrock.
+
+### Conexiones (vallas, paneles, paredes)
+
+Los bloques conectables no son estados fijos: al colocar una valla, la
+valla nueva conecta con la de al lado **y la de al lado conecta con
+ella**. `WorldState::set_block` reproduce el cascada de PocketMine
+(`internalNotifyNeighbourBlockUpdate` → `onNearbyBlockChange`): encola
+el bloque y sus 6 vecinos, cada conectable recalcula sus conexiones con
+`block_states::recalculate_connections` (mismas reglas que
+`Fence`/`Thin`/`Wall`: misma familia, puerta de valla o cubo completo)
+y, si el estado cambió, se reescribe y se vuelve a propagar. Cada
+cambio pasa por las colas normales, así que llega a Bedrock
+(`UpdateBlockPacket`) y a Java (`block_change`) sin código extra.
+
+El cliente Java no calcula conexiones por su cuenta: el id de estado que
+recibe ya lleva `east/north/south/west` (y `up` en paredes). Por eso
+`block_states::java_connection_state` traduce el estado Bedrock a la
+variante exacta usando `data/java/connections/<protocol>.json` (generada
+desde minecraft-data, validada contra el `defaultState` de cada bloque de
+las cinco versiones). Se consulta en `ModernChunk::bedrock_state`, que es
+el único punto por el que pasan tanto los `block_change` como los payloads
+de chunk, así que las vallas se ven conectadas desde el primer chunk.
+
+Rendimiento: la comprobación está detrás de un filtro por sufijo del
+nombre (`_fence`, `_pane`, `_bars`, `_wall`), el índice de conexiones está
+precalculado por estado en el arranque y las tablas por protocolo se
+parsean una sola vez (`OnceLock`, sin locks en el camino caliente). Los
+bloques normales no pagan más que una comparación de sufijo.
+
+### Colocación Bedrock
+
+- **Sonido**: tras un `SetBlock` correcto la sesión emite
+  `PluginAction::BroadcastSound` y el manager difunde
+  `LevelSoundEventPacket` (`0x7B`, sonido `place`, id del bloque) a los
+  jugadores con la columna en vista, como `World::addSound(new
+  BlockPlaceSound($placed))`. También se emite cuando el bloque lo coloca
+  un jugador Java (`JavaHooks::place_block`).
+- **Entidades**: si la caja de un jugador (0,6 × 1,8) intersecta el bloque
+  a colocar se rechaza la colocación (PM
+  `getCollidingEntities`), se reenvía la columna para deshacer la
+  predicción del cliente y no se emite sonido: así ya no se puede quedar
+  dentro de un bloque.
+
+### Interacción (botones, palancas, puertas de valla)
+
+`World::useItemOn` de PM resuelve primero `$blockClicked->onInteract()` y solo
+después coloca el ítem; antes de esto un clic derecho sobre un botón ponía un
+bloque al lado. La lógica vive en un solo sitio, `WorldState::interact_block`
+(`bedrock_world::block_states::interact` decide qué bloque es interactivo y a
+qué estado pasa), y la usan las dos plataformas: `Session::handle_block_interact`
+(Bedrock, antes de la colocación) y `CoreHooks::interact_block` (Java, antes
+del gate de creativo, porque interactuar no necesita inventario).
+
+| Bloque | Cambio | Sonido |
+|---|---|---|
+| botón (`*_button`) | `button_pressed_bit` 1 y `scheduleDelayedBlockUpdate` con `getActivationTime()` (20 piedra, 30 madera); al dispararse vuelve a 0 | `power.on`, luego `power.off` |
+| palanca (`lever`) | `open_bit` alternado | `power.on` / `power.off` |
+| puerta de valla (`*fence_gate`) | `open_bit` alternado | `SOUND_DOOR` (`1003`) |
+
+- Un botón ya pulsado consume el clic sin cambiar nada (PM devuelve `true`).
+- Agachado **con un ítem en la mano** se salta la interacción
+  (`setUseBlock($item->isNull())`), así se puede construir contra un botón; con
+  la mano vacía sí se abre la puerta.
+- Con plugins escuchando `PlayerInteractEvent` (RIGHT_CLICK) el evento es
+  cancelable y, como en PM, cancelarlo no coloca nada.
+- El sonido lo difunde el manager a los viewers Bedrock (`broadcast_sound` /
+  `broadcast_level_event`); los clientes Java reciben el `block_change` del
+  nuevo estado.
 
 ## Tests
 

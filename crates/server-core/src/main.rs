@@ -532,6 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let peer_data_channels = Arc::clone(&peer_data_channels);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(50));
+                let mut last_tick_start: Option<Instant> = None;
                 // Skip, never burst-catch-up: a slow tick must not queue
                 // hundreds of catch-up ticks after one slow column build.
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -544,7 +545,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                     let started = Instant::now();
+                    if let Some(previous) = last_tick_start.replace(started) {
+                        session_manager.lag().tick_period.record(started - previous);
+                    }
                     session_manager.metrics().record_tick();
+
+                    // Flush first, stream terrain second. `session_manager.tick()`
+                    // generates the columns it is about to send (~18 ms each,
+                    // warmed outside the sessions lock), and anything that waited
+                    // for this flush would inherit that stall: a block break's
+                    // `UpdateBlock` + destroy particles are queued by the packet
+                    // handler, so they must not sit behind chunk generation. With
+                    // a single player this send is one SCTP write.
+                    let flush_started = Instant::now();
+                    for (peer, batches) in session_manager.drain_pending_outgoing_bytes() {
+                        for batch in batches {
+                            let len = batch.len();
+                            let send_started = Instant::now();
+                            let sent = peer_data_channels.send_to_peer(peer, batch).await;
+                            session_manager.lag().send.record(send_started.elapsed());
+                            if !sent {
+                                debug!(
+                                    "Early flush: no WebRTC data channel for {peer}; dropped {len} byte batch"
+                                );
+                            }
+                        }
+                    }
+                    session_manager.lag().tick_flush.record(flush_started.elapsed());
 
                     // Bedrock connector tick (state + envelopes):
                     // world clock (queues the 1 Hz `SetTime`, or
@@ -552,7 +579,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // virtual-player sync, and `doChunkRequests` for
                     // every PreSpawn/InGame session with a view distance
                     // (`NetworkSession::tick()` in the reference).
+                    let session_started = Instant::now();
                     let report = session_manager.tick();
+                    session_manager
+                        .lag()
+                        .tick_session
+                        .record(session_started.elapsed());
                     let tick = report.tick;
 
                     // `NetworkSession::flushGamePacketQueue()`: encode
@@ -567,16 +599,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // only exist after their first dispatch, which
                     // requires the channel, so this is the disconnect
                     // race, not the normal path.
+                    let flush_started = Instant::now();
                     for (peer, batches) in session_manager.drain_pending_outgoing_bytes() {
                         for batch in batches {
                             let len = batch.len();
-                            if !peer_data_channels.send_to_peer(peer, batch).await {
+                            let send_started = Instant::now();
+                            let sent = peer_data_channels.send_to_peer(peer, batch).await;
+                            session_manager.lag().send.record(send_started.elapsed());
+                            if !sent {
                                 debug!(
                                     "Tick flush: no WebRTC data channel for {peer}; dropped {len} byte batch"
                                 );
                             }
                         }
                     }
+                    session_manager.lag().tick_flush.record(flush_started.elapsed());
 
                     // Java connector tick with the same number, after
                     // Bedrock so Java sees the world time Bedrock just
@@ -589,8 +626,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // `await` keeps order and 20 TPS pacing (no second
                     // interval, no lost ticks).
                     {
+                        let java_started = Instant::now();
                         let server = Arc::clone(&java_server);
                         let _ = tokio::task::spawn_blocking(move || server.tick_at(tick)).await;
+                        session_manager.lag().tick_java.record(java_started.elapsed());
                     }
 
                     // Queue the PHP tick. If the sidecar died the channel
@@ -611,6 +650,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
 
+                    session_manager.lag().tick_body.record(started.elapsed());
+                    // One `[lag]` line per second: avg/max per stage, enough to
+                    // see which one eats a slow tick (see `metrics::LagProbe`).
+                    if tick % 20 == 0 {
+                        if let Some(line) = session_manager.lag().report() {
+                            info!("{line}");
+                        }
+                    }
                     if started.elapsed() > Duration::from_millis(10) {
                         debug!(
                             "Logical tick {tick} took {:?} (must stay << 50 ms)",

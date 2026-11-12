@@ -3,7 +3,7 @@
 //! hotbar moves, creative creates and anvil XP costs.
 
 use bedrock_protocol::packets::item_stack_request::{
-    ItemStackContainerSlot, ItemStackRequestAction, ItemStackRequestPacket,
+    ItemStackContainerSlot, ItemStackRequest, ItemStackRequestAction, ItemStackRequestPacket,
 };
 use bedrock_protocol::ItemStack;
 use server_core::anvil::{
@@ -11,7 +11,8 @@ use server_core::anvil::{
 };
 use server_core::crafting::{
     apply_item_stack_request, container_slot, CraftingGrid, CraftingTableInventory, manager,
-    PlayerCraftingInventory, CONTAINER_CURSOR,
+    PlayerCraftingInventory, CREATED_ITEM_SLOT, UI_ARMOR, UI_COMBINED_HOTBAR_AND_INVENTORY,
+    UI_CREATED_OUTPUT, UI_CURSOR, UI_INVENTORY,
 };
 use server_core::inventory::{
     item_network_id, PlayerInventory, ArmorInventory, WINDOW_ID_INVENTORY,
@@ -70,11 +71,15 @@ fn craft_3x3_table() {
 fn drop_with_q_key() {
     let mut inventory = PlayerInventory::new();
     inventory.set_window_slot(WINDOW_ID_INVENTORY, 4, stack("stone", 64));
-    let packet = ItemStackRequestPacket::new(
+    let request = ItemStackRequest::new(
         10,
-        vec![ItemStackRequestAction::Drop { slot: slot(0, 4), count: 32 }],
+        vec![ItemStackRequestAction::Drop {
+            count: 32,
+            source: slot(UI_COMBINED_HOTBAR_AND_INVENTORY, 4),
+            randomly: false,
+        }],
     );
-    let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+    let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
     assert_eq!(outcome.response.status, server_core::crafting::STATUS_OK);
     assert_eq!(outcome.dropped, vec![stack("stone", 32)]);
     assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 4).unwrap().count, 32);
@@ -98,15 +103,28 @@ fn move_hotbar_stack() {
     assert_eq!(inventory.held_item().network_id, stack("diamond_sword", 1).network_id);
 }
 
-/// Creative creation: a creative player takes a full stack from the catalog.
+/// Creative creation: a creative player drags a full stack from the creative
+/// catalog into hotbar slot 0 (CreativeCreate fills the created-item output,
+/// then the client takes it).
 #[test]
 fn creative_create_item() {
     let mut inventory = PlayerInventory::new();
-    let packet = ItemStackRequestPacket::new(
+    let catalog = vec![stack("stone", 64)];
+    let request = ItemStackRequest::new(
         11,
-        vec![ItemStackRequestAction::CreativeCreate { item: stack("stone", 64), count: 64 }],
+        vec![
+            ItemStackRequestAction::CreativeCreate {
+                creative_item_id: 1,
+                repetitions: 64,
+            },
+            ItemStackRequestAction::Take {
+                count: 64,
+                source: slot(UI_CREATED_OUTPUT, CREATED_ITEM_SLOT),
+                destination: slot(UI_COMBINED_HOTBAR_AND_INVENTORY, 0),
+            },
+        ],
     );
-    let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, true);
+    let outcome = apply_item_stack_request(&mut inventory, manager(), &request, true, &catalog);
     assert_eq!(outcome.response.status, server_core::crafting::STATUS_OK);
     assert_eq!(inventory.total_items(), 64);
     assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().network_id, stack("stone", 1).network_id);
@@ -117,11 +135,15 @@ fn creative_create_item() {
 #[test]
 fn survival_creative_create_is_rejected() {
     let mut inventory = PlayerInventory::new();
-    let packet = ItemStackRequestPacket::new(
+    let catalog = vec![stack("stone", 64)];
+    let request = ItemStackRequest::new(
         12,
-        vec![ItemStackRequestAction::CreativeCreate { item: stack("stone", 64), count: 64 }],
+        vec![ItemStackRequestAction::CreativeCreate {
+            creative_item_id: 1,
+            repetitions: 64,
+        }],
     );
-    let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+    let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &catalog);
     assert_eq!(outcome.response.status, server_core::crafting::STATUS_ERROR);
     assert!(inventory.is_empty());
 }
@@ -167,14 +189,22 @@ fn armor_and_cursor_through_requests() {
     let mut inventory = PlayerInventory::new();
     inventory.set_window_slot(WINDOW_ID_INVENTORY, 1, stack("iron_chestplate", 1));
     // Take the chestplate to the cursor, then place it into armor slot 1.
-    let packet = ItemStackRequestPacket::new(
+    let request = ItemStackRequest::new(
         13,
         vec![
-            ItemStackRequestAction::Take { slot: slot(0, 1), count: 1 },
-            ItemStackRequestAction::Place { slot: slot(120, 1), count: 1 },
+            ItemStackRequestAction::Take {
+                count: 1,
+                source: slot(UI_INVENTORY, 1),
+                destination: slot(UI_CURSOR, 0),
+            },
+            ItemStackRequestAction::Take {
+                count: 1,
+                source: slot(UI_CURSOR, 0),
+                destination: slot(UI_ARMOR, 1),
+            },
         ],
     );
-    let outcome = apply_item_stack_request(&mut inventory, manager(), &packet, false);
+    let outcome = apply_item_stack_request(&mut inventory, manager(), &request, false, &[]);
     assert_eq!(outcome.response.status, server_core::crafting::STATUS_OK);
     assert_eq!(
         inventory.window_slot(server_core::inventory::WINDOW_ID_ARMOR, 1).unwrap().network_id,
@@ -183,7 +213,7 @@ fn armor_and_cursor_through_requests() {
     assert!(inventory.cursor_item().is_empty());
     // `container_slot` agrees with the window view.
     assert_eq!(
-        container_slot(&inventory, &slot(CONTAINER_CURSOR, 0)),
+        container_slot(&inventory, &slot(UI_CURSOR, 0)),
         Some(ItemStack::empty())
     );
     let _ = ArmorInventory::new();
@@ -199,7 +229,11 @@ fn session_answers_item_stack_request() {
     let mut writer = bedrock_protocol::binary::Writer::new();
     ItemStackRequestPacket::new(
         21,
-        vec![ItemStackRequestAction::Drop { slot: slot(0, 0), count: 5 }],
+        vec![ItemStackRequestAction::Drop {
+            count: 5,
+            source: slot(UI_COMBINED_HOTBAR_AND_INVENTORY, 0),
+            randomly: false,
+        }],
     )
     .encode_payload(&mut writer);
     let out = session.handle_packet(0x93, &writer.into_bytes()).unwrap();
@@ -207,6 +241,43 @@ fn session_answers_item_stack_request() {
     assert_eq!(out[0].packet_id(), 0x94);
     assert_eq!(out[2].packet_id(), 0x1F);
     assert_eq!(session.inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().count, 59);
+}
+
+/// Session-level: the creative drag that failed before (the client sends
+/// `CreativeCreate` for the catalog entry, then takes it from the created-item
+/// output) now reaches the hotbar and is answered with an OK response.
+#[test]
+fn session_creative_drag_reaches_the_hotbar() {
+    let mut session = PlayerSession::new(11, SocketAddr::from(([127, 0, 0, 1], 19132)));
+    session.gamemode = 1;
+    let mut writer = bedrock_protocol::binary::Writer::new();
+    ItemStackRequestPacket::new(
+        30,
+        vec![
+            ItemStackRequestAction::CreativeCreate {
+                creative_item_id: 1,
+                repetitions: 1,
+            },
+            ItemStackRequestAction::Take {
+                count: 1,
+                source: slot(UI_CREATED_OUTPUT, CREATED_ITEM_SLOT),
+                destination: slot(UI_COMBINED_HOTBAR_AND_INVENTORY, 0),
+            },
+        ],
+    )
+    .encode_payload(&mut writer);
+    let out = session.handle_packet(0x93, &writer.into_bytes()).unwrap();
+    assert_eq!(out[0].packet_id(), 0x94);
+    let catalog = server_core::crafting::creative_catalog();
+    assert!(!catalog[0].is_empty(), "catalog entry 1 must be a real item");
+    assert_eq!(
+        session
+            .inventory
+            .window_slot(WINDOW_ID_INVENTORY, 0)
+            .unwrap()
+            .network_id,
+        catalog[0].network_id
+    );
 }
 
 /// Session-level: opening and closing the crafting table container.
@@ -220,22 +291,38 @@ fn session_opens_and_closes_crafting_table() {
 
     // Put planks in the table grid, then close: inputs return to inventory.
     session.crafting_table.inventory.set_input(0, stack("oak_planks", 4));
-    let out = session.handle_packet(0x2F, b"\x0a\x00").unwrap();
+    let out = session.handle_packet(0x2F, b"\x0a\x01\x00").unwrap();
     assert!(out.iter().any(|packet| packet.packet_id() == 0x2F));
     assert!(session.open_container.is_none());
     assert_eq!(session.inventory.total_items(), 4);
 }
 
-/// Session-level: InteractPacket OPEN_INVENTORY (0x21) resyncs inventory.
+/// Session-level: InteractPacket OPEN_INVENTORY (0x21) opens the inventory
+/// screen (ContainerOpen 0x2E, window 0, container type `INVENTORY`) and then
+/// resyncs the contents.
 #[test]
 fn session_interact_open_inventory() {
+    use bedrock_protocol::packets::container_open::{
+        ContainerOpenPacket, CONTAINER_TYPE_INVENTORY,
+    };
     use bedrock_protocol::packets::interact::{InteractPacket, ACTION_OPEN_INVENTORY};
     let mut session = PlayerSession::new(9, SocketAddr::from(([127, 0, 0, 1], 19132)));
     let mut writer = bedrock_protocol::binary::Writer::new();
-    InteractPacket::new(ACTION_OPEN_INVENTORY, 0, None).encode_payload(&mut writer);
+    InteractPacket::new(ACTION_OPEN_INVENTORY, 9, None).encode_payload(&mut writer);
     let out = session.handle_packet(0x21, &writer.into_bytes()).unwrap();
-    assert!(!out.is_empty());
-    assert_eq!(out[0].packet_id(), 0x31); // InventoryContentPacket
+    assert_eq!(out[0].packet_id(), 0x2E); // ContainerOpenPacket
+    assert_eq!(out[1].packet_id(), 0x31); // InventoryContentPacket
+
+    let bytes = out[0].to_bytes().unwrap();
+    let mut reader = bedrock_protocol::binary::Reader::new(&bytes);
+    assert_eq!(reader.read_var_u32().unwrap(), ContainerOpenPacket::PACKET_ID);
+    let open = ContainerOpenPacket::decode_payload(&mut reader).unwrap();
+    assert_eq!(
+        open.window_id as u32,
+        server_core::inventory::WINDOW_ID_INVENTORY
+    );
+    assert_eq!(open.container_type, CONTAINER_TYPE_INVENTORY);
+    assert_eq!(open.actor_unique_id, session.entity_runtime_id as i64);
 }
 
 /// Session-level: anvil container + damage roll through its API.

@@ -243,29 +243,61 @@ servidor responde con `ItemStackResponsePacket` (0x94) más
 actualizaciones de slot. El motor vive en `crafting.rs` y lo despacha
 `PlayerSession::handle_item_stack_request`.
 
-Contenedores modelados (los ids coinciden con los de ventana):
+Layout del paquete (Mojang `ItemStackRequestPacket`, contrastado con
+`pocketmine/network/mcpe/protocol/ItemStackRequest`):
 
-```rust
-pub const CONTAINER_INVENTORY: u8 = 0;
-pub const CONTAINER_OFFHAND:   u8 = 119;
-pub const CONTAINER_ARMOR:     u8 = 120;
-pub const CONTAINER_CURSOR:    u8 = 124;
-pub const CONTAINER_CRAFT_SMALL: u8 = 125;
-pub const CONTAINER_CRAFT_BIG:   u8 = 126;
+```
+requests: var_u32 count, cada uno:
+  request_id: var_i32 (zigzag)
+  actions:    var_u32 count, cada una:
+    type: var_u32  ← numeración externa: 0 Take, 1 Place, 2 Swap, 3 Drop,
+                     4 Destroy, 12 CreativeCreate, 10 CraftingRecipe,
+                     11 CraftingRecipeAuto, ...
+    inner_type: u8 ← `ItemStackRequestActionType::INNER_TYPES[type]`
+                     (7 y 8 son las acciones de contenedor obsoletas, así que
+                     desde LabTableCombine va desplazado dos: 9, 10, 11, ...)
+    payload según el tipo
+  filter_strings: var_u32 count + strings
+  filter_string_cause: i32 LE
 ```
 
-`container_slot(inventory, slot)` lee cualquier slot modelado
-(incluidos los slots de resultado de crafteo 125/126);
-`set_container_slot` escribe. Un contenedor desconocido → `false`.
+Las dos trampas que rompían todo: el tipo de acción son **dos** campos
+(`var_u32` + byte interior, comparado con el anterior que leía uno solo),
+y el `stack net id` de un slot es un **i32 LE**, no un varint.
+
+`ContainerSlot` (`ItemStackRequestSlotInfo`): `container u8`,
+`dynamic_id` opcional (bool + u32 LE), `slot u8` y el `item stack net id`
+(`i32 LE`) que el cliente cree que hay en el slot (se ignora).
+
+Ojo: el cliente direcciona slots con **ids de contenedor de UI**
+(`ContainerUIIds`), no con ids de ventana. `crafting::ui_container_window`
+los traduce:
+
+```rust
+UI_COMBINED_HOTBAR_AND_INVENTORY = 12 ─┐
+UI_HOTBAR = 28 ──────────────────────┼→ ventana 0 (inventario)
+UI_INVENTORY = 29 ───────────────────┘
+UI_ARMOR = 6      → ventana 120
+UI_OFFHAND = 34   → ventana 119 (slot 0)
+UI_CURSOR = 59    → cursor
+UI_CRAFTING_INPUT = 13, slots 28..=31 → rejilla 2x2, 32..=40 → rejilla 3x3
+UI_CREATED_OUTPUT = 60, slot 50 → «created item» (resultado de crafteo /
+                                  entrada del catálogo creativo)
+```
+
+`container_slot(inventory, slot)` / `set_container_slot` aplican esa
+traducción; un contenedor desconocido → `None`/`false`.
 
 ```rust
 pub fn apply_item_stack_request(
     inventory: &mut PlayerInventory,
     mgr: &CraftingManager,
-    packet: &ItemStackRequestPacket,
+    request: &ItemStackRequest,
     is_creative: bool,
+    creative: &[ItemStack],   // catalogo creativo (creative_item_id - 1)
 ) -> ItemStackRequestOutcome
-// ItemStackRequestOutcome { response, dropped: Vec<ItemStack>, changed: Vec<ItemStackResponseSlot> }
+// ItemStackRequestOutcome { response, dropped: Vec<ItemStack>,
+//                           changed: Vec<(ItemStackContainerSlot, ItemStack)> }
 ```
 
 Regla de oro: se clona el inventario antes de tocar nada; **si una
@@ -275,29 +307,37 @@ el port de `Player::handleItemStackRequest`.
 
 | Acción | Qué hace |
 |---|---|
-| `Take { slot, count }` | Mueve hasta `count` del slot al cursor. Falla si el cursor lleva otro ítem o superaría `max_stack_size`. |
-| `Place { slot, count }` | Deja hasta `count` del cursor en el slot. Falla si difieren los ítems o supera la pila máxima. |
-| `Swap { slot_a, slot_b }` | Intercambia dos slots de cualquier ventana modelada. |
-| `Drop { slot, count }` | Quita ítems del slot (tecla Q) vía `drop_from_slot`; la pila va a `dropped`. |
-| `Destroy { slot, count }` | Borra ítems del slot (desaparecen: borrado creativo). |
-| `CreativeCreate { item, count }` | Solo si `is_creative` (la sesión pasa `gamemode == 1`): añade con `add_item`, recortado a la pila máxima; si no cabe, falla. |
-| `CraftRecipe { recipe_id, count }` | Crafteo desde el libro de recetas (abajo). |
+| `Take { count, source, destination }` | Mueve `count` del slot `source` al `destination` (incluye el «created item»). |
+| `Place { count, source, destination }` | Igual que `Take`: el protocolo manda origen y destino en ambas. |
+| `Swap { slot1, slot2 }` | Intercambia dos slots modelados. |
+| `Drop { count, source, randomly }` | Quita ítems del slot (tecla Q); la pila va a `dropped`. |
+| `Destroy { count, source }` | Borra ítems (borrado del inventario creativo). |
+| `CraftingConsumeInput { count, source }` | Consume un ingrediente de la rejilla durante un crafteo. |
+| `CreativeCreate { creative_item_id, repetitions }` | Solo creativo: copia la entrada `creative_item_id` del catálogo al «created item». |
+| `CraftingRecipe { recipe_network_id, repetitions }` | `mgr.recipe_by_network_id` resuelve la receta y deja su resultado en el «created item». |
+| `MineBlock`, `BeaconPayment`, `CraftingRecipeOptional`, `Grindstone`, `Loom`, `LabTableCombine`, … | Aceptadas sin efecto (no hay modelo de durabilidad/encantamientos). |
 
-`CraftRecipe`: `mgr.recipe_by_id(recipe_id)` resuelve por id exacto
-(`minecraft:oak_planks#123`) o por nombre de resultado
-(`minecraft:oak_planks`). Para shapeless consume cada ingrediente
-una vez por unidad producida desde el inventario principal
-(`consume_ingredient`); para shaped consume una de cada celda no
-vacía de la forma. El resultado se multiplica por `count` y debe
-caber entero con `add_item`, o el request entero falla.
+El catálogo creativo (`crafting::creative_catalog`) se parsea de
+`data/bds-capture/creative_content/1.json`, la forma decodificada del
+`CreativeContentPacket` que se envía en el spawn: los ids de entrada
+(1..=1875) son los `creative_item_id` que manda el cliente.
 
-Respuesta (`session.rs::handle_item_stack_request`):
+Respuesta (`session.rs::handle_item_stack_request`), una por request:
 
 1. `ItemStackResponsePacket` (0x94) vía
-   `packets_wire::item_stack_response_wire` (una entrada por `request_id`).
-2. Un `InventorySlotPacket` (0x32) por cada slot en `changed`.
+   `packets_wire::item_stack_response_wire` (`result` u8 + `request_id`
+   var_i32 + **opcional** de contenedores: siempre va el byte de presencia,
+   con la lista solo en las respuestas OK; el estado del servidor ya
+   coincide, así que la lista va vacía).
+2. Un `InventorySlotPacket` (0x32) por cada slot en `changed` (traducido
+   del id de UI a ventana + slot).
 3. `MobEquipmentPacket` (0x1F) con el ítem en mano, para los demás
    espectadores.
+
+Si el paquete no decodifica, la sesión responde un `ItemStackResponse`
+con `result = 1` para cada `request_id` que pueda leer
+(`item_stack_error_response`), para que el cliente revierta su
+predicción en vez de quedarse esperando.
 
 Nota: `outcome.dropped` hoy se descarta en la sesión
 (`let _ = outcome.dropped`): el drop actualiza el inventario pero
@@ -327,9 +367,8 @@ cualquier rechazo devuelve `resync_inventory()`: un
 // session.rs
 pub struct OpenContainer {
     pub window_id: u8,       // 10 = mesa de crafteo, 16 = yunque (BDS)
-    pub name: String,        // "minecraft:crafting_table" | "minecraft:anvil"
+    pub container_type: u8,  // 1 = workbench, 5 = anvil (ContainerType del protocolo)
     pub position: (i32, i32, i32),
-    pub unique_id: u32,      // 10_000 + session_id % 10_000 (determinista por sesión)
     pub kind: String,        // "crafting_table" | "anvil"
 }
 ```
@@ -343,8 +382,16 @@ pub struct OpenContainer {
   principal con `add_item` (el resto que no cabe se registra en log),
   se reenvía el inventario y se confirma con `container_close_wire`
   (`server_initiated = false`).
-- `InteractPacket` (0x21) con `OPEN_INVENTORY` simplemente
-  re-sincroniza la pantalla de inventario del jugador.
+- `ContainerOpenPacket` (0x2E) usa el layout actual del protocolo:
+  `container_id u8`, `container_type u8` (`0xFF` = inventario, `1` =
+  workbench, `5` = anvil), `BlockPos` y `ActorUniqueID` (`var_i64`, `-1`
+  para bloques). `ContainerClosePacket` (0x2F) lleva también el
+  `container_type` entre el id y el flag.
+- `InteractPacket` (0x21) con `OPEN_INVENTORY` abre la pantalla de
+  inventario del jugador con `ContainerOpenPacket` (ventana 0, tipo
+  `INVENTORY`, actor id del propio jugador) y después re-sincroniza el
+  contenido: desde 1.16 el cliente espera `ContainerOpen` para toda
+  pantalla, incluida la suya.
 
 Solo existen dos contenedores dinámicos (`crafting_table`, `anvil`):
 no hay cofres ni ventanas genéricas de plugin todavía.

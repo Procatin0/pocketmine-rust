@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use rtc::ice::network_type::NetworkType;
 use rtc::peer_connection::transport::{RTCDtlsRole, RTCIceCandidateInit};
@@ -85,8 +85,22 @@ impl PeerDataChannels {
         let mut framed = Vec::with_capacity(data.len() + 1);
         framed.push(0x00); // 0x00 NetherNet countdown header (unfragmented)
         framed.extend_from_slice(&data);
+        let len = framed.len();
         let buf = bytes::BytesMut::from(&framed[..]);
-        dc.send(buf).await.is_ok()
+        // `DataChannel::send` awaits SCTP flow control: on a congested peer it
+        // parks for tens of milliseconds, and the caller is the server tick, so
+        // that stall delays every other packet queued behind it. Log slow writes
+        // so lag can be attributed to the transport instead of the game logic.
+        let started = std::time::Instant::now();
+        let ok = dc.send(buf).await.is_ok();
+        let elapsed = started.elapsed();
+        if elapsed > std::time::Duration::from_millis(20) {
+            warn!(
+                "[:WebRTC] slow data channel send to {}: {:?} for {} bytes",
+                peer, elapsed, len
+            );
+        }
+        ok
     }
 }
 
@@ -177,7 +191,17 @@ impl PeerConnectionEventHandler for NetherNetWebRtcHandler {
                                         dc.clone()
                                     };
 
-                                    if let Err(e) = target_dc.send(buf).await {
+                                    let len = buf.len();
+                                    let send_started = std::time::Instant::now();
+                                    let sent = target_dc.send(buf).await;
+                                    let send_elapsed = send_started.elapsed();
+                                    if send_elapsed > std::time::Duration::from_millis(20) {
+                                        warn!(
+                                            "[:WebRTC] slow reply send to {} on '{}': {:?} for {} bytes",
+                                            peer, label, send_elapsed, len
+                                        );
+                                    }
+                                    if let Err(e) = sent {
                                         error!("[:WebRTC] Failed to send response on '{}': {}", label, e);
                                     }
                                 }

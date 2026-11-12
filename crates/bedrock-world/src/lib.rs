@@ -1,6 +1,7 @@
 //! Bedrock World Crate - PalettedBlockArray, SubChunks, Chunks & Generators
 
 pub mod block_id;
+pub mod block_states;
 pub mod chunk;
 pub mod generator;
 pub mod java_chunk;
