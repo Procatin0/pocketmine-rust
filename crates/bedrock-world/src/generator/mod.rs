@@ -5,6 +5,10 @@
 use std::sync::Arc;
 
 pub mod biome;
+pub mod bds_biome_tree;
+pub mod bds_noise_params;
+pub mod bds_seed_hash;
+pub mod bds_terrain;
 pub mod caves;
 pub mod flat;
 pub mod java_terrain;
@@ -15,6 +19,9 @@ pub mod populators;
 pub mod random;
 pub mod structures;
 
+pub use bds_noise_params::{BEDROCK_CLIMATE_SEEDS, BedrockNoiseConfig, CLIMATE_TEMPERATURE, CLIMATE_HUMIDITY, CLIMATE_CONTINENTALNESS, CLIMATE_EROSION, CLIMATE_PEAKS_AND_VALLEYS, CLIMATE_WEIRDNESS, bedrock_string_seed, get_climate_seed_by_name};
+pub use bds_seed_hash::{bedrock_string_to_seed, bedrock_string_seed_to_u64, murmur3_32};
+pub use bds_terrain::{BDSTerrain, BDS_SEA_LEVEL};
 pub use flat::FlatGenerator;
 pub use java_terrain::{
     DoublePerlinNoise, JavaTerrain, PerlinNoise, Spline, Xoroshiro128Plus,
@@ -80,10 +87,11 @@ pub trait WorldGenerator: Send + Sync {
     }
 }
 
-/// Creates a `WorldGenerator` from a level-type string ("flat" or "normal"/"default") and a seed.
+/// Creates a `WorldGenerator` from a level-type string ("flat", "normal"/"default", or "bds") and a seed.
 pub fn create_generator(level_type: &str, seed: u64) -> Arc<dyn WorldGenerator> {
     match level_type.to_lowercase().as_str() {
         "flat" => Arc::new(FlatGenerator::new()),
+        "bds" => Arc::new(BDSTerrain::new(seed)),
         _ => Arc::new(NormalGenerator::new(seed as i64)),
     }
 }

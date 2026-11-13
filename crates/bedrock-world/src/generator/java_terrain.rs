@@ -10,7 +10,7 @@
 //! | Relief            | `min/max` heights per biome, Gaussian-smoothed | `Spline` tree over `(continentalness, erosion, peaks, weirdness)` |
 //! | Solidity          | `noise - slope > 0`                    | `density = 1 - 4y/128 - 83/160 + offset > 0` |
 //! | Sea level         | 62                                     | 63 (`JAVA_SEA_LEVEL`) |
-//! | Biomes            | `BiomeSelector` (temp/rainfall Simplex) | `BIOME_TREE` nearest node (not ported: needs the 217 KB table) |
+//! | Biomes            | `BiomeSelector` (temp/rainfall Simplex) | `BIOME_TREE` nearest node — ported in `bds_biome_tree.rs`, wired up by `bds_terrain.rs` |
 //! | Blocks            | Stone/water + GroundCover/ores/trees   | Not generated here (niduy only renders a biome preview at y=255) |
 //!
 //! `NormalGenerator` stays the default world generator: it is the only one

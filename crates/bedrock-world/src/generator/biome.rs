@@ -7,18 +7,22 @@
 //! funnels into its cubiomes biome noise. `Plains` (1) and `Ocean` (0)
 //! already matched; the six badlands ids were the gap.
 //!
-//! What is *not* ported from niduy: its 1.18+ climate engine (temperature,
-//! humidity, continentalness, erosion and weirdness double-Perlin noises
-//! plus spline/Voronoi biome noise and a ~1.6k-entry parameter tree).
-//! PocketMine's `BiomeSelector` is a temperature/rainfall lookup, and the
-//! PocketMine seed-parity suite expects those elevations/blocks exactly,
-//! so the selector keeps its 11 emitted biomes and, like PocketMine,
-//! never emits a badlands id (see
-//! [`tests::selector_lookup_never_emits_badlands`]). niduy locates biomes
-//! and structures only — it has no terrain or water pass — so sea level
-//! stays PocketMine's (`NormalGenerator::SEA_LEVEL = 62`); the Java
-//! client side (plains/badlands registry indexes, 26.1 `fluidCount`)
-//! lives in `crate::java_chunk`.
+//! niduy's 1.18+ climate engine (the six double-Perlin climate noises and
+//! the 9112-node `BIOME_TREE` KD-tree over 139 shared parameter ranges) is
+//! ported too now — in [`crate::generator::bds_terrain`] and
+//! [`crate::generator::bds_biome_tree`] — and it can emit far more legacy
+//! ids than PocketMine's selector, so every id the tree can produce has a
+//! `get_biome_info` entry below.
+//!
+//! PocketMine's `BiomeSelector` itself (a temperature/rainfall lookup, used
+//! by the PocketMine-parity `NormalGenerator`) is unchanged: the PocketMine
+//! seed-parity suite expects those elevations/blocks exactly, so the
+//! selector keeps its 11 emitted biomes and, like PocketMine, never emits a
+//! badlands id (see [`tests::selector_lookup_never_emits_badlands`]). niduy
+//! locates biomes and structures only — it has no terrain or water pass —
+//! so sea level stays PocketMine's (`NormalGenerator::SEA_LEVEL = 62`) for
+//! the normal generator; the Java client side (plains/badlands registry
+//! indexes, 26.1 `fluidCount`) lives in `crate::java_chunk`.
 
 use crate::block_id;
 use crate::generator::noise::SimplexNoise;
@@ -47,6 +51,52 @@ pub mod biome_ids {
     pub const ERODED_BADLANDS: u8 = 165;
     pub const MODIFIED_WOODED_BADLANDS_PLATEAU: u8 = 166;
     pub const MODIFIED_BADLANDS_PLATEAU: u8 = 167;
+
+    // —— Ids emitted by the 1.18+ climate KD-tree (see `bds_biome_tree`) ——
+    //
+    // The BDS generator selects biomes with the Java 1.18+ climate tree and
+    // maps the Java ids onto this legacy id space (`java_to_bedrock`), so
+    // every id below can now appear in a BDS world. Named like PocketMine's
+    // `generated/data/bedrock/BiomeIds.php`.
+    pub const FROZEN_RIVER: u8 = 11;
+    pub const MUSHROOM_FIELDS: u8 = 14;
+    pub const BEACH: u8 = 16;
+    pub const JUNGLE: u8 = 21;
+    pub const JUNGLE_EDGE: u8 = 23;
+    pub const DEEP_OCEAN: u8 = 24;
+    pub const STONE_SHORE: u8 = 25;
+    pub const SNOWY_BEACH: u8 = 26;
+    pub const DARK_FOREST: u8 = 29;
+    pub const SNOWY_TAIGA: u8 = 30;
+    pub const GIANT_TREE_TAIGA: u8 = 32;
+    pub const WOODED_MOUNTAINS: u8 = 34;
+    pub const SAVANNA: u8 = 35;
+    pub const SAVANNA_PLATEAU: u8 = 36;
+    pub const WARM_OCEAN: u8 = 40;
+    pub const LUKEWARM_OCEAN: u8 = 42;
+    pub const DEEP_LUKEWARM_OCEAN: u8 = 43;
+    pub const COLD_OCEAN: u8 = 44;
+    pub const DEEP_COLD_OCEAN: u8 = 45;
+    pub const FROZEN_OCEAN: u8 = 46;
+    pub const DEEP_FROZEN_OCEAN: u8 = 47;
+    pub const BAMBOO_JUNGLE: u8 = 48;
+    pub const SUNFLOWER_PLAINS: u8 = 129;
+    pub const GRAVELLY_MOUNTAINS: u8 = 131;
+    pub const FLOWER_FOREST: u8 = 132;
+    pub const ICE_SPIKES: u8 = 140;
+    pub const TALL_BIRCH_FOREST: u8 = 155;
+    pub const GIANT_SPRUCE_TAIGA: u8 = 160;
+    pub const SHATTERED_SAVANNA: u8 = 163;
+    pub const JAGGED_PEAKS: u8 = 182;
+    pub const FROZEN_PEAKS: u8 = 183;
+    pub const SNOWY_SLOPES: u8 = 184;
+    pub const GROVE: u8 = 185;
+    pub const MEADOW: u8 = 186;
+    pub const LUSH_CAVES: u8 = 187;
+    pub const DRIPSTONE_CAVES: u8 = 188;
+    pub const STONY_PEAKS: u8 = 189;
+    pub const DEEP_DARK: u8 = 190;
+    pub const MANGROVE_SWAMP: u8 = 191;
 }
 
 pub use biome_ids::*;
@@ -268,6 +318,361 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             ground_cover: BADLANDS_COVER,
             temperature: 2.0,
             rainfall: 0.0,
+        },
+        // —— Ids the 1.18+ climate KD-tree can emit (see `bds_biome_tree`) ——
+        // Without these the fallback below would report them as ocean-elevation
+        // gravel biomes and drag the terrain envelope down wherever the tree
+        // picks a land biome.
+        FROZEN_RIVER => BiomeInfo {
+            id: FROZEN_RIVER,
+            name: "Frozen River",
+            min_elevation: 58.0,
+            max_elevation: 62.0,
+            ground_cover: RIVER_COVER,
+            temperature: 0.0,
+            rainfall: 0.5,
+        },
+        MUSHROOM_FIELDS => BiomeInfo {
+            id: MUSHROOM_FIELDS,
+            name: "Mushroom Fields",
+            min_elevation: 63.0,
+            max_elevation: 75.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.9,
+            rainfall: 1.0,
+        },
+        BEACH => BiomeInfo {
+            id: BEACH,
+            name: "Beach",
+            min_elevation: 62.0,
+            max_elevation: 64.0,
+            ground_cover: SANDY_COVER,
+            temperature: 0.8,
+            rainfall: 0.4,
+        },
+        JUNGLE => BiomeInfo {
+            id: JUNGLE,
+            name: "Jungle",
+            min_elevation: 63.0,
+            max_elevation: 82.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.95,
+            rainfall: 0.9,
+        },
+        JUNGLE_EDGE => BiomeInfo {
+            id: JUNGLE_EDGE,
+            name: "Jungle Edge",
+            min_elevation: 63.0,
+            max_elevation: 78.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.95,
+            rainfall: 0.8,
+        },
+        DEEP_OCEAN => BiomeInfo {
+            id: DEEP_OCEAN,
+            name: "Deep Ocean",
+            min_elevation: 40.0,
+            max_elevation: 52.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        STONE_SHORE => BiomeInfo {
+            id: STONE_SHORE,
+            name: "Stone Shore",
+            min_elevation: 63.0,
+            max_elevation: 90.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.2,
+            rainfall: 0.3,
+        },
+        SNOWY_BEACH => BiomeInfo {
+            id: SNOWY_BEACH,
+            name: "Snowy Beach",
+            min_elevation: 62.0,
+            max_elevation: 64.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.3,
+        },
+        DARK_FOREST => BiomeInfo {
+            id: DARK_FOREST,
+            name: "Dark Forest",
+            min_elevation: 63.0,
+            max_elevation: 78.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.7,
+            rainfall: 0.8,
+        },
+        SNOWY_TAIGA => BiomeInfo {
+            id: SNOWY_TAIGA,
+            name: "Snowy Taiga",
+            min_elevation: 63.0,
+            max_elevation: 81.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.8,
+        },
+        GIANT_TREE_TAIGA => BiomeInfo {
+            id: GIANT_TREE_TAIGA,
+            name: "Giant Tree Taiga",
+            min_elevation: 63.0,
+            max_elevation: 86.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.3,
+            rainfall: 0.8,
+        },
+        WOODED_MOUNTAINS => BiomeInfo {
+            id: WOODED_MOUNTAINS,
+            name: "Wooded Mountains",
+            min_elevation: 63.0,
+            max_elevation: 127.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.2,
+            rainfall: 0.3,
+        },
+        SAVANNA => BiomeInfo {
+            id: SAVANNA,
+            name: "Savanna",
+            min_elevation: 63.0,
+            max_elevation: 80.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        SAVANNA_PLATEAU => BiomeInfo {
+            id: SAVANNA_PLATEAU,
+            name: "Savanna Plateau",
+            min_elevation: 70.0,
+            max_elevation: 100.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        WARM_OCEAN => BiomeInfo {
+            id: WARM_OCEAN,
+            name: "Warm Ocean",
+            min_elevation: 46.0,
+            max_elevation: 58.0,
+            ground_cover: SANDY_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        LUKEWARM_OCEAN => BiomeInfo {
+            id: LUKEWARM_OCEAN,
+            name: "Lukewarm Ocean",
+            min_elevation: 46.0,
+            max_elevation: 58.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        DEEP_LUKEWARM_OCEAN => BiomeInfo {
+            id: DEEP_LUKEWARM_OCEAN,
+            name: "Deep Lukewarm Ocean",
+            min_elevation: 40.0,
+            max_elevation: 52.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        COLD_OCEAN => BiomeInfo {
+            id: COLD_OCEAN,
+            name: "Cold Ocean",
+            min_elevation: 46.0,
+            max_elevation: 58.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        DEEP_COLD_OCEAN => BiomeInfo {
+            id: DEEP_COLD_OCEAN,
+            name: "Deep Cold Ocean",
+            min_elevation: 40.0,
+            max_elevation: 52.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        FROZEN_OCEAN => BiomeInfo {
+            id: FROZEN_OCEAN,
+            name: "Frozen Ocean",
+            min_elevation: 46.0,
+            max_elevation: 58.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.0,
+            rainfall: 0.5,
+        },
+        DEEP_FROZEN_OCEAN => BiomeInfo {
+            id: DEEP_FROZEN_OCEAN,
+            name: "Deep Frozen Ocean",
+            min_elevation: 40.0,
+            max_elevation: 52.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.0,
+            rainfall: 0.5,
+        },
+        BAMBOO_JUNGLE => BiomeInfo {
+            id: BAMBOO_JUNGLE,
+            name: "Bamboo Jungle",
+            min_elevation: 63.0,
+            max_elevation: 85.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.95,
+            rainfall: 0.9,
+        },
+        SUNFLOWER_PLAINS => BiomeInfo {
+            id: SUNFLOWER_PLAINS,
+            name: "Sunflower Plains",
+            min_elevation: 63.0,
+            max_elevation: 68.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.8,
+            rainfall: 0.4,
+        },
+        GRAVELLY_MOUNTAINS => BiomeInfo {
+            id: GRAVELLY_MOUNTAINS,
+            name: "Gravelly Mountains",
+            min_elevation: 63.0,
+            max_elevation: 140.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.2,
+            rainfall: 0.3,
+        },
+        FLOWER_FOREST => BiomeInfo {
+            id: FLOWER_FOREST,
+            name: "Flower Forest",
+            min_elevation: 63.0,
+            max_elevation: 80.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.7,
+            rainfall: 0.8,
+        },
+        ICE_SPIKES => BiomeInfo {
+            id: ICE_SPIKES,
+            name: "Ice Spikes",
+            min_elevation: 63.0,
+            max_elevation: 74.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.0,
+            rainfall: 0.5,
+        },
+        TALL_BIRCH_FOREST => BiomeInfo {
+            id: TALL_BIRCH_FOREST,
+            name: "Tall Birch Forest",
+            min_elevation: 63.0,
+            max_elevation: 85.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.6,
+            rainfall: 0.6,
+        },
+        GIANT_SPRUCE_TAIGA => BiomeInfo {
+            id: GIANT_SPRUCE_TAIGA,
+            name: "Giant Spruce Taiga",
+            min_elevation: 63.0,
+            max_elevation: 86.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.25,
+            rainfall: 0.8,
+        },
+        SHATTERED_SAVANNA => BiomeInfo {
+            id: SHATTERED_SAVANNA,
+            name: "Shattered Savanna",
+            min_elevation: 63.0,
+            max_elevation: 110.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 2.0,
+            rainfall: 0.0,
+        },
+        JAGGED_PEAKS => BiomeInfo {
+            id: JAGGED_PEAKS,
+            name: "Jagged Peaks",
+            min_elevation: 90.0,
+            max_elevation: 200.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.3,
+        },
+        FROZEN_PEAKS => BiomeInfo {
+            id: FROZEN_PEAKS,
+            name: "Frozen Peaks",
+            min_elevation: 90.0,
+            max_elevation: 200.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.3,
+        },
+        SNOWY_SLOPES => BiomeInfo {
+            id: SNOWY_SLOPES,
+            name: "Snowy Slopes",
+            min_elevation: 70.0,
+            max_elevation: 160.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.3,
+        },
+        GROVE => BiomeInfo {
+            id: GROVE,
+            name: "Grove",
+            min_elevation: 63.0,
+            max_elevation: 140.0,
+            ground_cover: SNOWY_COVER,
+            temperature: 0.05,
+            rainfall: 0.5,
+        },
+        MEADOW => BiomeInfo {
+            id: MEADOW,
+            name: "Meadow",
+            min_elevation: 63.0,
+            max_elevation: 110.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.5,
+            rainfall: 0.8,
+        },
+        LUSH_CAVES => BiomeInfo {
+            id: LUSH_CAVES,
+            name: "Lush Caves",
+            min_elevation: 62.0,
+            max_elevation: 90.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        DRIPSTONE_CAVES => BiomeInfo {
+            id: DRIPSTONE_CAVES,
+            name: "Dripstone Caves",
+            min_elevation: 62.0,
+            max_elevation: 90.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.8,
+            rainfall: 0.4,
+        },
+        STONY_PEAKS => BiomeInfo {
+            id: STONY_PEAKS,
+            name: "Stony Peaks",
+            min_elevation: 70.0,
+            max_elevation: 160.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 1.0,
+            rainfall: 0.3,
+        },
+        DEEP_DARK => BiomeInfo {
+            id: DEEP_DARK,
+            name: "Deep Dark",
+            min_elevation: 40.0,
+            max_elevation: 52.0,
+            ground_cover: GRAVEL_COVER,
+            temperature: 0.5,
+            rainfall: 0.5,
+        },
+        MANGROVE_SWAMP => BiomeInfo {
+            id: MANGROVE_SWAMP,
+            name: "Mangrove Swamp",
+            min_elevation: 62.0,
+            max_elevation: 64.0,
+            ground_cover: GRASSY_COVER,
+            temperature: 0.8,
+            rainfall: 0.9,
         },
         _ => BiomeInfo {
             id,
