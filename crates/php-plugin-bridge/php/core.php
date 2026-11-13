@@ -18,10 +18,11 @@ namespace pocketmine {
     use pocketmine\world\World;
     use pocketmine\world\WorldManager;
 
-    class Logger
+    class Logger extends \pocketmine\thread\log\AttachableThreadSafeLogger
     {
         public function __construct(private string $prefix = 'Server')
         {
+            parent::__construct();
         }
 
         private function emit(string $level, string $message): void
@@ -59,49 +60,49 @@ namespace pocketmine {
             return $isTty ? "\033[0m" . TextFormat::toANSI($line) . "\033[0m" : TextFormat::stripColors($line);
         }
 
-        public function info(string $message): void
+        public function info($message): void
         {
-            $this->emit('INFO', $message);
+            $this->emit('INFO', (string)$message);
         }
 
-        public function notice(string $message): void
+        public function notice($message): void
         {
-            $this->emit('NOTICE', $message);
+            $this->emit('NOTICE', (string)$message);
         }
 
-        public function warning(string $message): void
+        public function warning($message): void
         {
-            $this->emit('WARN', $message);
+            $this->emit('WARN', (string)$message);
         }
 
-        public function error(string $message): void
+        public function error($message): void
         {
-            $this->emit('ERROR', $message);
+            $this->emit('ERROR', (string)$message);
         }
 
-        public function critical(string $message): void
+        public function critical($message): void
         {
-            $this->emit('CRITICAL', $message);
+            $this->emit('CRITICAL', (string)$message);
         }
 
-        public function alert(string $message): void
+        public function alert($message): void
         {
-            $this->emit('ALERT', $message);
+            $this->emit('ALERT', (string)$message);
         }
 
-        public function emergency(string $message): void
+        public function emergency($message): void
         {
-            $this->emit('EMERGENCY', $message);
+            $this->emit('EMERGENCY', (string)$message);
         }
 
-        public function debug(string $message): void
+        public function debug($message): void
         {
-            $this->emit('DEBUG', $message);
+            $this->emit('DEBUG', (string)$message);
         }
 
-        public function log(int $level, string $message): void
+        public function log($level, $message): void
         {
-            $this->emit((string)$level, $message);
+            $this->emit((string)$level, (string)$message);
         }
 
         public function logException(\Throwable $e, array $trace = []): void

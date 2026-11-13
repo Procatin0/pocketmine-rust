@@ -23,7 +23,7 @@ pub use error::PluginError;
 pub use event::{Event, EventDispatcher, EventPriority, RegisteredListener};
 pub use events::*;
 pub use host::PluginHost;
-pub use manager::{CommandOutcome, LoadResult, PluginEnableOrder, PluginManager};
+pub use manager::{CommandOutcome, LoadResult, PluginEnableOrder, PluginFailure, PluginManager};
 pub use plugin::Plugin;
 pub use runtime::{
     DiscoveredPluginManifest, IpcResponse, NativePluginWrapper, PhpPlugin, PhpWorker, PluginSource,

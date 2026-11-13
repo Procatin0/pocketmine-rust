@@ -25,6 +25,7 @@ pub const PHP_RUNTIME_FILES: &[(&str, &str)] = &[
     ("scoreboard.php", include_str!("../../php/scoreboard.php")),
     ("bossbar.php", include_str!("../../php/bossbar.php")),
     ("chat.php", include_str!("../../php/chat.php")),
+    ("thread.php", include_str!("../../php/thread.php")),
     ("core.php", include_str!("../../php/core.php")),
     ("event.php", include_str!("../../php/event.php")),
     // After `event.php`/`player.php`: extends `Event` and uses `EventData`.
@@ -134,7 +135,7 @@ mod tests {
     /// minus `bootstrap.php` itself, which no file requires.
     #[test]
     fn runtime_list_matches_bootstrap_php() {
-        assert_eq!(PHP_RUNTIME_FILES.len(), 19, "runtime file count");
+        assert_eq!(PHP_RUNTIME_FILES.len(), 20, "runtime file count");
         let bootstrap = PHP_RUNTIME_FILES
             .iter()
             .find(|(name, _)| *name == "bootstrap.php")
@@ -157,7 +158,7 @@ mod tests {
             required, embedded,
             "bootstrap.php $runtimeFiles drifted from PHP_RUNTIME_FILES"
         );
-        for name in ["bossbar.php", "scoreboard.php", "PlayerDataSaveEvent.php"] {
+        for name in ["bossbar.php", "scoreboard.php", "PlayerDataSaveEvent.php", "thread.php"] {
             assert!(embedded.contains(&name), "missing {}", name);
         }
     }

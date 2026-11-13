@@ -51,11 +51,19 @@ impl PluginDescription {
     }
 }
 
+/// Detailed information about a plugin that failed to load or enable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginFailure {
+    pub name: String,
+    pub reason: String,
+}
+
 /// Result of [`PluginManager::load_plugins_from_directory`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadResult {
     pub loaded: usize,
     pub errors: usize,
+    pub failures: Vec<PluginFailure>,
 }
 
 /// Result of [`PluginManager::enable_plugins_for`]: `true` when every
@@ -81,6 +89,7 @@ pub struct PluginManager {
     listener_events_by_plugin: RwLock<HashMap<String, Vec<String>>>,
     listener_events: RwLock<HashSet<String>>,
     current_tick: AtomicU64,
+    enable_failures: RwLock<Vec<PluginFailure>>,
 }
 
 impl Default for PluginManager {
@@ -102,6 +111,7 @@ impl PluginManager {
             listener_events_by_plugin: RwLock::new(HashMap::new()),
             listener_events: RwLock::new(HashSet::new()),
             current_tick: AtomicU64::new(0),
+            enable_failures: RwLock::new(Vec::new()),
         }
     }
 
@@ -137,6 +147,11 @@ impl PluginManager {
     /// Planned load order (PHP plugins, dependencies first).
     pub fn load_order(&self) -> Vec<String> {
         self.load_order.read().clone()
+    }
+
+    /// Failures encountered during the last `enable_plugins_for` execution.
+    pub fn enable_failures(&self) -> Vec<PluginFailure> {
+        self.enable_failures.read().clone()
     }
 
     pub fn current_tick(&self) -> u64 {
@@ -215,11 +230,13 @@ impl PluginManager {
             return Ok(LoadResult {
                 loaded: 0,
                 errors: 0,
+                failures: Vec::new(),
             });
         }
 
         let mut discovered: Vec<(PluginDescription, PluginSource)> = Vec::new();
         let mut load_error_count = 0usize;
+        let mut failures: Vec<PluginFailure> = Vec::new();
 
         for item in self.discover_plugins_with_php(path) {
             match Self::parse_discovered_manifest(&item) {
@@ -227,10 +244,15 @@ impl PluginManager {
                 Err(error) => {
                     // `loadError($file, invalidManifest($e->getMessage()))`
                     tracing::error!(
+                        pm_level = "CRITICAL",
                         "Could not load plugin '{}': Invalid plugin manifest: {}",
                         item.path,
                         error
                     );
+                    failures.push(PluginFailure {
+                        name: item.path.clone(),
+                        reason: format!("Invalid plugin manifest: {error}"),
+                    });
                     load_error_count += 1;
                 }
             }
@@ -253,6 +275,7 @@ impl PluginManager {
             return Ok(LoadResult {
                 loaded: 0,
                 errors: load_error_count,
+                failures,
             });
         }
 
@@ -264,7 +287,11 @@ impl PluginManager {
         for entry in discovered {
             let name = entry.0.name.clone();
             if seen.contains(&name) {
-                tracing::error!("Could not load plugin '{name}': plugin exists");
+                tracing::error!(pm_level = "CRITICAL", "Could not load plugin '{name}': plugin exists");
+                failures.push(PluginFailure {
+                    name: name.clone(),
+                    reason: "plugin exists".to_string(),
+                });
                 load_error_count += 1;
                 continue;
             }
@@ -279,11 +306,17 @@ impl PluginManager {
             Ok(ordered) => ordered,
             Err(PluginError::MissingDependency(missing, requester)) => {
                 tracing::error!(
+                    pm_level = "CRITICAL",
                     "Could not load plugin '{requester}': Unknown dependency: {missing}"
                 );
+                failures.push(PluginFailure {
+                    name: requester.clone(),
+                    reason: format!("Unknown dependency: {missing}"),
+                });
                 return Ok(LoadResult {
                     loaded: 0,
                     errors: load_error_count + 1,
+                    failures,
                 });
             }
             Err(PluginError::CircularDependency(remaining)) => {
@@ -291,13 +324,19 @@ impl PluginManager {
                     let name = name.trim();
                     if !name.is_empty() {
                         tracing::error!(
+                            pm_level = "CRITICAL",
                             "Could not load plugin '{name}': Circular dependency detected"
                         );
+                        failures.push(PluginFailure {
+                            name: name.to_string(),
+                            reason: "Circular dependency detected".to_string(),
+                        });
                     }
                 }
                 return Ok(LoadResult {
                     loaded: 0,
                     errors: load_error_count + 1,
+                    failures,
                 });
             }
             Err(other) => return Err(other),
@@ -320,7 +359,11 @@ impl PluginManager {
             if self.plugins.read().contains_key(&name) {
                 // `duplicateError`; already counted above for discovered
                 // duplicates, but a native plugin could have collided.
-                tracing::error!("Could not load plugin '{name}': plugin exists");
+                tracing::error!(pm_level = "CRITICAL", "Could not load plugin '{name}': plugin exists");
+                failures.push(PluginFailure {
+                    name: name.clone(),
+                    reason: "plugin exists".to_string(),
+                });
                 load_error_count += 1;
                 continue;
             }
@@ -337,7 +380,11 @@ impl PluginManager {
             {
                 let mut guard = plugin.lock().await;
                 if let Err(error) = guard.on_load().await {
-                    tracing::error!("Could not load plugin '{name}': {error}");
+                    tracing::error!(pm_level = "CRITICAL", "Could not load plugin '{name}': {error}");
+                    failures.push(PluginFailure {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    });
                     load_error_count += 1;
                     continue;
                 }
@@ -351,6 +398,7 @@ impl PluginManager {
         Ok(LoadResult {
             loaded: loaded_count,
             errors: load_error_count,
+            failures,
         })
     }
 
@@ -379,6 +427,7 @@ impl PluginManager {
         order: PluginEnableOrder,
     ) -> Result<bool, PluginError> {
         let mut all_success = true;
+        self.enable_failures.write().clear();
         for name in self.ordered_plugin_names() {
             let description = self.get_description(&name);
             let matches_phase = description
@@ -414,8 +463,13 @@ impl PluginManager {
                     if !guard.is_enabled() {
                         // The plugin disabled itself during onEnable (`suicide`).
                         tracing::error!(
+                            pm_level = "CRITICAL",
                             "Could not enable plugin '{name}': Plugin disabled itself when attempting to enable it"
                         );
+                        self.enable_failures.write().push(PluginFailure {
+                            name: name.clone(),
+                            reason: "Plugin disabled itself when attempting to enable it".to_string(),
+                        });
                         all_success = false;
                         continue;
                     }
@@ -424,7 +478,11 @@ impl PluginManager {
                     self.record_plugin_listeners(&name, events);
                 }
                 Err(error) => {
-                    tracing::error!("Could not enable plugin '{name}': {error}");
+                    tracing::error!(pm_level = "CRITICAL", "Could not enable plugin '{name}': {error}");
+                    self.enable_failures.write().push(PluginFailure {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    });
                     all_success = false;
                 }
             }
@@ -458,7 +516,7 @@ impl PluginManager {
             {
                 let mut guard = plugin.lock().await;
                 if let Err(error) = guard.on_disable().await {
-                    tracing::error!("Could not disable plugin '{name}': {error}");
+                    tracing::error!(pm_level = "CRITICAL", "Could not disable plugin '{name}': {error}");
                 }
             }
 
@@ -1209,5 +1267,23 @@ mod tests {
 
         let bad_libraries = "name: Foo\nversion: 1.0.0\nmain: Foo\\\\Main\napi: [5.0.0]\nlibraries: [[nested]]\n";
         assert!(parse(bad_libraries).is_err(), "non-string libraries rejected");
+    }
+
+    #[test]
+    fn load_result_tracks_failures() {
+        let failure = PluginFailure {
+            name: "FaultyPlugin".to_string(),
+            reason: "Parse error: syntax error in Foo.php".to_string(),
+        };
+        let result = LoadResult {
+            loaded: 1,
+            errors: 1,
+            failures: vec![failure.clone()],
+        };
+        assert_eq!(result.loaded, 1);
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].name, "FaultyPlugin");
+        assert_eq!(result.failures[0].reason, "Parse error: syntax error in Foo.php");
     }
 }

@@ -1,6 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
@@ -142,7 +143,7 @@ impl WorkerHandle {
             .arg(&bootstrap_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
@@ -176,12 +177,50 @@ impl WorkerHandle {
             }
         };
 
+        let stderr = child.stderr.take();
+        let stderr_lines = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(64)));
+        if let Some(stderr) = stderr {
+            let buf_clone = Arc::clone(&stderr_lines);
+            std::thread::Builder::new()
+                .name("php-worker-stderr".to_string())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        let Ok(line) = line else { break };
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed.starts_with("[PHP/RUNTIME]") || trimmed.starts_with("[PHP/BOOTSTRAP]") {
+                            debug!("{trimmed}");
+                        } else if trimmed.contains("Fatal error")
+                            || trimmed.contains("Parse error")
+                            || trimmed.contains("Compile error")
+                            || trimmed.starts_with("[PHP/FATAL]")
+                        {
+                            tracing::error!(pm_level = "CRITICAL", "{trimmed}");
+                        } else if trimmed.contains("Warning") || trimmed.contains("Notice") {
+                            tracing::warn!("{trimmed}");
+                        } else {
+                            debug!("{trimmed}");
+                        }
+                        let mut buf = buf_clone.lock();
+                        if buf.len() >= 64 {
+                            buf.pop_front();
+                        }
+                        buf.push_back(trimmed.to_string());
+                    }
+                })
+                .ok();
+        }
+
         let (sender, receiver) = mpsc::channel::<WorkerRequest>();
         let host = Arc::clone(&self.host);
         *self.child_pid.lock() = Some(child.id());
+        let stderr_lines_for_worker = Arc::clone(&stderr_lines);
         let join_handle = match std::thread::Builder::new()
             .name("php-plugin-worker".to_string())
-            .spawn(move || run_worker(child, stdin, stdout, receiver, host))
+            .spawn(move || run_worker(child, stdin, stdout, receiver, host, stderr_lines_for_worker))
         {
             Ok(handle) => handle,
             Err(error) => {
@@ -546,6 +585,7 @@ fn run_worker(
     stdout: ChildStdout,
     receiver: Receiver<WorkerRequest>,
     host: Arc<RwLock<Option<Arc<dyn PluginHost>>>>,
+    stderr_lines: Arc<Mutex<VecDeque<String>>>,
 ) {
     let mut reader = BufReader::new(stdout);
 
@@ -582,7 +622,7 @@ fn run_worker(
             break;
         }
 
-        let result = read_response(&mut reader, &mut stdin, &host);
+        let result = read_response(&mut reader, &mut stdin, &host, &stderr_lines);
         let failed = result.is_err();
         let _ = request.reply.send(result);
 
@@ -615,14 +655,39 @@ fn read_response(
     reader: &mut BufReader<ChildStdout>,
     stdin: &mut ChildStdin,
     host: &RwLock<Option<Arc<dyn PluginHost>>>,
+    stderr_lines: &Arc<Mutex<VecDeque<String>>>,
 ) -> Result<IpcResponse, PluginError> {
     loop {
         let mut line = String::new();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
-            return Err(PluginError::PhpRuntime(
-                "PHP worker closed stdout unexpectedly".to_string(),
-            ));
+            // Give stderr reader thread a short window to capture trailing error lines.
+            let mut captured = None;
+            for _ in 0..5 {
+                let buf = stderr_lines.lock();
+                let relevant: Vec<String> = buf
+                    .iter()
+                    .filter(|l| !l.starts_with("[PHP/RUNTIME]") && !l.starts_with("[PHP/BOOTSTRAP]"))
+                    .cloned()
+                    .collect();
+                if !relevant.is_empty() {
+                    captured = Some(relevant.join(" | "));
+                    break;
+                }
+                drop(buf);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            if captured.is_none() {
+                let buf = stderr_lines.lock();
+                if !buf.is_empty() {
+                    captured = Some(buf.iter().cloned().collect::<Vec<_>>().join(" | "));
+                }
+            }
+            let details = match captured {
+                Some(err) => format!("PHP worker terminated: {}", err),
+                None => "PHP worker closed stdout unexpectedly".to_string(),
+            };
+            return Err(PluginError::PhpRuntime(details));
         }
 
         let trimmed = line.trim();
@@ -656,6 +721,14 @@ fn read_response(
         let response: IpcResponse = serde_json::from_value(value).map_err(|error| {
             PluginError::PhpRuntime(format!("Invalid IPC response from PHP worker: {}", error))
         })?;
+
+        if response.status == "fatal_error" {
+            let msg = response
+                .message
+                .unwrap_or_else(|| "PHP fatal error".to_string());
+            return Err(PluginError::PhpRuntime(format!("PHP fatal error: {}", msg)));
+        }
+
         return Ok(response);
     }
 }

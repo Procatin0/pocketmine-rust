@@ -64,6 +64,33 @@ namespace pocketmine\runtime {
             }
             self::$initialized = true;
 
+            register_shutdown_function(static function (): void {
+                $error = error_get_last();
+                if ($error !== null && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+                    $prefix = match ($error['type']) {
+                        E_PARSE => 'Parse error',
+                        E_COMPILE_ERROR => 'Compile error',
+                        E_CORE_ERROR => 'Core error',
+                        default => 'Fatal error',
+                    };
+                    $msg = sprintf(
+                        '%s: %s in %s on line %d',
+                        $prefix,
+                        $error['message'],
+                        $error['file'],
+                        $error['line']
+                    );
+                    if (!self::$ipcBroken && defined('STDOUT') && is_resource(STDOUT)) {
+                        @fwrite(STDOUT, json_encode([
+                            'status' => 'fatal_error',
+                            'message' => $msg,
+                        ]) . "\n");
+                        @fflush(STDOUT);
+                    }
+                    fwrite(STDERR, '[PHP/FATAL] ' . $msg . PHP_EOL);
+                }
+            });
+
             PluginAutoloader::register();
             self::$server = self::server();
 
@@ -377,7 +404,11 @@ namespace pocketmine\runtime {
             }
 
             try {
-                $instance->onLoad();
+                if (method_exists($instance, 'onPluginLoad')) {
+                    $instance->onPluginLoad();
+                } elseif (method_exists($instance, 'onLoad')) {
+                    (\Closure::bind(function () { $this->onLoad(); }, $instance, PluginBase::class))();
+                }
             } catch (\Throwable $e) {
                 return ['status' => 'error', 'message' => 'onLoad failed for ' . $name . ': ' . $e->getMessage()];
             }

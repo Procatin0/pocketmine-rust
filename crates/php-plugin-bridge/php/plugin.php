@@ -383,11 +383,7 @@ namespace pocketmine\plugin {
 
         public function getLogger();
 
-        public function onLoad(): void;
-
-        public function onEnable(): void;
-
-        public function onDisable(): void;
+        public function onEnableStateChange(bool $enabled): void;
 
         public function getPluginManager(): PluginManager;
 
@@ -1248,15 +1244,23 @@ namespace pocketmine\plugin {
             $this->getPluginManager()->registerEvents($listener, $plugin ?? $this);
         }
 
-        public function onLoad(): void
+        /**
+         * @internal Invoked by runtime to trigger onLoad().
+         */
+        public function onPluginLoad(): void
+        {
+            $this->onLoad();
+        }
+
+        protected function onLoad(): void
         {
         }
 
-        public function onEnable(): void
+        protected function onEnable(): void
         {
         }
 
-        public function onDisable(): void
+        protected function onDisable(): void
         {
         }
 
@@ -1676,11 +1680,12 @@ namespace pocketmine\plugin {
             }
 
             try {
-                // Bridge uses setEnabled()+onEnable() (PM uses onEnableStateChange()).
-                // PluginBase provides onEnableStateChange() for PM-style plugins that
-                // call it themselves; the manager does not double-invoke it.
-                $plugin->setEnabled(true);
-                $plugin->onEnable();
+                if (method_exists($plugin, 'onEnableStateChange')) {
+                    $plugin->onEnableStateChange(true);
+                } else {
+                    $plugin->setEnabled(true);
+                    (\Closure::bind(function () { $this->onEnable(); }, $plugin, PluginBase::class))();
+                }
             } catch (DisablePluginException $e) {
                 $this->disablePlugin($plugin);
                 return false;
@@ -1756,7 +1761,11 @@ namespace pocketmine\plugin {
             }
 
             try {
-                $plugin->onDisable();
+                if (method_exists($plugin, 'onEnableStateChange')) {
+                    $plugin->onEnableStateChange(false);
+                } else {
+                    (\Closure::bind(function () { $this->onDisable(); }, $plugin, PluginBase::class))();
+                }
             } catch (\Throwable $e) {
                 $this->log('onDisable failed for ' . $plugin->getName() . ': ' . $e->getMessage());
             } finally {
@@ -2691,7 +2700,11 @@ namespace pocketmine\plugin {
             }
 
             try {
-                $plugin->onLoad();
+                if (method_exists($plugin, 'onPluginLoad')) {
+                    $plugin->onPluginLoad();
+                } elseif (method_exists($plugin, 'onLoad')) {
+                    (\Closure::bind(function () { $this->onLoad(); }, $plugin, PluginBase::class))();
+                }
             } catch (\Throwable $e) {
                 $this->log("Could not load plugin '" . $description->getName() . "': onLoad failed: " . $e->getMessage());
                 return null;

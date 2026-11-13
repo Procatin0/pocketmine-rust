@@ -25,6 +25,7 @@ $runtimeFiles = [
     'scoreboard.php',
     'bossbar.php',
     'chat.php',
+    'thread.php',
     'core.php',
     'event.php',
     'PlayerDataSaveEvent.php',

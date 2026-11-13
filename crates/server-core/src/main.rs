@@ -235,6 +235,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{}",
             lang.translate("pocketmine.plugin.someLoadErrors", &[])
         );
+        for failure in &load_result.failures {
+            server_core::emergency!("  - {}: {}", failure.name, failure.reason);
+        }
         shutdown_sequence(ShutdownContextKind::FailedStartup).await;
         stop_other_threads();
         std::process::exit(1);
@@ -249,6 +252,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 lang.translate("pocketmine.plugin.someEnableErrors", &[])
             );
+            for failure in plugin_manager.enable_failures() {
+                server_core::emergency!("  - {}: {}", failure.name, failure.reason);
+            }
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
             stop_other_threads();
             std::process::exit(1);
@@ -282,6 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 lang.translate("pocketmine.plugin.someEnableErrors", &[])
             );
+            for failure in plugin_manager.enable_failures() {
+                server_core::emergency!("  - {}: {}", failure.name, failure.reason);
+            }
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
             stop_other_threads();
             std::process::exit(1);
