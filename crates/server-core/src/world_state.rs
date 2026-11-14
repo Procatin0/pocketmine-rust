@@ -50,7 +50,12 @@ type Edit = (u32, u32);
 /// is exceeded the oldest entries are dropped. The newest edit for a given
 /// coordinate is always retained longest, so replaying the survivors still
 /// converges to the latest block at that coordinate.
-pub const BLOCK_CHANGE_QUEUE_CAP: usize = 512;
+///
+/// Kept above PocketMine's 512-per-chunk `LevelChunk` resend threshold
+/// (`World::actuallyDoTick`) so that threshold is actually reachable: a
+/// cascade that rewrites more than 512 cells of one column must still arrive
+/// as one whole-column resend instead of being silently truncated here.
+pub const BLOCK_CHANGE_QUEUE_CAP: usize = 4096;
 
 /// A single block edit, as queued by [`WorldState::set_block`].
 ///
@@ -145,7 +150,7 @@ pub struct WorldState {
     scheduled_tick: AtomicI32,
     /// Sounds produced while the queue fired, drained once per tick by
     /// `SessionManager::tick` (PM `World::addSound` from `onScheduledUpdate`).
-    pending_sounds: Mutex<Vec<(String, i32, i32, i32)>>,
+    pending_sounds: Mutex<Vec<(String, i32, i32, i32, i32)>>,
     edits: RwLock<HashMap<(i32, i32), BlockEdits>>,
     /// Fase 1 (Bedrock -> Java): changes waiting for
     /// `world.take_block_changes`. Drained by that host call (1x/tick from
@@ -171,6 +176,14 @@ pub struct WorldState {
     /// background chunk prefetch (main.rs) also reads it to skip columns
     /// whose payloads are already warm.
     chunk_versions: Mutex<HashMap<(i32, i32), u64>>,
+    /// `FallingBlock` entities of the reference, simulated as blocks that
+    /// move down one cell per tick (see [`FallingBlock`]).
+    pending_falls: Mutex<Vec<FallingBlock>>,
+    /// `LevelEventPacket`s produced by the world itself (PM
+    /// `World::addSound()` with a level-event sound, e.g. `AnvilFallSound`):
+    /// `(event id, event data, x, y, z)`. Drained once per tick by
+    /// `SessionManager`.
+    pending_level_events: Mutex<Vec<(i32, i32, i32, i32, i32)>>,
     /// In-memory [`Chunk`] per column, shared by every
     /// [`WorldState::get_chunk_cached`] caller (Java bridge chunk build,
     /// background prefetch in main.rs). `get_chunk` still regenerates on
@@ -179,6 +192,47 @@ pub struct WorldState {
     /// consumes after the prefetch warms it. Invalidated per-chunk by
     /// [`WorldState::set_block`].
     chunk_object_cache: Mutex<ChunkObjectCache>,
+}
+
+/// `FallingBlock::getInitialGravity()`.
+pub const FALL_GRAVITY: f32 = 0.04;
+/// `FallingBlock::getInitialDragMultiplier()`.
+pub const FALL_DRAG: f32 = 0.02;
+/// Maximum falls simulated at once: a griefing sand column must not grow the
+/// fall list without bound (`BLOCK_CHANGE_QUEUE_CAP` bounds the broadcasts,
+/// this bounds the simulation).
+pub const MAX_PENDING_FALLS: usize = 256;
+
+/// A falling block, translated from `src/entity/object/FallingBlock.php`.
+///
+/// The reference spawns an entity that falls with gravity/drag and turns back
+/// into a block when it lands. This server has no block-entity simulation, so
+/// the block itself moves one cell down per tick (the same animation a falling
+/// entity shows at terminal velocity, ~0.98 blocks/tick) and is restored with
+/// the normal neighbour cascade on landing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FallingBlock {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub block_id: u32,
+    /// `Entity::$motion.y` in blocks/tick (negative when falling).
+    pub motion: f32,
+    /// `Entity::$fallDistance`, kept for `onHitGround()` consumers.
+    pub fall_distance: f32,
+}
+
+/// A falling block that reached the ground this tick, used by
+/// `SessionManager` for `FallingBlock::onHitGround()` (anvil damage to
+/// entities).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LandedBlock {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub block_id: u32,
+    /// `Entity::getFallDistance()` of the falling block.
+    pub fall_distance: f32,
 }
 
 /// FIFO cache of serialized chunk payloads.
@@ -232,6 +286,8 @@ impl WorldState {
                 order: VecDeque::new(),
             }),
             chunk_versions: Mutex::new(HashMap::new()),
+            pending_falls: Mutex::new(Vec::new()),
+            pending_level_events: Mutex::new(Vec::new()),
             chunk_object_cache: Mutex::new(ChunkObjectCache {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
@@ -362,14 +418,22 @@ impl WorldState {
         for (_, (x, y, z), block_id, sound) in ready {
             self.set_block(x, y, z, block_id);
             if let Some(sound) = sound {
-                self.pending_sounds.lock().push((sound, x, y, z));
+                self.pending_sounds.lock().push((sound, -1, x, y, z));
             }
         }
     }
 
     /// Sounds queued by scheduled block updates, in firing order.
-    pub fn take_pending_sounds(&self) -> Vec<(String, i32, i32, i32)> {
+    pub fn take_pending_sounds(&self) -> Vec<(String, i32, i32, i32, i32)> {
         std::mem::take(&mut *self.pending_sounds.lock())
+    }
+
+    /// `World::addSound()`: queues a `LevelSoundEventPacket` for the next tick
+    /// (`extra_data` is the block runtime id for block sounds).
+    pub fn add_sound(&self, sound: impl Into<String>, extra_data: i32, x: i32, y: i32, z: i32) {
+        self.pending_sounds
+            .lock()
+            .push((sound.into(), extra_data, x, y, z));
     }
 
     /// PM `World::useItemOn()` interaction half: `$blockClicked->onInteract()`.
@@ -478,6 +542,15 @@ impl WorldState {
     /// command — all funnel through this method. A no-change call enqueues
     /// nothing, so the queues only ever carry real changes.
     pub fn set_block(&self, x: i32, y: i32, z: i32, block_id: u32) -> bool {
+        self.set_block_with(x, y, z, block_id, true)
+    }
+
+    /// [`WorldState::set_block`] with the block-physics cascade optional.
+    ///
+    /// The falling-block simulation moves one block down each tick; it must
+    /// not re-run the cascade for the cell it is moving (it would start a
+    /// second fall from the new cell), so it passes `physics = false`.
+    fn set_block_with(&self, x: i32, y: i32, z: i32, block_id: u32, physics: bool) -> bool {
         if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
             return false;
         }
@@ -491,6 +564,9 @@ impl WorldState {
             return false;
         }
         self.propagate_connections(x, y, z, &mut changes);
+        if physics {
+            self.propagate_physics(x, y, z, &mut changes);
+        }
         self.flush_changes(changes);
         true
     }
@@ -644,6 +720,214 @@ impl WorldState {
                 }
             }
         }
+    }
+
+    /// Block physics cascade after an edit, translated from
+    /// `FallableTrait::onNearbyBlockChange()` and
+    /// `StaticSupportTrait::onNearbyBlockChange()`.
+    ///
+    /// PocketMine queues the changed block plus its six neighbours and runs
+    /// `onNearbyBlockChange()` on each: a block whose support disappeared
+    /// breaks (`World::useBreakOn`), and a fallable block whose cell below can
+    /// be replaced leaves the world to fall. Every reaction queues the cells
+    /// around it again, so a torch on a removed block breaks, a sand column
+    /// collapses and a chest on top of collapsing sand falls too.
+    ///
+    /// Bounded like [`WorldState::propagate_connections`]: a pathological
+    /// layout cannot make one edit walk the whole world.
+    fn propagate_physics(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        changes: &mut HashMap<(i32, i32, i32), Edit>,
+    ) {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        /// One edit can collapse a column, but never an unbounded region.
+        const MAX_PHYSICS_UPDATES: usize = 256;
+
+        let mut frontier: VecDeque<(i32, i32, i32)> = VecDeque::with_capacity(16);
+        frontier.push_back((x, y, z));
+        for face in crate::physics::ALL_FACES {
+            let (dx, dy, dz) = crate::physics::offset(face);
+            frontier.push_back((x + dx, y + dy, z + dz));
+        }
+
+        let mut visited: HashSet<(i32, i32, i32)> = HashSet::with_capacity(16);
+        let mut budget = MAX_PHYSICS_UPDATES;
+        while let Some((bx, by, bz)) = frontier.pop_front() {
+            if budget == 0 {
+                break;
+            }
+            if !visited.insert((bx, by, bz)) || !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&by) {
+                continue;
+            }
+            budget -= 1;
+            let id = self.block_at(bx, by, bz);
+            if id == AIR {
+                continue;
+            }
+            let Some(name) = block_states::state_name(id) else {
+                continue;
+            };
+
+            // `FallableTrait::onNearbyBlockChange()`: the block below can be
+            // replaced, so this block leaves the world and falls.
+            if crate::physics::is_fallable(name) {
+                let below = self.block_at(bx, by - 1, bz);
+                let can_fall = block_states::state_name(below)
+                    .is_some_and(crate::physics::is_replaceable);
+                if can_fall && self.write_block(bx, by, bz, AIR, changes) {
+                    self.start_falling(bx, by, bz, id);
+                    for face in crate::physics::ALL_FACES {
+                        let (dx, dy, dz) = crate::physics::offset(face);
+                        frontier.push_back((bx + dx, by + dy, bz + dz));
+                    }
+                }
+                continue;
+            }
+
+            // `StaticSupportTrait::onNearbyBlockChange()`: support removed.
+            if crate::physics::needs_support(id)
+                && !crate::physics::is_supported(id, |dx, dy, dz| {
+                    self.block_at(bx + dx, by + dy, bz + dz)
+                })
+                && self.write_block(bx, by, bz, AIR, changes)
+            {
+                tracing::debug!("world.physics_break: ({},{},{}) {:#010X}", bx, by, bz, id);
+                for face in crate::physics::ALL_FACES {
+                    let (dx, dy, dz) = crate::physics::offset(face);
+                    frontier.push_back((bx + dx, by + dy, bz + dz));
+                }
+            }
+        }
+    }
+
+    /// Starts the falling-block simulation for a block that just left the
+    /// world (`new FallingBlock(...)->spawnToAll()` in the reference).
+    pub fn start_falling(&self, x: i32, y: i32, z: i32, block_id: u32) {
+        let mut pending = self.pending_falls.lock();
+        if pending.len() >= MAX_PENDING_FALLS {
+            // Over the budget the block is dropped instead of simulated, which
+            // is what the reference effectively does at its entity cap.
+            return;
+        }
+        pending.push(FallingBlock {
+            x,
+            y,
+            z,
+            block_id,
+            motion: 0.0,
+            fall_distance: 0.0,
+        });
+    }
+
+    /// Number of falling blocks still simulated.
+    pub fn pending_fall_count(&self) -> usize {
+        self.pending_falls.lock().len()
+    }
+
+    /// Queues a `LevelEventPacket` (PM `World::addSound()` /
+    /// `World::addParticle()` with a level-event implementation).
+    pub fn add_level_event(&self, event_id: i32, event_data: i32, x: i32, y: i32, z: i32) {
+        self.pending_level_events
+            .lock()
+            .push((event_id, event_data, x, y, z));
+    }
+
+    /// Drains the level events queued since the last tick, oldest first.
+    pub fn take_pending_level_events(&self) -> Vec<(i32, i32, i32, i32, i32)> {
+        std::mem::take(&mut *self.pending_level_events.lock())
+    }
+
+    /// Advances every falling block one tick, translating
+    /// `FallingBlock::entityBaseTick()` + `Entity::tryChangeMovement()`.
+    ///
+    /// Returns the blocks that landed this tick (restored into the world),
+    /// for `FallingBlock::onHitGround()` consumers.
+    pub fn tick_falling_blocks(&self) -> Vec<LandedBlock> {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let falls = {
+            let mut pending = self.pending_falls.lock();
+            std::mem::take(&mut *pending)
+        };
+        if falls.is_empty() {
+            return Vec::new();
+        }
+
+        let mut still_falling: Vec<FallingBlock> = Vec::with_capacity(falls.len());
+        let mut landed: Vec<LandedBlock> = Vec::new();
+        for mut fall in falls {
+            if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&fall.y) {
+                continue;
+            }
+            // `mY -= gravity; mY *= (1 - drag)`: converges to ~0.98 blocks/tick.
+            fall.motion = (fall.motion + FALL_GRAVITY) * (1.0 - FALL_DRAG);
+            fall.fall_distance += fall.motion;
+
+            // The cell is empty (first tick) or still holds this simulated
+            // falling block; anything else in it means another edit replaced
+            // the falling block while it was in the air. `entityBaseTick()`
+            // cannot place the block there (`!$block->canBeReplaced()`), so the
+            // reference drops the item and plays `BlockBreakSound` instead of
+            // overwriting: this port has no item entities, so the block is
+            // lost, the cell is preserved and the sound still plays.
+            let current = self.block_at(fall.x, fall.y, fall.z);
+            let current_name = block_states::state_name(current);
+            let occupied_by_other = current != fall.block_id
+                && !current_name.is_some_and(crate::physics::is_replaceable);
+            if occupied_by_other {
+                self.add_sound(
+                    bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_BREAK,
+                    fall.block_id as i32,
+                    fall.x,
+                    fall.y,
+                    fall.z,
+                );
+                continue;
+            }
+
+            let below = self.block_at(fall.x, fall.y - 1, fall.z);
+            let below_replaceable =
+                block_states::state_name(below).is_some_and(crate::physics::is_replaceable);
+            if below_replaceable && fall.y - 1 > WORLD_MIN_Y {
+                // Moving down one cell: leave air behind and occupy the next
+                // cell. Both edits are broadcast as `UpdateBlockPacket`s, so
+                // viewers see the block step down every tick.
+                self.set_block_with(fall.x, fall.y, fall.z, AIR, false);
+                self.set_block_with(fall.x, fall.y - 1, fall.z, fall.block_id, false);
+                fall.y -= 1;
+                still_falling.push(fall);
+            } else {
+                // `entityBaseTick()`: on the ground the block is restored and
+                // the neighbour cascade runs for its final cell.
+                self.set_block_with(fall.x, fall.y, fall.z, fall.block_id, true);
+                // `Anvil::getLandSound()` -> `AnvilFallSound` ->
+                // `LevelEventPacket(SOUND_ANVIL_FALL)` at the landing cell.
+                if block_states::state_name(fall.block_id).is_some_and(|n| n.ends_with("anvil")) {
+                    self.add_level_event(
+                        bedrock_protocol::packets::level_event::LEVEL_EVENT_SOUND_ANVIL_FALL,
+                        0,
+                        fall.x,
+                        fall.y,
+                        fall.z,
+                    );
+                }
+                landed.push(LandedBlock {
+                    x: fall.x,
+                    y: fall.y,
+                    z: fall.z,
+                    block_id: fall.block_id,
+                    fall_distance: fall.fall_distance,
+                });
+            }
+        }
+        self.pending_falls.lock().extend(still_falling);
+        landed
     }
 
     /// Drains the Java-facing queue (Fase 1), oldest first.
@@ -1240,6 +1524,88 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_torch_breaks_when_its_support_is_removed() {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let stone = block_states::network_id("stone").unwrap();
+        let torch = block_states::network_id("torch").unwrap();
+        assert!(world.set_block(5, 20, 5, stone));
+        assert!(world.set_block(5, 21, 5, torch));
+        assert_eq!(world.block_at(5, 21, 5), torch);
+
+        // `Torch::onNearbyBlockChange()` -> `World::useBreakOn()`.
+        world.set_block(5, 20, 5, AIR);
+        assert_eq!(world.block_at(5, 21, 5), AIR);
+    }
+
+    #[test]
+    fn a_lantern_breaks_when_its_ceiling_is_removed() {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let stone = block_states::network_id("stone").unwrap();
+        let lantern = block_states::network_id("lantern").unwrap();
+        let hanging = block_states::with_property(lantern, "hanging", "true").unwrap();
+        world.set_block(8, 22, 8, stone);
+        world.set_block(8, 21, 8, hanging);
+        assert_eq!(world.block_at(8, 21, 8), hanging);
+
+        world.set_block(8, 22, 8, AIR);
+        assert_eq!(world.block_at(8, 21, 8), AIR);
+    }
+
+    #[test]
+    fn an_unsupported_sand_block_falls_until_it_lands() {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let stone = block_states::network_id("stone").unwrap();
+        let sand = block_states::network_id("sand").unwrap();
+        // A platform in the air (the flat surface is at y = 3).
+        world.set_block(2, 20, 2, stone);
+        world.set_block(2, 21, 2, sand);
+        assert_eq!(world.block_at(2, 21, 2), sand);
+        assert_eq!(world.pending_fall_count(), 0);
+
+        // `FallableTrait::onNearbyBlockChange()`: the sand leaves the world.
+        world.set_block(2, 20, 2, AIR);
+        assert_eq!(world.block_at(2, 21, 2), AIR);
+        assert_eq!(world.pending_fall_count(), 1);
+
+        for _ in 0..64 {
+            world.tick_falling_blocks();
+        }
+        assert_eq!(world.pending_fall_count(), 0);
+        // It landed on the grass at y = 3.
+        assert_eq!(world.block_at(2, 4, 2), sand);
+    }
+
+    #[test]
+    fn a_block_placed_where_a_falling_block_was_is_not_deleted() {
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let stone = block_states::network_id("stone").unwrap();
+        let sand = block_states::network_id("sand").unwrap();
+        world.set_block(9, 30, 9, stone);
+        world.set_block(9, 31, 9, sand);
+        world.set_block(9, 30, 9, AIR);
+        assert_eq!(world.pending_fall_count(), 1);
+
+        // Somebody replaces the falling block's cell while it is in the air.
+        world.set_block(9, 31, 9, stone);
+        world.tick_falling_blocks();
+
+        assert_eq!(world.block_at(9, 31, 9), stone, "the placed block survives");
+        assert_eq!(world.pending_fall_count(), 0, "the stale fall is dropped");
+    }
+
+    #[test]
     fn a_scheduled_update_restores_the_block_and_queues_its_sound() {
         let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
         let button = bedrock_world::block_states::network_id("stone_button").unwrap();
@@ -1260,7 +1626,7 @@ mod tests {
         assert_eq!(world.block_at(4, 80, 4), button);
         assert_eq!(
             world.take_pending_sounds(),
-            vec![("power.off".to_string(), 4, 80, 4)]
+            vec![("power.off".to_string(), -1, 4, 80, 4)]
         );
         assert_eq!(world.scheduled_block_update_count(), 0);
     }

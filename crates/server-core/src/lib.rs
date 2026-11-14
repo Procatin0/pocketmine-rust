@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod nbt_json;
 pub mod packets_wire;
 pub mod permission;
+pub mod physics;
 pub mod plugin_host;
 pub mod query;
 pub mod scoreboard;
@@ -35,14 +36,18 @@ pub use crafting::{
 };
 pub use identity::{parse_login_identity, LoginIdentity};
 pub use bossbar::{BossBar, BossBarManager, DiverseBossBar};
+pub use physics::{
+    calculate_fall_damage, is_fallable, is_on_ground, is_supported, support_type, LandingEffect,
+    SupportType,
+};
 pub use plugin_host::{PlayerRegistry, ServerPluginHost};
 pub use scoreboard::{
     ColorRange, PacketBytes as ScoreboardPacket, Scoreboard, ScoreboardFile, ScoreboardLine,
     ScoreboardObjective, ScoreboardSlot, SCOREBOARD_FILE_VERSION,
 };
 pub use session::{
-    OpenContainer, OutgoingPacket, PlayerSession, SessionError, SessionManager, SessionState,
-    TickReport,
+    ActorSound, OpenContainer, OutgoingPacket, PlayerSession, SessionError, SessionManager,
+    SessionState, TickReport,
 };
 pub use world_state::WorldState;
 /// Geyser/Floodgate-style display-name helpers (Bedrock -> Java is

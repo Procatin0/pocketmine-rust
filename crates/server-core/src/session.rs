@@ -20,7 +20,7 @@ use bedrock_protocol::{
     SetScorePacket, SetScoreboardIdentityPacket, SetTitlePacket, TextPacket, TransactionData, TransferPacket, UpdateAbilitiesPacket,
     UpdatePlayerGameTypePacket, Vector3f,
 };
-use bedrock_protocol::packets::actor_event::EVENT_DEATH_ANIMATION;
+use bedrock_protocol::packets::actor_event::{EVENT_DEATH_ANIMATION, EVENT_HURT};
 use bedrock_protocol::packets::inventory_transaction::{
     ACTION_CLICK_BLOCK, UseItemData,
 };
@@ -41,7 +41,9 @@ use bedrock_protocol::packets::level_event::{
     LEVEL_EVENT_SOUND_DOOR,
 };
 use bedrock_protocol::packets::level_sound_event::{
-    level_sound_event_wire, LEVEL_SOUND_EVENT_PACKET_ID, LEVEL_SOUND_PLACE, LEVEL_SOUND_POWER_OFF,
+    level_sound_actor_event_wire, level_sound_event_wire, LEVEL_SOUND_EVENT_PACKET_ID,
+    LEVEL_SOUND_FALL_BIG,
+    LEVEL_SOUND_FALL_SMALL, LEVEL_SOUND_LAND, LEVEL_SOUND_PLACE, LEVEL_SOUND_POWER_OFF,
     LEVEL_SOUND_POWER_ON,
 };
 use bedrock_protocol::packets::player_list::uuid_from_str;
@@ -65,6 +67,7 @@ use crate::identity::parse_login_identity;
 use crate::inventory::{
     PlayerInventory, WINDOW_ID_ARMOR, WINDOW_ID_CURSOR, WINDOW_ID_INVENTORY, WINDOW_ID_OFFHAND,
 };
+use crate::physics;
 use crate::plugin_host::PlayerRegistry;
 use crate::scoreboard::{PacketBytes as ScoreboardPacketBytes, Scoreboard};
 use crate::static_packets::StaticPackets;
@@ -128,6 +131,32 @@ pub const UPDATE_BLOCK_PACKET_ID: u32 = 0x15;
 pub const UPDATE_BLOCK_FLAGS_NETWORK: u32 = 0b0010;
 /// Data layer as sent by PocketMine (`UpdateBlockPacket::DATA_LAYER_NORMAL`).
 pub const UPDATE_BLOCK_DATA_LAYER_NORMAL: u32 = 0;
+
+/// `World::actuallyDoTick()`'s `$changedBlocks` flush threshold: above this
+/// many edits in a single chunk, PocketMine stops sending per-block
+/// `UpdateBlockPacket`s and resends the whole `LevelChunk`
+/// (`Player::onChunkChanged`) instead. Same resulting world, far fewer packets.
+pub const CHUNK_RESEND_THRESHOLD: usize = 512;
+
+/// An actor sound: a `LevelSoundEventPacket` carrying the actor's network type
+/// and runtime id (`EntityShortFallSound`, `EntityLongFallSound`, ...).
+///
+/// PocketMine's `Entity::broadcastSound()` sends to `$this->hasSpawned`, i.e.
+/// the entity's **viewers** and not the entity itself (a player hears their own
+/// landing through the client's local prediction). `SessionManager` reproduces
+/// that recipient rule when it flushes these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorSound {
+    pub sound: String,
+    pub extra_data: i32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// `$entity::getNetworkTypeId()`.
+    pub entity_type: &'static str,
+    /// `Entity::getId()`: the runtime id the viewers know.
+    pub actor_unique_id: i64,
+}
 
 /// Ticks between periodic `SetTimePacket` broadcasts to Bedrock
 /// clients (20 ticks = 1 second at 20 TPS). Clients advance the sun
@@ -465,6 +494,14 @@ pub struct PlayerSession {
     pub xp_progress: f32,
     /// Breath ticks, Living::breathTicks (max 300).
     pub air: i16,
+    /// `Entity::$fallDistance`: distance fallen since the last landing, fed by
+    /// client movement through `Entity::updateFallState()`.
+    pub fall_distance: f32,
+    /// `Entity::$onGround`, resolved by `Player::checkGroundState()`.
+    pub on_ground: bool,
+    /// Sounds this player produced that its **viewers** must hear
+    /// (`Entity::broadcastSound()`: fall/landing sounds, self excluded).
+    pub pending_actor_sounds: Vec<ActorSound>,
     /// Actions emitted by plugins while handling the current packet.
     pub pending_actions: Vec<PluginAction>,
     /// `InGamePacketHandler::$lastBlockAttacked` (PM): the block the client
@@ -618,6 +655,12 @@ impl PlayerSession {
             xp_level: 0,
             xp_progress: 0.0,
             air: 300,
+            fall_distance: 0.0,
+            // `Server::__construct()` flags new players on-ground until their
+            // first movement; without it a spawn in the air would deal fall
+            // damage on the first packet.
+            on_ground: true,
+            pending_actor_sounds: Vec::new(),
             pending_actions: Vec::new(),
             last_block_attacked: None,
             break_handler: None,
@@ -987,6 +1030,8 @@ impl PlayerSession {
         if self.gamemode != 1 {
             self.is_flying = false;
         }
+        // `Player::teleport()` resets the fall state: a teleport is not a fall.
+        self.fall_distance = 0.0;
         let packet = self.create_move_player_packet(2, yaw, pitch);
         self.pending_outgoing.push(OutgoingPacket::RawWire(packet));
         self.register_self();
@@ -2392,8 +2437,13 @@ impl PlayerSession {
         // round-trip instead of being dropped here.
         self.head_yaw = crate::java_sync::normalize_bedrock_yaw(packet.head_yaw);
         if position_changed {
+            let previous_y = self.position.y;
             self.position = new_feet;
             self.pending_move_broadcast = true;
+            // `Player::actuallyHandleMovement()` -> `Entity::move()`:
+            // `updateFallState($dy, $this->onGround)` runs after the new
+            // position is applied, so the ground check uses the new feet.
+            self.update_fall_state(new_feet.y - previous_y);
         }
         self.register_self();
 
@@ -2432,12 +2482,15 @@ impl PlayerSession {
             if has_input_flag(flags, INPUT_FLAG_START_FLYING) {
                 if self.gamemode == 1 && !self.is_flying {
                     self.is_flying = true;
+                    // `Player::setFlying(true)`: `resetFallDistance()`.
+                    self.fall_distance = 0.0;
                     self.pending_outgoing
                         .push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
                 }
             } else if has_input_flag(flags, INPUT_FLAG_STOP_FLYING) {
                 if self.is_flying {
                     self.is_flying = false;
+                    self.fall_distance = 0.0;
                     self.pending_outgoing
                         .push(OutgoingPacket::RawWire(self.create_update_abilities_packet()));
                 }
@@ -3046,6 +3099,15 @@ impl PlayerSession {
         // collision boxes intersect an entity (`getCollidingEntities`): without
         // this a player could place a block inside themselves and get stuck.
         if self.placement_blocked_by_entity(x, y, z, block_id) {
+            self.revert_predicted_placement(x, z);
+            return;
+        }
+        // PM `Block::canBePlacedAt()`: blocks using `StaticSupportTrait`
+        // (torch, lantern, sapling, snow layer, ...) refuse a placement with
+        // no support around the target cell.
+        if !physics::can_be_placed_at(block_id, |dx, dy, dz| {
+            self.world.block_at(x + dx, y + dy, z + dz)
+        }) {
             self.revert_predicted_placement(x, z);
             return;
         }
@@ -3760,6 +3822,128 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
         }
         self.anvil_damage = hit.damage;
         hit.broken
+    }
+
+    /// `Player::checkGroundState()`: a block with collision intersects the
+    /// 0.4-high slice of the player's bounding box around the feet.
+    pub fn is_on_ground(&self) -> bool {
+        physics::is_on_ground(
+            self.position.x,
+            self.position.y,
+            self.position.z,
+            |x, y, z| self.world.block_at(x, y, z),
+        )
+    }
+
+    /// `Entity::updateFallState()` + `Living::onHitGround()` for client-driven
+    /// movement: accumulates the fall distance, and on landing applies the
+    /// landing block's effect (`HayBale`, `Bed`, `Slime`) and then the fall
+    /// damage (`calculateFallDamage`).
+    fn update_fall_state(&mut self, dy: f32) {
+        use bedrock_world::block_states;
+
+        // `onEntityInside()` of water/lava/cobweb/ladder/vine resets the fall
+        // before the landing check ever runs.
+        let feet_id = self.world.block_at(
+            self.position.x.floor() as i32,
+            self.position.y.floor() as i32,
+            self.position.z.floor() as i32,
+        );
+        if block_states::state_name(feet_id).is_some_and(physics::resets_fall_distance) {
+            self.fall_distance = 0.0;
+            self.on_ground = true;
+            return;
+        }
+
+        self.on_ground = self.is_on_ground();
+        self.fall_distance = physics::update_fall_distance(self.fall_distance, dy);
+        if !self.on_ground || self.fall_distance <= 0.0 {
+            return;
+        }
+
+        // `Living::onHitGround()`: the block under the feet, or the one below
+        // it when the feet cell carries no collision box.
+        let block_x = self.position.x.floor() as i32;
+        let block_z = self.position.z.floor() as i32;
+        let mut block_y = self.position.y.floor() as i32;
+        let mut landing_id = self.world.block_at(block_x, block_y, block_z);
+        let mut landing_name = block_states::state_name(landing_id);
+        if landing_name.map_or(true, |name| !block_states::has_collision(name)) {
+            block_y -= 1;
+            landing_id = self.world.block_at(block_x, block_y, block_z);
+            landing_name = block_states::state_name(landing_id);
+        }
+        let mut distance = self.fall_distance;
+        self.fall_distance = 0.0;
+        if let Some(name) = landing_name {
+            match physics::on_entity_land(name) {
+                physics::LandingEffect::Reset => distance = 0.0,
+                physics::LandingEffect::Multiply(factor) => distance *= factor,
+                physics::LandingEffect::None => {}
+            }
+        }
+
+        let damage = physics::calculate_fall_damage(distance, self.is_flying, 0);
+        if damage > 0.0 {
+            self.damage_player(damage);
+        }
+
+        // `Living::onHitGround()`: `EntityLongFallSound` for damage > 4,
+        // `EntityShortFallSound` otherwise, and `EntityLandSound` for a
+        // harmless landing on a non-air block (never on air/water).
+        let (sound, extra_data) = if damage > 4.0 {
+            (LEVEL_SOUND_FALL_BIG, -1)
+        } else if damage > 0.0 {
+            (LEVEL_SOUND_FALL_SMALL, -1)
+        } else if landing_id != AIR {
+            // `EntityLandSound` carries the landed-on block as extra data.
+            (LEVEL_SOUND_LAND, landing_id as i32)
+        } else {
+            return;
+        };
+        // `Entity::broadcastSound()`: an actor sound at the player's position,
+        // sent to the player's viewers only.
+        self.pending_actor_sounds.push(ActorSound {
+            sound: sound.to_string(),
+            extra_data,
+            x: self.position.x,
+            y: self.position.y,
+            z: self.position.z,
+            entity_type: "minecraft:player",
+            actor_unique_id: self.entity_runtime_id as i64,
+        });
+    }
+
+    /// Takes the actor sounds produced since the last flush.
+    pub fn take_actor_sounds(&mut self) -> Vec<ActorSound> {
+        std::mem::take(&mut self.pending_actor_sounds)
+    }
+
+    /// `Living::attack()` for environmental damage (currently fall damage).
+    ///
+    /// Creative and spectator players are immune, like vanilla; the death path
+    /// reuses [`PlayerSession::kill_player`] so `PlayerDeathEvent` and the
+    /// respawn flow stay in one place.
+    pub fn damage_player(&mut self, damage: f32) {
+        if damage <= 0.0 || self.is_dead || self.gamemode == 1 || self.gamemode == 3 {
+            return;
+        }
+        self.health = (self.health - damage).clamp(0.0, self.max_health);
+        if self.health <= 0.0 {
+            self.kill_player();
+            return;
+        }
+        self.pending_outgoing
+            .push(OutgoingPacket::RawWire(set_health_wire(self.health)));
+        // `Living::setHealth()` -> `$this->healthAttr->setValue(ceil($health), true)`:
+        // the health attribute is re-sent, not just the health packet.
+        self.pending_outgoing
+            .push(OutgoingPacket::RawWire(self.create_update_attributes_packet()));
+        // `Living::doHitAnimation()` -> `HurtAnimation` -> ActorEvent(HURT).
+        self.pending_outgoing.push(OutgoingPacket::RawWire(actor_event_wire(
+            self.entity_runtime_id,
+            EVENT_HURT,
+        )));
     }
 
     /// Kills the player: health drops to zero, the death animation plays and
@@ -8660,12 +8844,23 @@ impl SessionManager {
         let world_time = self.tick_world_time();
         // Sounds produced by scheduled block updates, e.g. a button releasing
         // itself (`onScheduledUpdate` -> `World::addSound`).
-        for (sound, x, y, z) in self.world.take_pending_sounds() {
-            self.broadcast_sound(&sound, -1, x, y, z);
+        for (sound, extra_data, x, y, z) in self.world.take_pending_sounds() {
+            self.broadcast_sound(&sound, extra_data, x, y, z);
         }
         // Dig handlers first: a completed dig edits the world, and the
         // broadcast poll below must ship that edit in this same tick.
         self.update_break_handlers();
+        // `World::actuallyDoTick()` -> entity ticks: falling blocks move a cell
+        // per tick and turn back into blocks on landing, so run them before
+        // the broadcast poll ships this tick's edits.
+        let landed = self.world.tick_falling_blocks();
+        // `World::addSound()` / `addParticle()` level events queued by the
+        // world itself (e.g. `AnvilFallSound` when an anvil lands).
+        for (event_id, event_data, x, y, z) in self.world.take_pending_level_events() {
+            self.broadcast_level_event(event_id, event_data, x, y, z);
+        }
+        self.apply_falling_block_damage(&landed);
+        self.flush_actor_sounds();
         let block_changes = self.poll_block_changes();
         let virtual_queued = self.poll_virtual_players();
         let chunk_packets_queued = self.drive_chunk_requests();
@@ -8796,9 +8991,10 @@ impl SessionManager {
     /// [`SessionManager::broadcast_block_change`]: a whole chunk is only
     /// resent when the lightweight `UpdateBlockPacket` could not be
     /// delivered; the normal single-block path never resends a chunk.
-    fn refresh_chunk_at(&self, x: i32, z: i32) {
+    fn refresh_chunk_at(&self, x: i32, z: i32) -> usize {
         let chunk = (x >> 4, z >> 4);
         let mut map = self.sessions.write();
+        let mut recipients = 0usize;
         for session in map.values_mut() {
             if !session.joined || !session.sent_chunks.contains(&chunk) {
                 continue;
@@ -8807,7 +9003,9 @@ impl SessionManager {
             session
                 .pending_outgoing
                 .push(OutgoingPacket::LevelChunk(session.create_chunk_packet(chunk.0, chunk.1)));
+            recipients += 1;
         }
+        recipients
     }
 
     /// Fase 2 (Java -> Bedrock): queues a single-block
@@ -8891,8 +9089,27 @@ impl SessionManager {
         if !changes.is_empty() {
             tracing::debug!("poll_block_changes: drained {} changes", changes.len());
         }
+        // `World::actuallyDoTick()` groups the edits per chunk and, above
+        // `CHUNK_RESEND_THRESHOLD` edits in one column, resends the whole
+        // `LevelChunk` instead of one `UpdateBlockPacket` per block. Same
+        // final client state, dramatically fewer packets for a big cascade.
+        let mut per_chunk: HashMap<(i32, i32), usize> = HashMap::new();
+        for change in &changes {
+            *per_chunk
+                .entry((change.x >> 4, change.z >> 4))
+                .or_insert(0) += 1;
+        }
+        let mut resent: HashSet<(i32, i32)> = HashSet::new();
         let mut delivered = 0usize;
         for change in &changes {
+            let chunk = (change.x >> 4, change.z >> 4);
+            if per_chunk.get(&chunk).copied().unwrap_or(0) > CHUNK_RESEND_THRESHOLD {
+                // One resend per column, not one per edit.
+                if resent.insert(chunk) {
+                    delivered += self.refresh_chunk_at(change.x, change.z);
+                }
+                continue;
+            }
             if self.broadcast_block_change_ref(change) > 0 {
                 delivered += 1;
             } else {
@@ -8900,6 +9117,95 @@ impl SessionManager {
             }
         }
         delivered
+    }
+
+    /// `FallingBlock::onHitGround()`: a falling anvil hurts the living entities
+    /// it lands on by `min((round($fallDistance) - 1) * getFallDamagePerBlock(),
+    /// getMaxFallDamage())`. Players are the only entities this server
+    /// simulates, so they are the only victims.
+    fn apply_falling_block_damage(&self, landed: &[crate::world_state::LandedBlock]) {
+        if landed.is_empty() {
+            return;
+        }
+        let mut map = self.sessions.write();
+        for block in landed {
+            let Some(name) = bedrock_world::block_states::state_name(block.block_id) else {
+                continue;
+            };
+            let per_block = physics::fall_damage_per_block(name);
+            if per_block <= 0.0 {
+                continue;
+            }
+            let fallen_blocks = block.fall_distance.round() - 1.0;
+            if fallen_blocks <= 0.0 {
+                continue;
+            }
+            let damage = (fallen_blocks * per_block).min(physics::max_fall_damage(name));
+            // `getCollidingEntities($this->getBoundingBox())`: the falling
+            // block's 0.98-wide box at the landed cell.
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead {
+                    continue;
+                }
+                if (session.position.x - (block.x as f32 + 0.5)).abs() > 0.49
+                    || (session.position.z - (block.z as f32 + 0.5)).abs() > 0.49
+                    || session.position.y < block.y as f32
+                    || session.position.y >= block.y as f32 + 0.98
+                {
+                    continue;
+                }
+                session.damage_player(damage);
+            }
+        }
+    }
+
+    /// `Entity::broadcastSound()` for every sound queued by a session: one
+    /// `LevelSoundEventPacket` carrying the actor's network type and runtime id
+    /// to that actor's **viewers** (sessions with the chunk in view, self
+    /// excluded - the player hears their own landing locally).
+    fn flush_actor_sounds(&self) {
+        let mut map = self.sessions.write();
+        let mut queued: Vec<(u64, Vec<ActorSound>)> = Vec::new();
+        for session in map.values_mut() {
+            if session.pending_actor_sounds.is_empty() {
+                continue;
+            }
+            queued.push((session.session_id, std::mem::take(&mut session.pending_actor_sounds)));
+        }
+        for (source_id, sounds) in queued {
+            for sound in sounds {
+                let chunk = (
+                    (sound.x.floor() as i32) >> 4,
+                    (sound.z.floor() as i32) >> 4,
+                );
+                let mut wire = Vec::with_capacity(64);
+                {
+                    let mut writer = Writer::new();
+                    writer.write_var_u32(LEVEL_SOUND_EVENT_PACKET_ID);
+                    wire.extend_from_slice(&writer.into_bytes());
+                }
+                wire.extend_from_slice(&level_sound_actor_event_wire(
+                    &sound.sound,
+                    sound.x,
+                    sound.y,
+                    sound.z,
+                    sound.extra_data,
+                    sound.entity_type,
+                    sound.actor_unique_id,
+                ));
+                for session in map.values_mut() {
+                    if session.session_id == source_id {
+                        continue;
+                    }
+                    if !session.joined || !session.sent_chunks.contains(&chunk) {
+                        continue;
+                    }
+                    session
+                        .pending_outgoing
+                        .push(OutgoingPacket::RawWire(wire.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -11018,5 +11324,226 @@ mod bossbar_tests {
         let decoded = BossEventPacket::decode(&mut reader).expect("decode");
         assert_eq!(decoded, packet);
         assert_eq!(reader.remaining(), 0);
+    }
+}
+
+/// Fall damage, translated from `Entity::updateFallState()`,
+/// `Living::onHitGround()`/`calculateFallDamage()` and
+/// `Player::checkGroundState()`/`calculateFallDamage()`.
+#[cfg(test)]
+mod fall_damage_tests {
+    use super::*;
+
+    fn session() -> PlayerSession {
+        PlayerSession::new(1, "127.0.0.1:19132".parse().expect("addr"))
+    }
+
+    #[test]
+    fn landing_from_four_blocks_costs_one_heart() {
+        let mut session = session();
+        session.health = 20.0;
+        // The flat world's surface is at y = 3, so y = 4 puts the feet on it.
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        session.update_fall_state(-4.0);
+        assert!(session.on_ground);
+        assert_eq!(session.fall_distance, 0.0);
+        // `ceil(4 - 3)`
+        assert_eq!(session.health, 19.0);
+        // SetHealthPacket (0x2A) reaches the client.
+        assert!(session.pending_outgoing.iter().any(|packet| {
+            matches!(packet, OutgoingPacket::RawWire(bytes) if bytes.first() == Some(&0x2A))
+        }));
+        // `EntityShortFallSound` (damage <= 4).
+        let sounds = session.take_actor_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].sound, LEVEL_SOUND_FALL_SMALL);
+        assert_eq!(sounds[0].extra_data, -1);
+    }
+
+    #[test]
+    fn a_fall_of_three_blocks_or_less_is_free() {
+        let mut session = session();
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        session.update_fall_state(-3.0);
+        assert_eq!(session.health, 20.0);
+        assert!(session.pending_outgoing.is_empty());
+        // `EntityLandSound` for a harmless landing, as an actor sound for the
+        // player's viewers (`Entity::broadcastSound()`).
+        let sounds = session.take_actor_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].sound, LEVEL_SOUND_LAND);
+        assert_eq!(sounds[0].entity_type, "minecraft:player");
+        assert_eq!(sounds[0].actor_unique_id as u64, session.entity_runtime_id);
+    }
+
+    #[test]
+    fn landing_in_water_cancels_the_fall() {
+        let mut session = session();
+        let water = bedrock_world::block_states::network_id("water").unwrap();
+        session.world.set_block(0, 4, 0, water);
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        session.update_fall_state(-20.0);
+        assert_eq!(session.health, 20.0);
+        assert_eq!(session.fall_distance, 0.0);
+    }
+
+    #[test]
+    fn a_hay_bale_softens_the_landing() {
+        let mut session = session();
+        let hay = bedrock_world::block_states::network_id("hay_block").unwrap();
+        session.world.set_block(0, 3, 0, hay);
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        // 10 blocks * 0.2 = 2, which is below the 3-block threshold.
+        session.update_fall_state(-10.0);
+        assert_eq!(session.health, 20.0);
+    }
+
+    #[test]
+    fn creative_players_take_no_fall_damage() {
+        let mut session = session();
+        session.gamemode = 1;
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        session.update_fall_state(-30.0);
+        assert_eq!(session.health, 20.0);
+        session.damage_player(10.0);
+        assert_eq!(session.health, 20.0);
+    }
+
+    #[test]
+    fn a_lethal_fall_enters_the_death_flow() {
+        let mut session = session();
+        session.position = Vector3f::new(0.5, 4.0, 0.5);
+        // ceil(40 - 3) = 37, more than the 20 HP pool.
+        session.update_fall_state(-40.0);
+        assert_eq!(session.health, 0.0);
+        assert!(session.is_dead);
+        // `EntityLongFallSound` (damage > 4).
+        let sounds = session.take_actor_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].sound, LEVEL_SOUND_FALL_BIG);
+    }
+}
+
+/// Engine-level physics parity: recipient rules for actor sounds, the falling
+/// anvil (`Anvil::getLandSound()`, `FallingBlock::onHitGround()`) and the
+/// `> 512 edits per chunk` `LevelChunk` resend of `World::actuallyDoTick()`.
+#[cfg(test)]
+mod engine_physics_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn joined(id: u64, chunks: &[(i32, i32)]) -> PlayerSession {
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(id, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.sent_chunks = chunks.iter().copied().collect();
+        session
+    }
+
+    fn has_packet_id(session: &PlayerSession, id: u8) -> bool {
+        session.pending_outgoing.iter().any(|packet| {
+            matches!(packet, OutgoingPacket::RawWire(bytes) if bytes.first() == Some(&id))
+        })
+    }
+
+    #[test]
+    fn a_fall_sound_reaches_viewers_but_not_the_falling_player() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut faller = joined(1, &[(0, 0)]);
+        faller.world = Arc::clone(manager.world());
+        faller.position = Vector3f::new(0.5, 4.0, 0.5);
+        let mut viewer = joined(2, &[(0, 0)]);
+        viewer.world = Arc::clone(manager.world());
+        manager.add_session(faller);
+        manager.add_session(viewer);
+
+        // The real landing path (`Living::onHitGround()`).
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1).unwrap().update_fall_state(-4.0);
+        }
+        manager.flush_actor_sounds();
+
+        let map = manager.sessions.read();
+        // `Entity::broadcastSound()` uses `$this->hasSpawned`: the faller's own
+        // client plays the landing sound locally, so it gets no packet.
+        assert!(!has_packet_id(&map[&1], LEVEL_SOUND_EVENT_PACKET_ID as u8));
+        let wire = map[&2]
+            .pending_outgoing
+            .iter()
+            .find_map(|packet| match packet {
+                OutgoingPacket::RawWire(bytes)
+                    if bytes.first() == Some(&(LEVEL_SOUND_EVENT_PACKET_ID as u8)) =>
+                {
+                    Some(bytes.clone())
+                }
+                _ => None,
+            })
+            .expect("viewer receives the actor sound");
+        // Actor fields, not the non-actor `":"` / -1 form.
+        let text = String::from_utf8_lossy(&wire);
+        assert!(text.contains("fall.small"));
+        assert!(text.contains("minecraft:player"));
+    }
+
+    #[test]
+    fn a_falling_anvil_hurts_the_player_it_lands_on() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut victim = joined(1, &[(0, 0)]);
+        victim.world = Arc::clone(manager.world());
+        // Standing on the flat surface (grass at y = 3).
+        victim.position = Vector3f::new(0.5, 4.0, 0.5);
+        victim.health = 20.0;
+        manager.add_session(victim);
+
+        // 10 blocks above the victim, in the air: it falls on its own.
+        let anvil = bedrock_world::block_states::network_id("anvil").unwrap();
+        assert!(manager.world().set_block(0, 14, 0, anvil));
+        for _ in 0..12 {
+            manager.tick();
+        }
+
+        let map = manager.sessions.read();
+        let victim = &map[&1];
+        assert_eq!(manager.world().block_at(0, 4, 0), anvil, "the anvil landed");
+        assert!(
+            victim.health < 20.0,
+            "FallingBlock::onHitGround(): 2 HP per block (health {})",
+            victim.health
+        );
+        // `AnvilFallSound` -> LevelEventPacket(SOUND_ANVIL_FALL) for viewers.
+        assert!(has_packet_id(victim, LEVEL_EVENT_PACKET_ID as u8));
+    }
+
+    #[test]
+    fn more_than_512_edits_in_one_chunk_resend_the_whole_column() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut viewer = joined(1, &[(0, 0)]);
+        viewer.world = Arc::clone(manager.world());
+        manager.add_session(viewer);
+
+        // 600 distinct edits, all inside chunk (0, 0) (16x16 cells per layer).
+        for i in 0..600i32 {
+            manager
+                .world()
+                .set_block(i % 16, 20 + i / 256, (i / 16) % 16, 42);
+        }
+        assert!(manager.poll_block_changes() > 0);
+
+        let map = manager.sessions.read();
+        let viewer = &map[&1];
+        assert!(
+            viewer
+                .pending_outgoing
+                .iter()
+                .any(|packet| matches!(packet, OutgoingPacket::LevelChunk(_))),
+            "World::actuallyDoTick(): above 512 edits the chunk is resent"
+        );
+        assert!(
+            !has_packet_id(viewer, UPDATE_BLOCK_PACKET_ID as u8),
+            "no per-block UpdateBlockPacket once the column is resent"
+        );
     }
 }

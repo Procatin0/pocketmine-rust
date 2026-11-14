@@ -29,6 +29,9 @@ pub const LEVEL_EVENT_BLOCK_STOP_BREAK: i32 = 3601;
 pub const LEVEL_EVENT_BLOCK_BREAK_SPEED: i32 = 3602;
 /// `LevelEvent::SOUND_DOOR` (PM `DoorSound`, played by fence gates).
 pub const LEVEL_EVENT_SOUND_DOOR: i32 = 1003;
+/// `LevelEvent::SOUND_ANVIL_FALL` (1022), PM `AnvilFallSound`: played when a
+/// falling anvil lands (`Anvil::getLandSound()`).
+pub const LEVEL_EVENT_SOUND_ANVIL_FALL: i32 = 1022;
 
 /// Encodes a `LevelEventPacket` payload with the exact reference wire
 /// (eventId zigzag varint, position 3x f32 LE, eventData zigzag varint).

@@ -3,6 +3,10 @@ use crate::binary::{CodecError, Reader, Writer};
 /// `ActorEvent::DEATH_ANIMATION`, the event that plays the death animation.
 pub const EVENT_DEATH_ANIMATION: u8 = 3;
 
+/// `ActorEvent::HURT`, the red flash/knockback animation played when an actor
+/// takes damage (PocketMine `EntityDamageEvent` -> `ActorEventPacket(HURT)`).
+pub const EVENT_HURT: u8 = 2;
+
 /// Packet ID 0x1B (27): ActorEventPacket.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ActorEventPacket {
