@@ -505,4 +505,11 @@ permissions:
         assert!(response.plugins.is_empty());
         assert_eq!(response.tick, 0);
     }
+
+    #[test]
+    fn test_stop_threads_sync_when_worker_offline() {
+        let manager = PluginManager::new();
+        // Calling stop_threads_sync when PHP worker is offline must never panic or deadlock
+        manager.stop_threads_sync();
+    }
 }

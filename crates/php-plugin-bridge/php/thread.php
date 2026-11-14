@@ -228,9 +228,80 @@ namespace pocketmine\thread {
 
         class ThreadSafeClassLoader extends ThreadSafe
         {
+            /** @var ThreadSafeArray<int, string> */
+            protected ThreadSafeArray $paths;
+
+            public function __construct()
+            {
+                $this->paths = new ThreadSafeArray();
+            }
+
+            public function addPath(string $prefix, string $path, bool $prepend = false): void
+            {
+                $cleanPrefix = trim(str_replace('/', '\\', $prefix), '\\');
+                $cleanPath = rtrim(str_replace('\\', '/', $path), '/');
+                $entry = $cleanPrefix . "\0" . $cleanPath;
+                $this->paths[] = $entry;
+                if (class_exists(\pocketmine\runtime\PluginAutoloader::class, false)) {
+                    \pocketmine\runtime\PluginAutoloader::addPath($cleanPrefix, $cleanPath);
+                }
+            }
+
+            public function removePath(string $prefix, string $path): void
+            {
+                $cleanPrefix = trim(str_replace('/', '\\', $prefix), '\\');
+                $cleanPath = rtrim(str_replace('\\', '/', $path), '/');
+                $target = $cleanPrefix . "\0" . $cleanPath;
+                foreach ($this->paths as $i => $entry) {
+                    if ($entry === $target) {
+                        unset($this->paths[$i]);
+                    }
+                }
+            }
+
+            /** @return array<string, string[]> */
+            public function getPrefixes(): array
+            {
+                $prefixes = [];
+                foreach ($this->paths as $entry) {
+                    [$prefix, $path] = explode("\0", (string)$entry, 2);
+                    $prefixes[$prefix][] = $path;
+                }
+                return $prefixes;
+            }
+
+            public function loadClass(string $class): bool
+            {
+                $class = ltrim($class, '\\');
+                if ($class === '') {
+                    return false;
+                }
+
+                foreach ($this->paths as $entry) {
+                    [$prefix, $path] = explode("\0", (string)$entry, 2);
+                    if ($prefix === '' || stripos($class, $prefix . '\\') === 0 || stripos($class, $prefix) === 0) {
+                        $relative = $prefix === '' ? $class : substr($class, strlen($prefix));
+                        $candidate = $path . '/' . str_replace('\\', '/', ltrim($relative, '\\')) . '.php';
+                        if (is_file($candidate)) {
+                            require_once $candidate;
+                            return true;
+                        }
+                    }
+                }
+
+                if (class_exists(\pocketmine\runtime\PluginAutoloader::class, false)) {
+                    \pocketmine\runtime\PluginAutoloader::autoload($class);
+                    if (class_exists($class, false) || interface_exists($class, false) || trait_exists($class, false)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
             public function register(bool $prepend = false): bool
             {
-                return true;
+                return spl_autoload_register([$this, 'loadClass'], true, $prepend);
             }
         }
     } else {
@@ -304,9 +375,78 @@ namespace pocketmine\thread {
 
         class ThreadSafeClassLoader
         {
+            /** @var string[] */
+            protected array $paths = [];
+
+            public function addPath(string $prefix, string $path, bool $prepend = false): void
+            {
+                $cleanPrefix = trim(str_replace('/', '\\', $prefix), '\\');
+                $cleanPath = rtrim(str_replace('\\', '/', $path), '/');
+                $entry = $cleanPrefix . "\0" . $cleanPath;
+                if ($prepend) {
+                    array_unshift($this->paths, $entry);
+                } else {
+                    $this->paths[] = $entry;
+                }
+                if (class_exists(\pocketmine\runtime\PluginAutoloader::class, false)) {
+                    \pocketmine\runtime\PluginAutoloader::addPath($cleanPrefix, $cleanPath);
+                }
+            }
+
+            public function removePath(string $prefix, string $path): void
+            {
+                $cleanPrefix = trim(str_replace('/', '\\', $prefix), '\\');
+                $cleanPath = rtrim(str_replace('\\', '/', $path), '/');
+                $target = $cleanPrefix . "\0" . $cleanPath;
+                $idx = array_search($target, $this->paths, true);
+                if ($idx !== false) {
+                    unset($this->paths[$idx]);
+                }
+            }
+
+            /** @return array<string, string[]> */
+            public function getPrefixes(): array
+            {
+                $prefixes = [];
+                foreach ($this->paths as $entry) {
+                    [$prefix, $path] = explode("\0", $entry, 2);
+                    $prefixes[$prefix][] = $path;
+                }
+                return $prefixes;
+            }
+
+            public function loadClass(string $class): bool
+            {
+                $class = ltrim($class, '\\');
+                if ($class === '') {
+                    return false;
+                }
+
+                foreach ($this->paths as $entry) {
+                    [$prefix, $path] = explode("\0", $entry, 2);
+                    if ($prefix === '' || stripos($class, $prefix . '\\') === 0 || stripos($class, $prefix) === 0) {
+                        $relative = $prefix === '' ? $class : substr($class, strlen($prefix));
+                        $candidate = $path . '/' . str_replace('\\', '/', ltrim($relative, '\\')) . '.php';
+                        if (is_file($candidate)) {
+                            require_once $candidate;
+                            return true;
+                        }
+                    }
+                }
+
+                if (class_exists(\pocketmine\runtime\PluginAutoloader::class, false)) {
+                    \pocketmine\runtime\PluginAutoloader::autoload($class);
+                    if (class_exists($class, false) || interface_exists($class, false) || trait_exists($class, false)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
             public function register(bool $prepend = false): bool
             {
-                return true;
+                return spl_autoload_register([$this, 'loadClass'], true, $prepend);
             }
         }
     }
@@ -340,10 +480,28 @@ namespace pocketmine\thread {
             } else {
                 $this->classLoaders = [];
             }
+            if ($autoloaders !== null) {
+                foreach ($autoloaders as $loader) {
+                    $this->classLoaders[] = $loader;
+                }
+            } elseif (class_exists(\pocketmine\Server::class, false)) {
+                $serverLoader = \pocketmine\Server::getInstance()->getLoader();
+                if ($serverLoader !== null) {
+                    $this->classLoaders[] = $serverLoader;
+                }
+            }
         }
 
         public function registerClassLoaders(): void
         {
+            $loaders = $this->getClassLoaders();
+            if ($loaders !== null) {
+                foreach ($loaders as $loader) {
+                    if (is_object($loader) && method_exists($loader, 'register')) {
+                        $loader->register(true);
+                    }
+                }
+            }
             if ($this->composerAutoloaderPath !== null && is_file($this->composerAutoloaderPath)) {
                 require_once $this->composerAutoloaderPath;
             }
@@ -535,6 +693,125 @@ namespace pocketmine\thread {
             }
             $this->threads = [];
             return $count;
+        }
+    }
+}
+
+namespace pocketmine\snooze {
+    use pmmp\thread\ThreadSafe;
+    use pmmp\thread\ThreadSafeArray;
+
+    if (class_exists(ThreadSafe::class)) {
+        class SleeperNotifier extends ThreadSafe
+        {
+            protected ?ThreadSafeArray $sharedQueue = null;
+            protected int $notifierId = 0;
+
+            public function setHandler(ThreadSafeArray $queue, int $id): void
+            {
+                $this->sharedQueue = $queue;
+                $this->notifierId = $id;
+            }
+
+            public function wakeupSleeper(): void
+            {
+                if ($this->sharedQueue !== null) {
+                    $this->sharedQueue[] = $this->notifierId;
+                }
+            }
+        }
+    } else {
+        class SleeperNotifier
+        {
+            /** @var array<int, int>|null */
+            protected ?array $sharedQueue = null;
+            protected int $notifierId = 0;
+
+            public function setHandler(array &$queue, int $id): void
+            {
+                $this->sharedQueue = &$queue;
+                $this->notifierId = $id;
+            }
+
+            public function wakeupSleeper(): void
+            {
+                if ($this->sharedQueue !== null) {
+                    $this->sharedQueue[] = $this->notifierId;
+                }
+            }
+        }
+    }
+
+    class SleeperHandler
+    {
+        private mixed $queue;
+        /** @var array<int, \Closure> */
+        private array $notifiers = [];
+        private int $nextId = 1;
+
+        public function __construct()
+        {
+            if (class_exists(ThreadSafeArray::class)) {
+                $this->queue = new ThreadSafeArray();
+            } else {
+                $this->queue = [];
+            }
+        }
+
+        public function addNotifier(SleeperNotifier $notifier, \Closure $handler): int
+        {
+            $id = $this->nextId++;
+            $this->notifiers[$id] = $handler;
+            $this->attachNotifier($notifier, $id);
+            return $id;
+        }
+
+        private function attachNotifier(SleeperNotifier $notifier, int $id): void
+        {
+            if ($this->queue instanceof ThreadSafeArray) {
+                $notifier->setHandler($this->queue, $id);
+            } else {
+                $notifier->setHandler($this->queue, $id);
+            }
+        }
+
+        public function removeNotifier(int|SleeperNotifier $notifier): void
+        {
+            if (is_int($notifier)) {
+                unset($this->notifiers[$notifier]);
+            }
+        }
+
+        public function processNotifications(): void
+        {
+            if (class_exists(ThreadSafeArray::class) && $this->queue instanceof ThreadSafeArray) {
+                while (($id = $this->queue->shift()) !== null) {
+                    $intId = (int)$id;
+                    if (isset($this->notifiers[$intId])) {
+                        try {
+                            ($this->notifiers[$intId])();
+                        } catch (\Throwable $e) {
+                            fwrite(STDERR, '[PHP/SNOOZE] Sleeper notification callback failed: ' . $e->getMessage() . PHP_EOL);
+                        }
+                    }
+                }
+            } else {
+                while (($id = array_shift($this->queue)) !== null) {
+                    $intId = (int)$id;
+                    if (isset($this->notifiers[$intId])) {
+                        try {
+                            ($this->notifiers[$intId])();
+                        } catch (\Throwable $e) {
+                            fwrite(STDERR, '[PHP/SNOOZE] Sleeper notification callback failed: ' . $e->getMessage() . PHP_EOL);
+                        }
+                    }
+                }
+            }
+        }
+
+        public function sleepUntilNotification(float $timeout): void
+        {
+            $this->processNotifications();
         }
     }
 }

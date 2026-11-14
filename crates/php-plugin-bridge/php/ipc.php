@@ -215,6 +215,7 @@ namespace pocketmine\runtime {
                 'dispatch_event' => self::actionDispatchEvent($request),
                 'execute_command' => self::actionExecuteCommand($request),
                 'tick' => self::actionTick($request),
+                'stop_threads' => self::actionStopThreads($request),
                 'shutdown' => self::actionShutdown($request),
                 default => ['status' => 'error', 'message' => 'Unknown action: ' . $action],
             };
@@ -629,6 +630,19 @@ namespace pocketmine\runtime {
             return ['status' => 'ok', 'tick' => self::$tick, 'pending_tasks' => $pending];
         }
 
+        private static function actionStopThreads(array $request): array
+        {
+            $stopped = 0;
+            if (class_exists(\pocketmine\thread\ThreadManager::class)) {
+                try {
+                    $stopped = \pocketmine\thread\ThreadManager::getInstance()->stopAll();
+                } catch (\Throwable $e) {
+                    self::log('Failed to stop threads: ' . $e->getMessage());
+                }
+            }
+            return ['status' => 'ok', 'stopped_threads' => $stopped];
+        }
+
         private static function actionShutdown(array $request): array
         {
             foreach (self::getPluginManager()->getPlugins() as $plugin) {
@@ -638,7 +652,15 @@ namespace pocketmine\runtime {
                     self::log('Failed to disable ' . $plugin->getName() . ': ' . $e->getMessage());
                 }
             }
-            return ['status' => 'ok', 'message' => 'Runtime shut down'];
+            $stopped = 0;
+            if (class_exists(\pocketmine\thread\ThreadManager::class)) {
+                try {
+                    $stopped = \pocketmine\thread\ThreadManager::getInstance()->stopAll();
+                } catch (\Throwable $e) {
+                    self::log('Failed to stop threads: ' . $e->getMessage());
+                }
+            }
+            return ['status' => 'ok', 'message' => 'Runtime shut down', 'stopped_threads' => $stopped];
         }
 
         private static function registerPermissions(PluginDescription $description): void

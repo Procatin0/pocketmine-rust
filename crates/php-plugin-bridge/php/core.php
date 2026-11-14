@@ -160,9 +160,15 @@ namespace pocketmine {
         private int $tick = 0;
         private int $startTime;
         private bool $shuttingDown = false;
+        private ?\pocketmine\thread\ThreadSafeClassLoader $loader = null;
+        private ?\pocketmine\snooze\SleeperHandler $tickSleeper = null;
+        private ?\pocketmine\scheduler\AsyncPool $asyncPool = null;
 
         private function __construct()
         {
+            $this->loader = new \pocketmine\thread\ThreadSafeClassLoader();
+            $this->loader->register(true);
+            $this->tickSleeper = new \pocketmine\snooze\SleeperHandler();
             $this->logger = new Logger('Server');
             $this->permissionManager = PermissionManager::getInstance();
             DefaultPermissions::registerCorePermissions();
@@ -325,13 +331,16 @@ namespace pocketmine {
         }
 
         /**
-         * TODO(A1): sin ClassLoader en bridge (PHP nativo usa el autoloader
-         * de `autoload.php`). Null documentado; plugins que exijan el loader
-         * deben degradar (p.ej. `if ($loader !== null)`).
+         * PM `Server::getLoader()`: ThreadSafeClassLoader for the server and worker threads.
          */
-        public function getLoader(): ?object
+        public function getLoader(): \pocketmine\thread\ThreadSafeClassLoader
         {
-            return null;
+            return $this->loader ??= new \pocketmine\thread\ThreadSafeClassLoader();
+        }
+
+        public function getTickSleeper(): \pocketmine\snooze\SleeperHandler
+        {
+            return $this->tickSleeper ??= new \pocketmine\snooze\SleeperHandler();
         }
 
         /** TODO(A1): sin UpdateChecker en bridge. Null documentado. */
@@ -352,10 +361,16 @@ namespace pocketmine {
             return null;
         }
 
-        /** TODO(A1): sin AsyncPool en bridge (compresión sync). Null documentado. */
-        public function getAsyncPool(): ?object
+        /** PM `Server::getAsyncPool()`. */
+        public function getAsyncPool(): \pocketmine\scheduler\AsyncPool
         {
-            return null;
+            if ($this->asyncPool === null) {
+                $scheduler = $this->getScheduler();
+                $this->asyncPool = $scheduler instanceof \pocketmine\scheduler\Scheduler
+                    ? $scheduler->getAsyncPool()
+                    : new \pocketmine\scheduler\AsyncPool(2);
+            }
+            return $this->asyncPool;
         }
 
         /** TODO(A1): sin MemoryManager/view-distance en bridge. Null documentado. */

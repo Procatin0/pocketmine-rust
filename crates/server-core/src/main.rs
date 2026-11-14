@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         );
         shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-        stop_other_threads();
+        stop_other_threads(None);
         std::process::exit(1);
     }
 
@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             tracing::error!("Could not load plugins directory: {error}");
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-            stop_other_threads();
+            stop_other_threads(Some(&plugin_manager));
             std::process::exit(1);
         }
     };
@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_core::emergency!("  - {}: {}", failure.name, failure.reason);
         }
         shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-        stop_other_threads();
+        stop_other_threads(Some(&plugin_manager));
         std::process::exit(1);
     }
     match plugin_manager
@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_core::emergency!("  - {}: {}", failure.name, failure.reason);
             }
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-            stop_other_threads();
+            stop_other_threads(Some(&plugin_manager));
             std::process::exit(1);
         }
         Err(error) => {
@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lang.translate("pocketmine.plugin.someEnableErrors", &[])
             );
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-            stop_other_threads();
+            stop_other_threads(Some(&plugin_manager));
             std::process::exit(1);
         }
     }
@@ -292,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_core::emergency!("  - {}: {}", failure.name, failure.reason);
             }
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-            stop_other_threads();
+            stop_other_threads(Some(&plugin_manager));
             std::process::exit(1);
         }
         Err(error) => {
@@ -302,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lang.translate("pocketmine.plugin.someEnableErrors", &[])
             );
             shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-            stop_other_threads();
+            stop_other_threads(Some(&plugin_manager));
             std::process::exit(1);
         }
     }
@@ -330,7 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         shutdown_sequence(ShutdownContextKind::FailedStartup).await;
-        stop_other_threads();
+        stop_other_threads(Some(&plugin_manager));
         std::process::exit(1);
     }
 
@@ -755,7 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
     };
     shutdown_sequence(context).await;
-    stop_other_threads();
+    stop_other_threads(Some(&plugin_manager));
     // PM `forceShutdown()` ends the process with `exit` instead of returning:
     // returning instead would hand control back to the Tokio runtime, whose
     // drop waits indefinitely for the blocking pool (e.g. the console stdin
@@ -850,8 +850,11 @@ impl From<ShutdownContext> for ShutdownContextAlias {
 }
 
 /// `PocketMine.php`: `info "Stopping other threads"` after `new Server(...)`.
-fn stop_other_threads() {
+fn stop_other_threads(plugin_manager: Option<&PluginManager>) {
     info!("Stopping other threads");
+    if let Some(manager) = plugin_manager {
+        manager.stop_threads_sync();
+    }
     server_core::logging::shutdown_log_writer();
 }
 

@@ -685,6 +685,13 @@ impl PluginManager {
         Ok(response.actions)
     }
 
+    /// Asks the PHP runtime to stop all background worker threads (`ThreadManager::stopAll`).
+    pub fn stop_threads_sync(&self) {
+        if self.php_worker.is_available() {
+            let _ = self.php_worker.request_sync("stop_threads", serde_json::json!({}));
+        }
+    }
+
     /// Whether PHP has any listener for `event_name`.
     pub fn has_listeners(&self, event_name: &str) -> bool {
         self.listener_events.read().contains(event_name)

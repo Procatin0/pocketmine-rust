@@ -726,9 +726,9 @@ namespace pocketmine\scheduler {
     }
 
     /**
-     * PM `AsyncWorker` stub: no real thread, no class loader, no sleeper.
+     * PM `AsyncWorker`: worker thread for background AsyncTasks.
      */
-    class AsyncWorker
+    class AsyncWorker extends \pocketmine\thread\Worker
     {
         private bool $terminated = false;
         private ?string $crashInfo = null;
@@ -736,6 +736,10 @@ namespace pocketmine\scheduler {
         public function __construct(
             private int $workerId = 0
         ) {
+        }
+
+        protected function onRun(): void
+        {
         }
 
         public function getId(): int
@@ -748,19 +752,23 @@ namespace pocketmine\scheduler {
             return $this->terminated;
         }
 
-        public function getCrashInfo(): ?string
+        public function getCrashInfo(): ?\pocketmine\thread\ThreadCrashInfo
         {
-            return $this->crashInfo;
+            return null;
         }
 
-        public function start(int $options = 0): void
+        public function start(int $options = 0): bool
         {
-            // No-op: virtual workers start on first submit.
+            return true;
         }
 
         public function quit(): void
         {
             $this->terminated = true;
+            try {
+                parent::quit();
+            } catch (\Throwable) {
+            }
         }
 
         public function collect(): void
@@ -1428,6 +1436,13 @@ namespace pocketmine\scheduler {
                 $this->getAsyncPool()->collectTasks();
             } catch (\Throwable $e) {
                 fwrite(STDERR, '[PHP/SCHEDULER] Async collect failed: ' . $e->getMessage() . PHP_EOL);
+            }
+            if (class_exists(\pocketmine\Server::class, false)) {
+                try {
+                    \pocketmine\Server::getInstance()->getTickSleeper()->processNotifications();
+                } catch (\Throwable $e) {
+                    fwrite(STDERR, '[PHP/SNOOZE] Sleeper process failed: ' . $e->getMessage() . PHP_EOL);
+                }
             }
         }
 

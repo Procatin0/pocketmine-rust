@@ -80,6 +80,13 @@ final class PluginAutoloader
 
         // Composer dependencies are usually needed while the main class is parsed.
         self::loadVendor($key);
+
+        if (class_exists(\pocketmine\Server::class, false)) {
+            try {
+                \pocketmine\Server::getInstance()->getLoader()->addPath($prefix, $root . '/src');
+            } catch (\Throwable) {
+            }
+        }
     }
 
     /**
