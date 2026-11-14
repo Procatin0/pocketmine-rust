@@ -32,6 +32,9 @@ pub mod move_actor_delta;
 pub mod move_player;
 pub mod remove_actor;
 pub mod transfer;
+pub mod add_actor;
+pub mod add_item_actor;
+pub mod take_item_actor;
 pub mod add_player;
 pub mod player_list;
 pub mod set_actor_data;
@@ -90,7 +93,10 @@ pub use move_actor_delta::MoveActorDeltaPacket;
 pub use move_player::{MovePlayerPacket, MovePlayerTeleportData};
 pub use remove_actor::RemoveActorPacket;
 pub use transfer::TransferPacket;
-pub use add_player::{AbilitiesData, AbilitiesLayer, AddPlayerPacket};
+pub use add_player::{AbilitiesData, AbilitiesLayer, AddPlayerPacket, EntityLink};
+pub use add_actor::{ActorAttribute, AddActorPacket};
+pub use add_item_actor::AddItemActorPacket;
+pub use take_item_actor::TakeItemActorPacket;
 pub use player_list::{
     PlayerListEntry, PlayerListPacket, SkinData, SkinImage, STEVE_GEOMETRY_DATA,
     STEVE_GEOMETRY_NAME, STEVE_GEOMETRY_VERSION, STEVE_RESOURCE_PATCH, uuid_from_str,

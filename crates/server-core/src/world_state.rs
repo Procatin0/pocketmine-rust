@@ -32,9 +32,22 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
+use bedrock_protocol::types::Vector3f;
+use bedrock_protocol::ItemStack;
 use bedrock_world::chunk::{Chunk, MIN_SUBCHUNK_INDEX};
 use bedrock_world::WorldGenerator;
 use parking_lot::{Mutex, RwLock};
+
+/// Deterministic `lcg_value()` stand-in for `World::dropItem()`'s random
+/// sideways motion (PocketMine seeds from the RNG; the exact value is not
+/// observable behaviour, only the [0, 0.2) spread is).
+fn pseudo_random(seed: i64) -> f32 {
+    let mut x = seed as u64 ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    (x % 10_000) as f32 / 10_000.0
+}
 
 /// Absolute block coordinate -> network block id.
 type BlockEdits = HashMap<(i32, i32, i32), u32>;
@@ -176,9 +189,14 @@ pub struct WorldState {
     /// background chunk prefetch (main.rs) also reads it to skip columns
     /// whose payloads are already warm.
     chunk_versions: Mutex<HashMap<(i32, i32), u64>>,
-    /// `FallingBlock` entities of the reference, simulated as blocks that
-    /// move down one cell per tick (see [`FallingBlock`]).
-    pending_falls: Mutex<Vec<FallingBlock>>,
+    /// `World::$entities`: every live entity, keyed by `Entity::getId()`.
+    /// Translated from `World::addEntity()`/`removeEntity()`; the tick is
+    /// [`WorldState::tick_entities`].
+    entities: RwLock<HashMap<i64, crate::entity::Entity>>,
+    /// Next `Entity::getId()` (`nextEntityId`).
+    next_entity_id: std::sync::atomic::AtomicI64,
+    /// Next Bedrock runtime id passed to `AddActorPacket`/`AddItemActorPacket`.
+    next_entity_runtime: std::sync::atomic::AtomicU64,
     /// `LevelEventPacket`s produced by the world itself (PM
     /// `World::addSound()` with a level-event sound, e.g. `AnvilFallSound`):
     /// `(event id, event data, x, y, z)`. Drained once per tick by
@@ -194,33 +212,9 @@ pub struct WorldState {
     chunk_object_cache: Mutex<ChunkObjectCache>,
 }
 
-/// `FallingBlock::getInitialGravity()`.
-pub const FALL_GRAVITY: f32 = 0.04;
-/// `FallingBlock::getInitialDragMultiplier()`.
-pub const FALL_DRAG: f32 = 0.02;
-/// Maximum falls simulated at once: a griefing sand column must not grow the
-/// fall list without bound (`BLOCK_CHANGE_QUEUE_CAP` bounds the broadcasts,
-/// this bounds the simulation).
-pub const MAX_PENDING_FALLS: usize = 256;
-
-/// A falling block, translated from `src/entity/object/FallingBlock.php`.
-///
-/// The reference spawns an entity that falls with gravity/drag and turns back
-/// into a block when it lands. This server has no block-entity simulation, so
-/// the block itself moves one cell down per tick (the same animation a falling
-/// entity shows at terminal velocity, ~0.98 blocks/tick) and is restored with
-/// the normal neighbour cascade on landing.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FallingBlock {
-    pub x: i32,
-    pub y: i32,
-    pub z: i32,
-    pub block_id: u32,
-    /// `Entity::$motion.y` in blocks/tick (negative when falling).
-    pub motion: f32,
-    /// `Entity::$fallDistance`, kept for `onHitGround()` consumers.
-    pub fall_distance: f32,
-}
+/// Maximum entities simulated at once: a griefing sand column or an item
+/// explosion must not grow `World::$entities` without bound.
+pub const MAX_ENTITIES: usize = 512;
 
 /// A falling block that reached the ground this tick, used by
 /// `SessionManager` for `FallingBlock::onHitGround()` (anvil damage to
@@ -286,7 +280,11 @@ impl WorldState {
                 order: VecDeque::new(),
             }),
             chunk_versions: Mutex::new(HashMap::new()),
-            pending_falls: Mutex::new(Vec::new()),
+            entities: RwLock::new(HashMap::new()),
+            // Entity ids start above the session-derived player ids (small
+            // ints `>= 1`) so an actor id is never ambiguous.
+            next_entity_id: std::sync::atomic::AtomicI64::new(1_000_000),
+            next_entity_runtime: std::sync::atomic::AtomicU64::new(5_000_000),
             pending_level_events: Mutex::new(Vec::new()),
             chunk_object_cache: Mutex::new(ChunkObjectCache {
                 entries: HashMap::new(),
@@ -805,28 +803,263 @@ impl WorldState {
         }
     }
 
-    /// Starts the falling-block simulation for a block that just left the
-    /// world (`new FallingBlock(...)->spawnToAll()` in the reference).
+    /// `new FallingBlock(Location::fromObject($pos->add(0.5, 0, 0.5)), $block)`
+    /// followed by `spawnToAll()`: the block leaves the world and an entity
+    /// with gravity/drag falls in its place.
     pub fn start_falling(&self, x: i32, y: i32, z: i32, block_id: u32) {
-        let mut pending = self.pending_falls.lock();
-        if pending.len() >= MAX_PENDING_FALLS {
-            // Over the budget the block is dropped instead of simulated, which
-            // is what the reference effectively does at its entity cap.
-            return;
-        }
-        pending.push(FallingBlock {
-            x,
-            y,
-            z,
-            block_id,
-            motion: 0.0,
-            fall_distance: 0.0,
-        });
+        self.spawn_falling_block(x, y, z, block_id);
     }
 
-    /// Number of falling blocks still simulated.
-    pub fn pending_fall_count(&self) -> usize {
-        self.pending_falls.lock().len()
+    /// Next `(Entity::getId(), runtime id)` pair. Entity ids start above the
+    /// small session-derived player ids so the two can never collide.
+    pub fn next_entity_ids(&self) -> (i64, u64) {
+        (
+            self.next_entity_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            self.next_entity_runtime
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// `World::addEntity()`: registers a live entity. Returns its id, or
+    /// `None` when [`MAX_ENTITIES`] is reached (PocketMine's entity cap).
+    pub fn spawn_entity(&self, entity: crate::entity::Entity) -> Option<i64> {
+        let mut entities = self.entities.write();
+        if entities.len() >= MAX_ENTITIES {
+            return None;
+        }
+        let id = entity.unique_id;
+        entities.insert(id, entity);
+        Some(id)
+    }
+
+    /// `new FallingBlock(Position::fromObject($pos->add(0.5, 0, 0.5), ...), $block)`.
+    pub fn spawn_falling_block(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+    ) -> Option<i64> {
+        if self.entities.read().len() >= MAX_ENTITIES {
+            return None;
+        }
+        let (unique_id, runtime_id) = self.next_entity_ids();
+        self.spawn_entity(crate::entity::Entity::falling_block(
+            unique_id,
+            runtime_id,
+            Vector3f::new(x as f32 + 0.5, y as f32, z as f32 + 0.5),
+            block_id,
+        ))
+    }
+
+    /// `World::dropItem($source, $item, $motion)`: spawns an `ItemEntity` with
+    /// the default pickup delay and PocketMine's random upward motion.
+    pub fn spawn_item(
+        &self,
+        position: Vector3f,
+        item: ItemStack,
+        motion: Option<Vector3f>,
+        owner: &str,
+    ) -> Option<i64> {
+        if item.is_empty() || item.count == 0 {
+            return None;
+        }
+        if self.entities.read().len() >= MAX_ENTITIES {
+            return None;
+        }
+        let (unique_id, runtime_id) = self.next_entity_ids();
+        // `$motion ?? new Vector3(lcg_value() * 0.2 - 0.1, 0.1, lcg_value() * 0.2 - 0.1)`.
+        let motion = motion.unwrap_or_else(|| {
+            Vector3f::new(
+                pseudo_random(unique_id.wrapping_mul(3)) * 0.2 - 0.1,
+                0.1,
+                pseudo_random(unique_id.wrapping_mul(7)) * 0.2 - 0.1,
+            )
+        });
+        self.spawn_entity(crate::entity::Entity::item(
+            unique_id, runtime_id, position, item, motion, owner,
+        ))
+    }
+
+    /// `World::dropItem($pos, $block->asItem())` for a broken block.
+    pub fn drop_block_item(&self, x: i32, y: i32, z: i32, block_id: u32, owner: &str) {
+        if let Some(item) = crate::entity::block_item(block_id) {
+            self.spawn_item(
+                Vector3f::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5),
+                item,
+                None,
+                owner,
+            );
+        }
+    }
+
+    /// Removes an entity from the world (`Entity::close()` -> `World::removeEntity`).
+    pub fn remove_entity(&self, id: i64) -> bool {
+        self.entities.write().remove(&id).is_some()
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entities.read().len()
+    }
+
+    /// Copy of every live entity, for the network sync pass.
+    pub fn entities_snapshot(&self) -> Vec<crate::entity::Entity> {
+        self.entities.read().values().cloned().collect()
+    }
+
+    /// `World::getBlockCollisionBoxes($bb)`: one box per colliding block the
+    /// bounding box touches.
+    pub fn collision_boxes(&self, bb: &crate::entity::Aabb) -> Vec<crate::entity::Aabb> {
+        crate::entity::collision_boxes_in(self, bb)
+    }
+
+    /// `World::actuallyDoTick()` -> entity ticks (`Entity::onUpdate()` for
+    /// every registered entity).
+    ///
+    /// Falling blocks that reach the ground are turned back into blocks here
+    /// (`FallingBlock::entityBaseTick()`), which is why this runs before the
+    /// block-broadcast poll. Returns the landed blocks for
+    /// `FallingBlock::onHitGround()` consumers.
+    pub fn tick_entities(&self) -> Vec<LandedBlock> {
+        let mut entities = self.entities.write();
+        if entities.is_empty() {
+            return Vec::new();
+        }
+        let mut ids: Vec<i64> = entities.keys().copied().collect();
+        ids.sort_unstable();
+        let mut landed = Vec::new();
+        let mut spawned: Vec<crate::entity::Entity> = Vec::new();
+        let mut merges: Vec<(i64, i64)> = Vec::new();
+
+        for id in ids {
+            let Some(entity) = entities.get_mut(&id) else {
+                continue;
+            };
+            if entity.closed {
+                continue;
+            }
+            entity.on_update(self);
+
+            match entity.kind {
+                crate::entity::EntityKind::Item { .. } => {
+                    entity.item_tick();
+                    // `ItemEntity::entityBaseTick()` merge pass, every
+                    // `MERGE_CHECK_PERIOD` ticks.
+                    if entity.ticks_lived as i32 % crate::entity::ITEM_MERGE_PERIOD == 0
+                        && !entity.closed
+                        && entity.pickup_delay() != -1
+                    {
+                        let bb = entity.bounding_box();
+                        let nearby: Vec<i64> = entities
+                            .iter()
+                            .filter(|(other_id, other)| {
+                                **other_id != id
+                                    && matches!(other.kind, crate::entity::EntityKind::Item { .. })
+                                    && !other.closed
+                                    && other.bounding_box().intersects(
+                                        &crate::entity::Aabb::new(
+                                            bb.min_x - 0.5,
+                                            bb.min_y - 0.5,
+                                            bb.min_z - 0.5,
+                                            bb.max_x + 0.5,
+                                            bb.max_y + 0.5,
+                                            bb.max_z + 0.5,
+                                        ),
+                                    )
+                            })
+                            .map(|(other_id, _)| *other_id)
+                            .collect();
+                        for other_id in nearby {
+                            merges.push((id, other_id));
+                        }
+                    }
+                }
+                crate::entity::EntityKind::FallingBlock { block_id } => {
+                    if !entity.on_ground {
+                        continue;
+                    }
+                    // `if($this->onGround || $blockTarget !== null)`:
+                    // the entity despawns and its block is restored.
+                    entity.closed = true;
+                    let (bx, by, bz) = entity.falling_block_cell();
+                    let fall_distance = entity.landed_fall_distance.max(0.0);
+                    // `$blockTarget ?? $this->block` at `$pos`: when the
+                    // target cell cannot be replaced (or is out of world)
+                    // PocketMine drops the item and plays
+                    // `BlockBreakSound` instead of overwriting it.
+                    if crate::entity::can_falling_block_settle(self, bx, by, bz) {
+                        self.set_block_with(bx, by, bz, block_id, true);
+                        // `Anvil::getLandSound()` -> `AnvilFallSound`, a
+                        // `LevelEventPacket(SOUND_ANVIL_FALL)` at the cell.
+                        if bedrock_world::block_states::state_name(block_id)
+                            .is_some_and(|name| name.ends_with("anvil"))
+                        {
+                            self.add_level_event(
+                                bedrock_protocol::packets::level_event::LEVEL_EVENT_SOUND_ANVIL_FALL,
+                                0,
+                                bx,
+                                by,
+                                bz,
+                            );
+                        }
+                        landed.push(LandedBlock {
+                            x: bx,
+                            y: by,
+                            z: bz,
+                            block_id,
+                            fall_distance,
+                        });
+                    } else {
+                        self.add_sound(
+                            bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_BREAK,
+                            block_id as i32,
+                            bx,
+                            by,
+                            bz,
+                        );
+                        if let Some(item) = crate::entity::block_item(block_id) {
+                            let (unique_id, runtime_id) = self.next_entity_ids();
+                            spawned.push(crate::entity::Entity::item(
+                                unique_id,
+                                runtime_id,
+                                Vector3f::new(
+                                    entity.position.x,
+                                    entity.position.y,
+                                    entity.position.z,
+                                ),
+                                item,
+                                Vector3f::new(0.0, 0.0, 0.0),
+                                "",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // `ItemEntity::tryMergeInto()`: applied after the tick pass so the
+        // source and consumer never need two mutable map borrows at once.
+        for (source_id, consumer_id) in merges {
+            let Some(mut source) = entities.remove(&source_id) else {
+                continue;
+            };
+            if let Some(consumer) = entities.get_mut(&consumer_id) {
+                crate::entity::try_merge(&mut source, consumer);
+            }
+            if !source.closed {
+                entities.insert(source_id, source);
+            }
+        }
+
+        for entity in spawned {
+            if entities.len() >= MAX_ENTITIES {
+                break;
+            }
+            entities.insert(entity.unique_id, entity);
+        }
+        entities.retain(|_, entity| !entity.closed);
+        landed
     }
 
     /// Queues a `LevelEventPacket` (PM `World::addSound()` /
@@ -840,94 +1073,6 @@ impl WorldState {
     /// Drains the level events queued since the last tick, oldest first.
     pub fn take_pending_level_events(&self) -> Vec<(i32, i32, i32, i32, i32)> {
         std::mem::take(&mut *self.pending_level_events.lock())
-    }
-
-    /// Advances every falling block one tick, translating
-    /// `FallingBlock::entityBaseTick()` + `Entity::tryChangeMovement()`.
-    ///
-    /// Returns the blocks that landed this tick (restored into the world),
-    /// for `FallingBlock::onHitGround()` consumers.
-    pub fn tick_falling_blocks(&self) -> Vec<LandedBlock> {
-        use bedrock_world::block_id::AIR;
-        use bedrock_world::block_states;
-
-        let falls = {
-            let mut pending = self.pending_falls.lock();
-            std::mem::take(&mut *pending)
-        };
-        if falls.is_empty() {
-            return Vec::new();
-        }
-
-        let mut still_falling: Vec<FallingBlock> = Vec::with_capacity(falls.len());
-        let mut landed: Vec<LandedBlock> = Vec::new();
-        for mut fall in falls {
-            if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&fall.y) {
-                continue;
-            }
-            // `mY -= gravity; mY *= (1 - drag)`: converges to ~0.98 blocks/tick.
-            fall.motion = (fall.motion + FALL_GRAVITY) * (1.0 - FALL_DRAG);
-            fall.fall_distance += fall.motion;
-
-            // The cell is empty (first tick) or still holds this simulated
-            // falling block; anything else in it means another edit replaced
-            // the falling block while it was in the air. `entityBaseTick()`
-            // cannot place the block there (`!$block->canBeReplaced()`), so the
-            // reference drops the item and plays `BlockBreakSound` instead of
-            // overwriting: this port has no item entities, so the block is
-            // lost, the cell is preserved and the sound still plays.
-            let current = self.block_at(fall.x, fall.y, fall.z);
-            let current_name = block_states::state_name(current);
-            let occupied_by_other = current != fall.block_id
-                && !current_name.is_some_and(crate::physics::is_replaceable);
-            if occupied_by_other {
-                self.add_sound(
-                    bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_BREAK,
-                    fall.block_id as i32,
-                    fall.x,
-                    fall.y,
-                    fall.z,
-                );
-                continue;
-            }
-
-            let below = self.block_at(fall.x, fall.y - 1, fall.z);
-            let below_replaceable =
-                block_states::state_name(below).is_some_and(crate::physics::is_replaceable);
-            if below_replaceable && fall.y - 1 > WORLD_MIN_Y {
-                // Moving down one cell: leave air behind and occupy the next
-                // cell. Both edits are broadcast as `UpdateBlockPacket`s, so
-                // viewers see the block step down every tick.
-                self.set_block_with(fall.x, fall.y, fall.z, AIR, false);
-                self.set_block_with(fall.x, fall.y - 1, fall.z, fall.block_id, false);
-                fall.y -= 1;
-                still_falling.push(fall);
-            } else {
-                // `entityBaseTick()`: on the ground the block is restored and
-                // the neighbour cascade runs for its final cell.
-                self.set_block_with(fall.x, fall.y, fall.z, fall.block_id, true);
-                // `Anvil::getLandSound()` -> `AnvilFallSound` ->
-                // `LevelEventPacket(SOUND_ANVIL_FALL)` at the landing cell.
-                if block_states::state_name(fall.block_id).is_some_and(|n| n.ends_with("anvil")) {
-                    self.add_level_event(
-                        bedrock_protocol::packets::level_event::LEVEL_EVENT_SOUND_ANVIL_FALL,
-                        0,
-                        fall.x,
-                        fall.y,
-                        fall.z,
-                    );
-                }
-                landed.push(LandedBlock {
-                    x: fall.x,
-                    y: fall.y,
-                    z: fall.z,
-                    block_id: fall.block_id,
-                    fall_distance: fall.fall_distance,
-                });
-            }
-        }
-        self.pending_falls.lock().extend(still_falling);
-        landed
     }
 
     /// Drains the Java-facing queue (Fase 1), oldest first.
@@ -1569,17 +1714,17 @@ mod tests {
         world.set_block(2, 20, 2, stone);
         world.set_block(2, 21, 2, sand);
         assert_eq!(world.block_at(2, 21, 2), sand);
-        assert_eq!(world.pending_fall_count(), 0);
+        assert_eq!(world.entity_count(), 0);
 
         // `FallableTrait::onNearbyBlockChange()`: the sand leaves the world.
         world.set_block(2, 20, 2, AIR);
         assert_eq!(world.block_at(2, 21, 2), AIR);
-        assert_eq!(world.pending_fall_count(), 1);
+        assert_eq!(world.entity_count(), 1);
 
         for _ in 0..64 {
-            world.tick_falling_blocks();
+            world.tick_entities();
         }
-        assert_eq!(world.pending_fall_count(), 0);
+        assert_eq!(world.entity_count(), 0);
         // It landed on the grass at y = 3.
         assert_eq!(world.block_at(2, 4, 2), sand);
     }
@@ -1595,14 +1740,19 @@ mod tests {
         world.set_block(9, 30, 9, stone);
         world.set_block(9, 31, 9, sand);
         world.set_block(9, 30, 9, AIR);
-        assert_eq!(world.pending_fall_count(), 1);
+        assert_eq!(world.entity_count(), 1);
 
-        // Somebody replaces the falling block's cell while it is in the air.
+        // Somebody replaces the falling block's cell while the entity is in
+        // the air. The entity keeps falling (`Entity::move()` only clamps
+        // against the blocks it would enter) and the placed block survives.
         world.set_block(9, 31, 9, stone);
-        world.tick_falling_blocks();
+        for _ in 0..80 {
+            world.tick_entities();
+        }
 
         assert_eq!(world.block_at(9, 31, 9), stone, "the placed block survives");
-        assert_eq!(world.pending_fall_count(), 0, "the stale fall is dropped");
+        assert_eq!(world.entity_count(), 0, "the fall finished elsewhere");
+        assert_eq!(world.block_at(9, 4, 9), sand, "it landed on the grass");
     }
 
     #[test]

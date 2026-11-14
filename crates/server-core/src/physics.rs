@@ -22,7 +22,7 @@
 //! server has no entity simulation outside players, so a falling block is
 //! simulated as a block that moves down one cell per tick (`WorldState`), and
 //! its landing only applies the block physics (`onHitGround` damage to
-//! entities is not applied). See [`FallingBlock`](crate::world_state::FallingBlock).
+//! entities is not applied). See [`EntityKind::FallingBlock`](crate::entity::EntityKind).
 
 use bedrock_world::block_states::{self, Value};
 

@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
-    AddPlayerPacket, AvailableCommandsPacket, BlockPos, BossEventPacket, ChunkRadiusUpdatedPacket,
+    AddActorPacket, AddItemActorPacket, AddPlayerPacket, AvailableCommandsPacket, BlockPos,
+    BossEventPacket, ChunkRadiusUpdatedPacket, TakeItemActorPacket,
     CommandRequestPacket, CommandSpec, DisconnectPacket, LevelChunkPacket, LoginPacket,
     MetadataEntry, MetadataValue, MoveActorAbsolutePacket, MoveActorDeltaPacket, MovePlayerPacket,
     NetworkChunkPublisherUpdatePacket,
@@ -264,6 +265,12 @@ pub enum OutgoingPacket {
     SetTitle(SetTitlePacket),
     Transfer(TransferPacket),
     AddPlayer(AddPlayerPacket),
+    /// `Entity::sendSpawnPacket()` for non-player actors (falling blocks).
+    AddActor(AddActorPacket),
+    /// `ItemEntity::sendSpawnPacket()` (`AddItemActorPacket`).
+    AddItemActor(AddItemActorPacket),
+    /// `onPickUpItem`: the taker consumed an item entity.
+    TakeItemActor(TakeItemActorPacket),
     PlayerList(PlayerListPacket),
     SetActorData(SetActorDataPacket),
     MoveActorAbsolute(MoveActorAbsolutePacket),
@@ -298,6 +305,9 @@ impl OutgoingPacket {
             Self::SetTitle(p) => p.packet_id(),
             Self::Transfer(p) => p.packet_id(),
             Self::AddPlayer(p) => p.packet_id(),
+            Self::AddActor(p) => p.packet_id(),
+            Self::AddItemActor(p) => p.packet_id(),
+            Self::TakeItemActor(p) => p.packet_id(),
             Self::PlayerList(p) => p.packet_id(),
             Self::SetActorData(p) => p.packet_id(),
             Self::MoveActorAbsolute(p) => p.packet_id(),
@@ -334,6 +344,9 @@ impl OutgoingPacket {
             Self::SetTitle(p) => p.encode(writer),
             Self::Transfer(p) => p.encode(writer),
             Self::AddPlayer(p) => p.encode(writer),
+            Self::AddActor(p) => p.encode(writer),
+            Self::AddItemActor(p) => p.encode(writer),
+            Self::TakeItemActor(p) => p.encode(writer),
             Self::PlayerList(p) => p.encode(writer),
             Self::SetActorData(p) => p.encode(writer),
             Self::MoveActorAbsolute(p) => p.encode(writer),
@@ -2813,6 +2826,13 @@ impl PlayerSession {
                             y,
                             z,
                         });
+                        // `World::useBreakOn()`: `if($player->hasFiniteResources())
+                        // { $this->dropItem($pos->add(0.5, 0.5, 0.5), $item); }`.
+                        // Creative breaks leave nothing behind.
+                        if self.gamemode != 1 && block_id != AIR {
+                            self.world
+                                .drop_block_item(x, y, z, block_id, &self.username);
+                        }
                     }
                     // PM `breakBlock` starts by calling `stopBreakBlock($pos)`.
                     if let Some(handler) = self
@@ -4576,6 +4596,17 @@ pub struct SessionManager {
     /// (0x4A) to Bedrock sessions and Java `boss_bar` frames to
     /// virtual players through the `take_bossbar_frames` hook poll.
     bossbars: BossBarManager,
+    /// Per-entity network bookkeeping, `Entity::$viewers`:
+    /// which sessions already received the spawn packet and the last
+    /// position sent, so `sync_entities_locked` only emits the diff.
+    entity_views: RwLock<HashMap<i64, EntityView>>,
+}
+
+/// `Entity::$viewers` plus the last broadcast position.
+#[derive(Debug, Clone, Default)]
+struct EntityView {
+    viewers: HashSet<u64>,
+    sent: Option<Vector3f>,
 }
 
 impl Default for SessionManager {
@@ -4633,6 +4664,7 @@ impl SessionManager {
             global_scoreboard: RwLock::new(None),
             java_scoreboard_sent: RwLock::new(HashMap::new()),
             bossbars: BossBarManager::new(),
+            entity_views: RwLock::new(HashMap::new()),
         }
     }
 
@@ -8775,7 +8807,7 @@ impl SessionManager {
     /// handler's `__destruct`).
     pub fn update_break_handlers(&self) {
         let mut stops: Vec<(i32, i32, i32)> = Vec::new();
-        let mut completed: Vec<(String, i32, i32, i32)> = Vec::new();
+        let mut completed: Vec<(String, i32, i32, i32, String, i32)> = Vec::new();
         {
             let mut map = self.sessions.write();
             for session in map.values_mut() {
@@ -8817,9 +8849,11 @@ impl SessionManager {
                 // the same position is a no-op (`set_block` sees AIR).
                 let (x, y, z) = handler.pos;
                 let world_name = session.world.name.clone();
+                let username = session.username.clone();
+                let gamemode = session.gamemode;
                 session.break_handler = None;
                 debug!("break handler complete: ({},{},{}) breaking server-side", x, y, z);
-                completed.push((world_name, x, y, z));
+                completed.push((world_name, x, y, z, username, gamemode));
                 stops.push((x, y, z));
             }
         }
@@ -8829,9 +8863,13 @@ impl SessionManager {
         // Authoritative edit: `set_block` enqueues for both sync consumers
         // (Bedrock broadcast queue + Java `take_block_changes`), so the
         // other clients converge from the next `poll_block_changes` pass.
-        for (world_name, x, y, z) in completed {
+        for (world_name, x, y, z, username, gamemode) in completed {
             if world_name.is_empty() || world_name.eq_ignore_ascii_case(&self.world.name) {
-                let _ = self.world.set_block(x, y, z, AIR);
+                let broken = self.world.block_at(x, y, z);
+                if self.world.set_block(x, y, z, AIR) && gamemode != 1 && broken != AIR {
+                    // `World::useBreakOn()` drops the block's item form.
+                    self.world.drop_block_item(x, y, z, broken, &username);
+                }
             }
         }
     }
@@ -8853,7 +8891,7 @@ impl SessionManager {
         // `World::actuallyDoTick()` -> entity ticks: falling blocks move a cell
         // per tick and turn back into blocks on landing, so run them before
         // the broadcast poll ships this tick's edits.
-        let landed = self.world.tick_falling_blocks();
+        let landed = self.world.tick_entities();
         // `World::addSound()` / `addParticle()` level events queued by the
         // world itself (e.g. `AnvilFallSound` when an anvil lands).
         for (event_id, event_data, x, y, z) in self.world.take_pending_level_events() {
@@ -8861,6 +8899,9 @@ impl SessionManager {
         }
         self.apply_falling_block_damage(&landed);
         self.flush_actor_sounds();
+        // `World::actuallyDoTick()` -> `Entity::onUpdate()` for items/actors:
+        // spawn, move and despawn them for every viewer.
+        self.sync_entities();
         let block_changes = self.poll_block_changes();
         let virtual_queued = self.poll_virtual_players();
         let chunk_packets_queued = self.drive_chunk_requests();
@@ -9157,6 +9198,207 @@ impl SessionManager {
                 session.damage_player(damage);
             }
         }
+    }
+
+    /// `World::actuallyDoTick()` entity pass: spawns the entities a viewer can
+    /// now see (`Entity::spawnTo`), despawns the ones that left its loaded
+    /// chunks (`Entity::despawnFrom`) and forwards movement
+    /// (`Entity::broadcastMovement`), then resolves item pickups
+    /// (`ItemEntity::onCollideWithPlayer`).
+    pub fn sync_entities(&self) -> usize {
+        let mut map = self.sessions.write();
+        let mut queued = self.sync_entities_locked(&mut map);
+        queued += self.collect_item_pickups_locked(&mut map);
+        queued
+    }
+
+    fn sync_entities_locked(&self, map: &mut HashMap<u64, PlayerSession>) -> usize {
+        let entities = self.world.entities_snapshot();
+        if entities.is_empty() && self.entity_views.read().is_empty() {
+            return 0;
+        }
+        let live: HashSet<i64> = entities.iter().map(|entity| entity.unique_id).collect();
+        let mut views = self.entity_views.write();
+        let mut queued = 0usize;
+
+        // Entities that vanished (picked up, merged, despawned).
+        let gone: Vec<i64> = views
+            .keys()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        for unique_id in gone {
+            if let Some(view) = views.remove(&unique_id) {
+                for viewer_id in view.viewers {
+                    if let Some(viewer) = map.get_mut(&viewer_id) {
+                        viewer
+                            .pending_outgoing
+                            .push(OutgoingPacket::RemoveActor(RemoveActorPacket::new(unique_id)));
+                        queued += 1;
+                    }
+                }
+            }
+        }
+
+        for entity in &entities {
+            let chunk = (
+                (entity.position.x.floor() as i32) >> 4,
+                (entity.position.z.floor() as i32) >> 4,
+            );
+            let position = entity.offset_position();
+            let view = views.entry(entity.unique_id).or_default();
+
+            // `Entity::despawnFrom()`: a viewer that lost the chunk or left.
+            let stale: Vec<u64> = view
+                .viewers
+                .iter()
+                .copied()
+                .filter(|viewer_id| {
+                    map.get(viewer_id).map_or(true, |session| {
+                        !session.joined || session.is_dead || !session.sent_chunks.contains(&chunk)
+                    })
+                })
+                .collect();
+            for viewer_id in stale {
+                view.viewers.remove(&viewer_id);
+                if let Some(viewer) = map.get_mut(&viewer_id) {
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::RemoveActor(RemoveActorPacket::new(entity.unique_id)));
+                    queued += 1;
+                }
+            }
+
+            // `Entity::spawnTo()` for every session holding the chunk.
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead || !session.sent_chunks.contains(&chunk) {
+                    continue;
+                }
+                if view.viewers.contains(&session.session_id) {
+                    continue;
+                }
+                match &entity.kind {
+                    crate::entity::EntityKind::Item { item, .. } => {
+                        session.pending_outgoing.push(OutgoingPacket::AddItemActor(
+                            AddItemActorPacket::new(
+                                entity.unique_id,
+                                entity.runtime_id,
+                                item.clone(),
+                                position,
+                                Some(entity.motion),
+                                entity.metadata(),
+                            ),
+                        ));
+                    }
+                    crate::entity::EntityKind::FallingBlock { .. } => {
+                        session.pending_outgoing.push(OutgoingPacket::AddActor(
+                            AddActorPacket::new(
+                                entity.unique_id,
+                                entity.runtime_id,
+                                entity.network_type_id(),
+                                position,
+                                Some(entity.motion),
+                                entity.pitch,
+                                entity.yaw,
+                                entity.metadata(),
+                            ),
+                        ));
+                    }
+                }
+                view.viewers.insert(session.session_id);
+                queued += 1;
+            }
+
+            // `Entity::broadcastMovement()`: interpolated delta packets, like
+            // the virtual-player path.
+            if view.sent != Some(position) {
+                view.sent = Some(position);
+                let packet = MoveActorDeltaPacket::full_move(
+                    entity.runtime_id,
+                    position,
+                    entity.pitch,
+                    entity.yaw,
+                    entity.yaw,
+                );
+                for viewer_id in view.viewers.iter().copied() {
+                    if let Some(viewer) = map.get_mut(&viewer_id) {
+                        viewer
+                            .pending_outgoing
+                            .push(OutgoingPacket::MoveActorDelta(packet.clone()));
+                        queued += 1;
+                    }
+                }
+            }
+        }
+
+        views.retain(|unique_id, _| live.contains(unique_id));
+        queued
+    }
+
+    /// `ItemEntity::onCollideWithPlayer()`: the first player whose box touches
+    /// the item picks it up, `TakeItemActorPacket` goes to the item's viewers
+    /// and the entity despawns. Items in creative still enter the inventory
+    /// (`hasFiniteResources` only gates the "inventory full" cancellation).
+    fn collect_item_pickups_locked(&self, map: &mut HashMap<u64, PlayerSession>) -> usize {
+        let items: Vec<crate::entity::Entity> = self
+            .world
+            .entities_snapshot()
+            .into_iter()
+            .filter(|entity| {
+                matches!(entity.kind, crate::entity::EntityKind::Item { .. })
+                    && entity.pickup_delay() == 0
+            })
+            .collect();
+        if items.is_empty() {
+            return 0;
+        }
+        let mut queued = 0usize;
+        for entity in items {
+            let crate::entity::EntityKind::Item { item, .. } = &entity.kind else {
+                continue;
+            };
+            let mut taker: Option<(u64, u64)> = None;
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead {
+                    continue;
+                }
+                let dx = (session.position.x - entity.position.x).abs();
+                let dz = (session.position.z - entity.position.z).abs();
+                let dy = session.position.y - entity.position.y;
+                if dx > 0.9 || dz > 0.9 || dy < -0.5 || dy > 1.0 {
+                    continue;
+                }
+                if session.inventory.add_item(item) != 0 {
+                    continue;
+                }
+                session.sync_inventory();
+                taker = Some((session.session_id, session.entity_runtime_id));
+                break;
+            }
+            let Some((taker_id, taker_runtime_id)) = taker else {
+                continue;
+            };
+            if !self.world.remove_entity(entity.unique_id) {
+                continue;
+            }
+            let packet = TakeItemActorPacket::new(entity.runtime_id, taker_runtime_id);
+            let mut recipients: HashSet<u64> = self
+                .entity_views
+                .read()
+                .get(&entity.unique_id)
+                .map(|view| view.viewers.clone())
+                .unwrap_or_default();
+            recipients.insert(taker_id);
+            for viewer_id in recipients {
+                if let Some(viewer) = map.get_mut(&viewer_id) {
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::TakeItemActor(packet));
+                    queued += 1;
+                }
+            }
+        }
+        queued
     }
 
     /// `Entity::broadcastSound()` for every sound queued by a session: one
@@ -11501,7 +11743,9 @@ mod engine_physics_tests {
         // 10 blocks above the victim, in the air: it falls on its own.
         let anvil = bedrock_world::block_states::network_id("anvil").unwrap();
         assert!(manager.world().set_block(0, 14, 0, anvil));
-        for _ in 0..12 {
+        // Gravity/drag reaches ~0.98 blocks per tick, so 10 blocks take a
+        // couple of dozen ticks (the old one-cell-per-tick port needed 10).
+        for _ in 0..40 {
             manager.tick();
         }
 
@@ -11545,5 +11789,110 @@ mod engine_physics_tests {
             !has_packet_id(viewer, UPDATE_BLOCK_PACKET_ID as u8),
             "no per-block UpdateBlockPacket once the column is resent"
         );
+    }
+
+    #[test]
+    fn a_survival_break_drops_an_item_the_player_can_pick_up() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut player = joined(1, &[(0, 0)]);
+        player.world = Arc::clone(manager.world());
+        player.gamemode = 0;
+        player.position = Vector3f::new(2.5, 4.0, 2.5);
+        manager.add_session(player);
+
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        assert!(manager.world().set_block(2, 4, 2, stone));
+        manager.poll_block_changes();
+        // `PREDICT_DESTROY_BLOCK` -> `World::useBreakOn()` -> `dropItem()`.
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1).unwrap().apply_block_actions(vec![PlayerBlockAction {
+                action_type: BLOCK_ACTION_PREDICT_DESTROY,
+                position: Some((2, 4, 2)),
+                face: Some(1),
+            }]);
+        }
+        assert_eq!(manager.world().entity_count(), 1, "an ItemEntity was spawned");
+
+        // The spawn reaches the viewer holding the chunk...
+        manager.sync_entities();
+        {
+            let map = manager.sessions.read();
+            let add = map[&1]
+                .pending_outgoing
+                .iter()
+                .find_map(|packet| match packet {
+                    OutgoingPacket::AddItemActor(packet) => Some(packet.clone()),
+                    _ => None,
+                })
+                .expect("AddItemActorPacket for the drop");
+            assert_eq!(add.item.network_id, 1, "stone");
+            assert_eq!(add.item.count, 1);
+        }
+
+        // ...and after its 10-tick pickup delay it enters the inventory.
+        for _ in 0..20 {
+            manager.tick();
+        }
+        assert_eq!(manager.world().entity_count(), 0, "the item was picked up");
+        let map = manager.sessions.read();
+        assert!(map[&1]
+            .inventory
+            .slots()
+            .iter()
+            .any(|slot| slot.network_id == 1 && slot.count == 1));
+        assert!(map[&1]
+            .pending_outgoing
+            .iter()
+            .any(|packet| matches!(packet, OutgoingPacket::TakeItemActor(_))));
+    }
+
+    #[test]
+    fn a_falling_block_is_an_actor_and_turns_back_into_a_block() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut viewer = joined(1, &[(0, 0)]);
+        viewer.world = Arc::clone(manager.world());
+        manager.add_session(viewer);
+
+        let sand = bedrock_world::block_states::network_id("sand").unwrap();
+        // Placing it in the air makes `FallableTrait::onNearbyBlockChange()`
+        // spawn the entity immediately.
+        assert!(manager.world().set_block(0, 14, 0, sand));
+        assert_eq!(manager.world().entity_count(), 1);
+
+        manager.tick();
+        {
+            let map = manager.sessions.read();
+            let add = map[&1]
+                .pending_outgoing
+                .iter()
+                .find_map(|packet| match packet {
+                    OutgoingPacket::AddActor(packet) => Some(packet.clone()),
+                    _ => None,
+                })
+                .expect("AddActorPacket for the falling block");
+            assert_eq!(add.type_id, "minecraft:falling_block");
+            assert!(add
+                .metadata
+                .iter()
+                .any(|entry| entry.key == 2
+                    && entry.value == MetadataValue::Int(sand as i32)));
+        }
+
+        for _ in 0..40 {
+            manager.tick();
+        }
+        assert_eq!(manager.world().entity_count(), 0);
+        assert_eq!(manager.world().block_at(0, 4, 0), sand, "it landed");
+        {
+            let map = manager.sessions.read();
+            assert!(
+                map[&1]
+                    .pending_outgoing
+                    .iter()
+                    .any(|packet| matches!(packet, OutgoingPacket::RemoveActor(_))),
+                "the actor is despawned once it turns back into a block"
+            );
+        }
     }
 }

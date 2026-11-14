@@ -7,6 +7,7 @@ pub mod bossbar;
 pub mod chat;
 pub mod crafting;
 pub mod command;
+pub mod entity;
 pub mod config;
 pub mod crash;
 pub mod identity;
@@ -34,6 +35,7 @@ pub use crafting::{
     CraftingGrid, CraftingInventory, CraftingManager, CraftingTableInventory,
     PlayerCraftingInventory, RecipeIngredient, ShapedRecipe, ShapelessRecipe,
 };
+pub use entity::{Aabb, Entity, EntityKind, EntitySize};
 pub use identity::{parse_login_identity, LoginIdentity};
 pub use bossbar::{BossBar, BossBarManager, DiverseBossBar};
 pub use physics::{

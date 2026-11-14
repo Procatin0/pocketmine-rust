@@ -119,7 +119,7 @@ pub struct EntityLink {
 }
 
 impl EntityLink {
-    fn encode(&self, writer: &mut Writer) {
+    pub fn encode_payload(&self, writer: &mut Writer) {
         writer.write_var_i64(self.from_actor_unique_id);
         writer.write_var_i64(self.to_actor_unique_id);
         writer.write_byte(self.link_type);
@@ -128,7 +128,7 @@ impl EntityLink {
         writer.write_f32_le(self.vehicle_angular_velocity);
     }
 
-    fn decode(reader: &mut Reader) -> Result<Self, CodecError> {
+    pub fn decode_payload(reader: &mut Reader) -> Result<Self, CodecError> {
         Ok(Self {
             from_actor_unique_id: reader.read_var_i64()?,
             to_actor_unique_id: reader.read_var_i64()?,
@@ -226,7 +226,7 @@ impl AddPlayerPacket {
         self.abilities.encode(writer);
         writer.write_var_u32(self.links.len() as u32);
         for link in &self.links {
-            link.encode(writer);
+            link.encode_payload(writer);
         }
         // passengerBlockData: optional, absent
         writer.write_bool(false);
@@ -254,7 +254,7 @@ impl AddPlayerPacket {
         let link_count = reader.read_var_u32()?;
         let mut links = Vec::with_capacity(link_count as usize);
         for _ in 0..link_count {
-            links.push(EntityLink::decode(reader)?);
+            links.push(EntityLink::decode_payload(reader)?);
         }
         let has_passenger_block = reader.read_bool()?;
         if has_passenger_block {
