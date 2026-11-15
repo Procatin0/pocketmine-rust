@@ -350,10 +350,13 @@ where
         }?;
         let value = match facing {
             UP => "top",
-            WEST => "west",
-            EAST => "east",
-            NORTH => "north",
-            SOUTH => "south",
+            // `ValueMappings::$torchFacing`: the horizontal directions are
+            // serialized flipped (MCPE-152036), so a torch pointing west is
+            // stored as `east`.
+            WEST => "east",
+            EAST => "west",
+            NORTH => "south",
+            SOUTH => "north",
             _ => return None,
         };
         return Some(
@@ -404,11 +407,14 @@ where
             // full block on the face it hangs from, a floor torch by a block
             // with centre support below.
             let direction = string_property(id, "torch_facing_direction").unwrap_or("top");
+            // `ValueMappings::$torchFacing` serializes the *horizontal* facing
+            // flipped (MCPE-152036), so the string names the side the torch is
+            // attached to, not the way it points.
             let face = match direction {
-                "west" => EAST,
-                "east" => WEST,
-                "north" => SOUTH,
-                "south" => NORTH,
+                "west" => WEST,
+                "east" => EAST,
+                "north" => NORTH,
+                "south" => SOUTH,
                 _ => DOWN,
             };
             let required = if face == DOWN {
@@ -707,8 +713,9 @@ mod tests {
             air()
         }));
         assert!(!is_supported(torch, |_, _, _| air()));
-        // A wall torch is supported by a full block on the wall side.
-        let wall = block_states::with_property(torch, "torch_facing_direction", "west")
+        // A wall torch is supported by a full block on the wall side; the
+        // state string names that side.
+        let wall = block_states::with_property(torch, "torch_facing_direction", "east")
             .expect("torch has a facing property");
         assert!(is_supported(wall, |dx, dy, dz| if (dx, dy, dz) == (1, 0, 0) {
             stone
@@ -808,13 +815,27 @@ mod tests {
             Some("top")
         );
         // Clicking a side face: a wall torch hanging from the clicked block.
+        // The stored value is the flipped (`ValueMappings::$torchFacing`)
+        // horizontal facing, i.e. the side the torch is attached to.
         let wall =
             state_for_placement(torch, WEST, |dx, _, _| if dx == 1 { stone } else { air() })
                 .expect("placeable on a wall");
         assert_eq!(
             string_property(wall, "torch_facing_direction"),
-            Some("west")
+            Some("east")
         );
+        // That state agrees with `is_supported()`: the block it was clicked
+        // against keeps it there, and nothing else does.
+        assert!(is_supported(wall, |dx, _, _| if dx == 1 {
+            stone
+        } else {
+            air()
+        }));
+        assert!(!is_supported(wall, |dx, _, _| if dx == -1 {
+            stone
+        } else {
+            air()
+        }));
         // No support anywhere: the reference refuses the placement.
         assert!(state_for_placement(torch, UP, |_, _, _| air()).is_none());
         // Torches may not face DOWN either.
