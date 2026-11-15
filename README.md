@@ -1,7 +1,7 @@
-# ⚡ PocketMine-Rust (Axolotl-PM)
+# ⚡ AmberPM (PocketMine-Rust)
 
 <p align="center">
-  <img src="architecture.svg" alt="PocketMine-Rust Architecture" width="700"/>
+  <img src="architecture.svg" alt="AmberPM Architecture" width="700"/>
 </p>
 
 <p align="center">
@@ -17,11 +17,17 @@
   <a href="docs/wiki/"><img src="https://img.shields.io/badge/docs-wiki-blueviolet?style=flat-square" alt="Documentation"/></a>
 </p>
 
+> [!WARNING]
+> ### ❌ AmberPM is NOT a vanilla Minecraft server software.
+> It is designed primarily for custom game modes, minigames, and lobby servers. AmberPM implements selected native gameplay mechanics, including redstone circuits, pistons, dispensers, and droppers, but it is not a complete vanilla survival implementation (for example, full vanilla mob AI and vanilla world generation are not provided).
+>
+> If you are trying to host a purely vanilla survival multiplayer server, please use the [official Minecraft: Bedrock server software](https://minecraft.net/download/server/bedrock).
+
 ---
 
 ## 🌟 Overview / Descripción General
 
-**PocketMine-Rust (Axolotl-PM)** is an ultra-fast, cross-platform Minecraft server engine built from the ground up in **Rust**. It eliminates the single-threaded bottlenecks and garbage collection pauses typical of traditional PHP and Java server implementations while preserving 100% compatibility with **PocketMine-MP 5** plugins and allowing **Minecraft Bedrock and Java Edition** players to play together natively without third-party proxies.
+**AmberPM** (PocketMine-Rust / Axolotl-PM) is an ultra-fast, cross-platform Minecraft server engine built from the ground up in **Rust**. It eliminates the single-threaded bottlenecks and garbage collection pauses typical of traditional PHP and Java server implementations while preserving 100% compatibility with **PocketMine-MP 5** plugins and allowing **Minecraft Bedrock and Java Edition** players to play together natively without third-party proxies.
 
 > 🇪🇸 **En español:** Servidor de Minecraft de alto rendimiento escrito en Rust nativo, con soporte simultáneo para clientes Bedrock y Java (cross-play integrado sin proxies externos) y compatibilidad con plugins de PocketMine-MP 5 en PHP 8.2.
 
