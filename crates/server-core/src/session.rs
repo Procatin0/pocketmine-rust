@@ -3122,6 +3122,18 @@ impl PlayerSession {
             self.revert_predicted_placement(x, z);
             return;
         }
+        // PM `Block::getStateForPlacement()` (`Torch::place()`, `Lantern::place()`):
+        // the item only carries its own block state (`blockRuntimeId`), which
+        // for a torch is the fixed `unknown` variant. The placed state depends
+        // on the clicked face and the support around the target cell.
+        let Some(block_id) =
+            physics::state_for_placement(block_id, use_item.face as i32, |dx, dy, dz| {
+                self.world.block_at(x + dx, y + dy, z + dz)
+            })
+        else {
+            self.revert_predicted_placement(x, z);
+            return;
+        };
         // PM `Block::canBePlacedAt()`: blocks using `StaticSupportTrait`
         // (torch, lantern, sapling, snow layer, ...) refuse a placement with
         // no support around the target cell.
@@ -11866,6 +11878,42 @@ mod engine_physics_tests {
             .pending_outgoing
             .iter()
             .any(|packet| matches!(packet, OutgoingPacket::TakeItemActor(_))));
+    }
+
+    #[test]
+    fn a_placed_floor_torch_breaks_when_its_support_is_removed() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut viewer = joined(1, &[(0, 0)]);
+        viewer.world = Arc::clone(manager.world());
+        manager.add_session(viewer);
+
+        // `handle_use_item_place` state: clicking the top face of the grass
+        // block at y = 3, with the new cell at y = 4.
+        let torch = bedrock_world::block_states::network_id("torch").unwrap();
+        let state = physics::state_for_placement(torch, physics::UP, |dx, dy, dz| {
+            manager.world().block_at(1 + dx, 4 + dy, 1 + dz)
+        })
+        .expect("a torch can stand on grass");
+        assert_eq!(
+            Some(state),
+            bedrock_world::block_states::with_property(
+                torch,
+                "torch_facing_direction",
+                "top"
+            ),
+            "a torch placed on the ground is the `top` variant, not `unknown`"
+        );
+        assert!(manager.world().set_block(1, 4, 1, state));
+        manager.tick();
+
+        // `StaticSupportTrait::onNearbyBlockChange()` after the player breaks
+        // the block it stands on.
+        assert!(manager.world().set_block(1, 3, 1, AIR));
+        assert_eq!(
+            manager.world().block_at(1, 4, 1),
+            AIR,
+            "the torch must fall off with its support"
+        );
     }
 
     #[test]

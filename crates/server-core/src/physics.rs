@@ -110,12 +110,12 @@ pub fn support_type(id: u32, facing: i32) -> SupportType {
         return SupportType::Full;
     }
     if name.ends_with("_slab") {
-        // `Slab::getSupportType()`: a single slab only supports upwards from
-        // its solid half (`FULL` towards that face, `NONE` elsewhere).
+        // `Slab::getSupportType()`: a bottom slab supports upwards
+        // (`FULL` towards UP), a top slab supports downwards.
         return match string_property(id, "minecraft:vertical_half") {
-            Some("top") if facing == UP => SupportType::Full,
+            Some("top") if facing == DOWN => SupportType::Full,
             Some("top") => SupportType::None,
-            _ if facing == DOWN => SupportType::Full,
+            _ if facing == UP => SupportType::Full,
             _ => SupportType::None,
         };
     }
@@ -300,6 +300,86 @@ where
 {
     let (dx, dy, dz) = offset(face);
     block_states::state_name(at(dx, dy, dz))
+}
+
+/// `Torch::place()` / `Lantern::place()`: the concrete state a block takes when
+/// placed against `face`.
+///
+/// Bedrock only sends the held item's own block state
+/// (`ItemStack::blockRuntimeId`), and for a torch that state is
+/// `torch_facing_direction: "unknown"` - a fixed variant, not the state the
+/// placement should produce. PocketMine resolves it server-side in
+/// `Block::getStateForPlacement()`; without this every placed torch rendered
+/// as a wall torch (the `unknown` state) and stopped noticing that the block
+/// under it was gone, which is also why it no longer broke with its support.
+///
+/// `at(dx, dy, dz)` answers block ids relative to the target cell. Returns
+/// `None` when the reference would refuse the placement.
+pub fn state_for_placement<F>(block_id: u32, face: i32, at: F) -> Option<u32>
+where
+    F: Fn(i32, i32, i32) -> u32,
+{
+    let Some(name) = block_states::state_name(block_id) else {
+        // Custom/unknown block: keep the id the caller brought.
+        return Some(block_id);
+    };
+    if matches!(
+        name,
+        "torch" | "soul_torch" | "copper_torch" | "underwater_torch"
+    ) {
+        // `Torch::place()`: `canBeSupportedAt($blockReplace, $face)` for
+        // `opposite($facing)`; a centre-support block below, a full block on
+        // any horizontal side.
+        let supported = |side: i32| {
+            let (dx, dy, dz) = offset(side);
+            let neighbour = at(dx, dy, dz);
+            if side == DOWN {
+                support_type(neighbour, UP).has_center_support()
+            } else {
+                support_type(neighbour, opposite(side)) == SupportType::Full
+            }
+        };
+        // The clicked face first, then the reference's fallback order.
+        let facing = if face != DOWN && supported(opposite(face)) {
+            Some(face)
+        } else {
+            [SOUTH, WEST, NORTH, EAST, DOWN]
+                .into_iter()
+                .find(|side| supported(*side))
+                .map(opposite)
+        }?;
+        let value = match facing {
+            UP => "top",
+            WEST => "west",
+            EAST => "east",
+            NORTH => "north",
+            SOUTH => "south",
+            _ => return None,
+        };
+        return Some(
+            block_states::with_property(block_id, "torch_facing_direction", value)
+                .unwrap_or(block_id),
+        );
+    }
+    if matches!(name, "lantern" | "soul_lantern" | "copper_lantern") {
+        // `Lantern::place()`: needs centre support below or above, and hangs
+        // whenever it is placed on a ceiling or the floor gives none.
+        let down_support = support_type(at(0, -1, 0), UP).has_center_support();
+        let up_support = support_type(at(0, 1, 0), DOWN).has_center_support();
+        if !down_support && !up_support {
+            return None;
+        }
+        let hanging = face == DOWN || !down_support;
+        return Some(
+            block_states::with_property(
+                block_id,
+                "hanging",
+                if hanging { "true" } else { "false" },
+            )
+            .unwrap_or(block_id),
+        );
+    }
+    Some(block_id)
 }
 
 /// `canBeSupportedAt($block)` for one block: `at(dx, dy, dz)` answers block ids
@@ -707,11 +787,56 @@ mod tests {
         let stone = id("stone");
         assert_eq!(support_type(stone, UP), SupportType::Full);
         let bottom = id("oak_slab");
-        assert_eq!(support_type(bottom, DOWN), SupportType::Full);
-        assert_eq!(support_type(bottom, UP), SupportType::None);
+        // `Slab::getSupportType()`: a bottom slab supports upwards.
+        assert_eq!(support_type(bottom, UP), SupportType::Full);
+        assert_eq!(support_type(bottom, DOWN), SupportType::None);
         let top = block_states::with_property(bottom, "minecraft:vertical_half", "top").unwrap();
-        assert_eq!(support_type(top, UP), SupportType::Full);
-        assert_eq!(support_type(top, DOWN), SupportType::None);
+        assert_eq!(support_type(top, DOWN), SupportType::Full);
+        assert_eq!(support_type(top, UP), SupportType::None);
+    }
+
+    #[test]
+    fn a_placed_torch_takes_its_facing_from_the_clicked_face() {
+        let stone = id("stone");
+        let torch = id("torch");
+        // Clicking the top face of a block: a floor torch supported below.
+        let top =
+            state_for_placement(torch, UP, |_, dy, _| if dy == -1 { stone } else { air() })
+                .expect("placeable on top");
+        assert_eq!(
+            string_property(top, "torch_facing_direction"),
+            Some("top")
+        );
+        // Clicking a side face: a wall torch hanging from the clicked block.
+        let wall =
+            state_for_placement(torch, WEST, |dx, _, _| if dx == 1 { stone } else { air() })
+                .expect("placeable on a wall");
+        assert_eq!(
+            string_property(wall, "torch_facing_direction"),
+            Some("west")
+        );
+        // No support anywhere: the reference refuses the placement.
+        assert!(state_for_placement(torch, UP, |_, _, _| air()).is_none());
+        // Torches may not face DOWN either.
+        assert!(state_for_placement(torch, DOWN, |_, _, _| air()).is_none());
+    }
+
+    #[test]
+    fn a_lantern_hangs_from_a_ceiling_and_stands_on_a_floor() {
+        let stone = id("stone");
+        let lantern = id("lantern");
+        let hanging = state_for_placement(lantern, DOWN, |_, dy, _| if dy == 1 { stone } else { air() })
+            .expect("placeable under a block");
+        assert_eq!(
+            block_states::bool_property(hanging, "hanging"),
+            Some(true)
+        );
+        let floor = state_for_placement(lantern, UP, |_, dy, _| if dy == -1 { stone } else { air() })
+            .expect("placeable on the floor");
+        assert_eq!(
+            block_states::bool_property(floor, "hanging"),
+            Some(false)
+        );
     }
 
     #[test]
