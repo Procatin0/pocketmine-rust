@@ -1200,6 +1200,61 @@ namespace pocketmine\event\player {
             ];
         }
     }
+
+    class PlayerEntityInteractEvent extends PlayerEvent implements Cancellable
+    {
+        protected \pocketmine\entity\Entity $entity;
+
+        public function __construct(Player $player, \pocketmine\entity\Entity $entity)
+        {
+            parent::__construct($player);
+            $this->entity = $entity;
+        }
+
+        public function getEntity(): \pocketmine\entity\Entity
+        {
+            return $this->entity;
+        }
+    }
+
+    class PlayerPostChunkSendEvent extends PlayerEvent
+    {
+        protected int $chunkX;
+        protected int $chunkZ;
+
+        public function __construct(Player $player, int $chunkX, int $chunkZ)
+        {
+            parent::__construct($player);
+            $this->chunkX = $chunkX;
+            $this->chunkZ = $chunkZ;
+        }
+
+        public function getChunkX(): int
+        {
+            return $this->chunkX;
+        }
+
+        public function getChunkZ(): int
+        {
+            return $this->chunkZ;
+        }
+    }
+
+    class PlayerToggleSneakEvent extends PlayerEvent implements Cancellable
+    {
+        protected bool $isSneaking;
+
+        public function __construct(Player $player, bool $isSneaking)
+        {
+            parent::__construct($player);
+            $this->isSneaking = $isSneaking;
+        }
+
+        public function isSneaking(): bool
+        {
+            return $this->isSneaking;
+        }
+    }
 }
 
 namespace pocketmine\event\block {
@@ -1397,5 +1452,291 @@ namespace pocketmine\event\server {
 
     class ServerCommandEvent extends CommandEvent
     {
+    }
+
+    class DataPacketReceiveEvent extends Event implements Cancellable
+    {
+        protected mixed $origin;
+        protected mixed $packet;
+
+        public function __construct(mixed $origin, mixed $packet)
+        {
+            $this->origin = $origin;
+            $this->packet = $packet;
+        }
+
+        public function getOrigin(): mixed
+        {
+            return $this->origin;
+        }
+
+        public function getPacket(): mixed
+        {
+            return $this->packet;
+        }
+    }
+
+    class DataPacketSendEvent extends Event implements Cancellable
+    {
+        protected array $targets;
+        protected array $packets;
+
+        public function __construct(array $targets, array $packets)
+        {
+            $this->targets = $targets;
+            $this->packets = $packets;
+        }
+
+        public function getTargets(): array
+        {
+            return $this->targets;
+        }
+
+        public function getPackets(): array
+        {
+            return $this->packets;
+        }
+    }
+}
+
+namespace pocketmine\event\entity {
+    use pocketmine\entity\Entity;
+    use pocketmine\event\Cancellable;
+    use pocketmine\event\Event;
+
+    abstract class EntityEvent extends Event
+    {
+        protected Entity $entity;
+
+        public function __construct(Entity $entity)
+        {
+            $this->entity = $entity;
+        }
+
+        public function getEntity(): Entity
+        {
+            return $this->entity;
+        }
+    }
+
+    class EntityDeathEvent extends EntityEvent
+    {
+        /** @var \pocketmine\item\Item[] */
+        protected array $drops = [];
+        protected int $xp = 0;
+
+        public function __construct(Entity $entity, array $drops = [], int $xp = 0)
+        {
+            parent::__construct($entity);
+            $this->drops = $drops;
+            $this->xp = $xp;
+        }
+
+        /** @return \pocketmine\item\Item[] */
+        public function getDrops(): array
+        {
+            return $this->drops;
+        }
+
+        public function setDrops(array $drops): void
+        {
+            $this->drops = $drops;
+        }
+
+        public function getXpDropAmount(): int
+        {
+            return $this->xp;
+        }
+
+        public function setXpDropAmount(int $xp): void
+        {
+            $this->xp = $xp;
+        }
+    }
+
+    class EntityDamageEvent extends EntityEvent implements Cancellable
+    {
+        public const CAUSE_CONTACT = 0;
+        public const CAUSE_ENTITY_ATTACK = 1;
+        public const CAUSE_PROJECTILE = 2;
+        public const CAUSE_SUFFOCATION = 3;
+        public const CAUSE_FALL = 4;
+        public const CAUSE_FIRE = 5;
+        public const CAUSE_FIRE_TICK = 6;
+        public const CAUSE_LAVA = 7;
+        public const CAUSE_DROWNING = 8;
+        public const CAUSE_BLOCK_EXPLOSION = 9;
+        public const CAUSE_ENTITY_EXPLOSION = 10;
+        public const CAUSE_VOID = 11;
+        public const CAUSE_SUICIDE = 12;
+        public const CAUSE_MAGIC = 13;
+        public const CAUSE_CUSTOM = 14;
+        public const CAUSE_STARVATION = 15;
+
+        protected float $baseDamage = 0.0;
+        protected int $cause = 0;
+
+        public function __construct(Entity $entity, int $cause, float $baseDamage)
+        {
+            parent::__construct($entity);
+            $this->cause = $cause;
+            $this->baseDamage = $baseDamage;
+        }
+
+        public function getCause(): int
+        {
+            return $this->cause;
+        }
+
+        public function getBaseDamage(): float
+        {
+            return $this->baseDamage;
+        }
+
+        public function setBaseDamage(float $damage): void
+        {
+            $this->baseDamage = $damage;
+        }
+
+        public function getFinalDamage(): float
+        {
+            return $this->baseDamage;
+        }
+    }
+
+    class EntityDamageByEntityEvent extends EntityDamageEvent
+    {
+        protected Entity $damager;
+
+        public function __construct(Entity $damager, Entity $entity, int $cause, float $baseDamage)
+        {
+            parent::__construct($entity, $cause, $baseDamage);
+            $this->damager = $damager;
+        }
+
+        public function getDamager(): Entity
+        {
+            return $this->damager;
+        }
+    }
+
+    class EntityDamageByChildEntityEvent extends EntityDamageByEntityEvent
+    {
+        protected Entity $child;
+
+        public function __construct(Entity $damager, Entity $child, Entity $entity, int $cause, float $baseDamage)
+        {
+            parent::__construct($damager, $entity, $cause, $baseDamage);
+            $this->child = $child;
+        }
+
+        public function getChild(): Entity
+        {
+            return $this->child;
+        }
+    }
+
+    class EntitySpawnEvent extends EntityEvent
+    {
+    }
+
+    class EntityDespawnEvent extends EntityEvent
+    {
+    }
+
+    class EntityTeleportEvent extends EntityEvent implements Cancellable
+    {
+        protected \pocketmine\world\Location $from;
+        protected \pocketmine\world\Location $to;
+
+        public function __construct(Entity $entity, \pocketmine\world\Location $from, \pocketmine\world\Location $to)
+        {
+            parent::__construct($entity);
+            $this->from = $from;
+            $this->to = $to;
+        }
+
+        public function getFrom(): \pocketmine\world\Location
+        {
+            return $this->from;
+        }
+
+        public function getTo(): \pocketmine\world\Location
+        {
+            return $this->to;
+        }
+
+        public function setTo(\pocketmine\world\Location $to): void
+        {
+            $this->to = $to;
+        }
+    }
+
+    class EntityPreExplodeEvent extends EntityEvent implements Cancellable
+    {
+        protected float $radius;
+        protected array $blockBreakList = [];
+
+        public function __construct(Entity $entity, float $radius)
+        {
+            parent::__construct($entity);
+            $this->radius = $radius;
+        }
+
+        public function getRadius(): float
+        {
+            return $this->radius;
+        }
+
+        public function setRadius(float $radius): void
+        {
+            $this->radius = $radius;
+        }
+
+        public function getBlockList(): array
+        {
+            return $this->blockBreakList;
+        }
+
+        public function setBlockList(array $list): void
+        {
+            $this->blockBreakList = $list;
+        }
+    }
+
+    class ProjectileLaunchEvent extends EntityEvent implements Cancellable
+    {
+    }
+
+    class ProjectileHitEvent extends EntityEvent
+    {
+        protected mixed $rayTraceResult = null;
+
+        public function __construct(Entity $entity, mixed $rayTraceResult = null)
+        {
+            parent::__construct($entity);
+            $this->rayTraceResult = $rayTraceResult;
+        }
+
+        public function getRayTraceResult(): mixed
+        {
+            return $this->rayTraceResult;
+        }
+    }
+
+    class ProjectileHitEntityEvent extends ProjectileHitEvent
+    {
+        protected Entity $entityHit;
+
+        public function __construct(Entity $projectile, Entity $entityHit, mixed $rayTraceResult = null)
+        {
+            parent::__construct($projectile, $rayTraceResult);
+            $this->entityHit = $entityHit;
+        }
+
+        public function getEntityHit(): Entity
+        {
+            return $this->entityHit;
+        }
     }
 }

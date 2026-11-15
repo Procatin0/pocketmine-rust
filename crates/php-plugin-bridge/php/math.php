@@ -527,6 +527,19 @@ namespace pocketmine\world {
             return new Position($this->x, $this->y, $this->z, $this->getWorldName());
         }
 
+        public static function fromObject(Vector3 $pos, mixed $world = null, float $yaw = 0.0, float $pitch = 0.0): Location
+        {
+            $worldName = '';
+            if (is_object($world) && method_exists($world, 'getFolderName')) {
+                $worldName = $world->getFolderName();
+            } elseif (is_string($world)) {
+                $worldName = $world;
+            } elseif ($pos instanceof Position) {
+                $worldName = $pos->getWorldName();
+            }
+            return new Location($pos->x, $pos->y, $pos->z, $yaw, $pitch, $worldName);
+        }
+
         public function __toString(): string
         {
             return 'Location(x=' . $this->x . ',y=' . $this->y . ',z=' . $this->z

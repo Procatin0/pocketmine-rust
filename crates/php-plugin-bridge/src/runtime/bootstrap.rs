@@ -17,6 +17,7 @@ pub const PHP_RUNTIME_FILES: &[(&str, &str)] = &[
     ("text.php", include_str!("../../php/text.php")),
     ("permission.php", include_str!("../../php/permission.php")),
     ("config.php", include_str!("../../php/config.php")),
+    ("thread.php", include_str!("../../php/thread.php")),
     ("scheduler.php", include_str!("../../php/scheduler.php")),
     ("command.php", include_str!("../../php/command.php")),
     ("item.php", include_str!("../../php/item.php")),
@@ -25,7 +26,6 @@ pub const PHP_RUNTIME_FILES: &[(&str, &str)] = &[
     ("scoreboard.php", include_str!("../../php/scoreboard.php")),
     ("bossbar.php", include_str!("../../php/bossbar.php")),
     ("chat.php", include_str!("../../php/chat.php")),
-    ("thread.php", include_str!("../../php/thread.php")),
     ("core.php", include_str!("../../php/core.php")),
     ("event.php", include_str!("../../php/event.php")),
     // After `event.php`/`player.php`: extends `Event` and uses `EventData`.

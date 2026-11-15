@@ -21,7 +21,7 @@ namespace pocketmine\scheduler {
         {
         }
 
-        abstract public function onRun(int $currentTick): void;
+        abstract public function onRun(): void;
 
         public function onCancel(): void
         {
@@ -84,9 +84,9 @@ namespace pocketmine\scheduler {
             return $this->closure;
         }
 
-        public function onRun(int $currentTick): void
+        public function onRun(): void
         {
-            ($this->closure)($currentTick);
+            ($this->closure)();
         }
 
         public function onCancel(): void
@@ -228,7 +228,7 @@ namespace pocketmine\scheduler {
 
             $this->running = true;
             try {
-                $this->task->onRun($currentTick);
+                $this->task->onRun();
             } catch (CancelTaskException) {
                 $this->cancel();
                 return true;
@@ -759,6 +759,13 @@ namespace pocketmine\scheduler {
 
         public function start(int $options = 0): bool
         {
+            if (is_subclass_of($this, \pmmp\thread\Worker::class)) {
+                try {
+                    return parent::start($options);
+                } catch (\Throwable) {
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -766,13 +773,27 @@ namespace pocketmine\scheduler {
         {
             $this->terminated = true;
             try {
+                if (method_exists($this, 'shutdown')) {
+                    $this->shutdown();
+                }
+            } catch (\Throwable) {
+            }
+            try {
                 parent::quit();
             } catch (\Throwable) {
             }
         }
 
-        public function collect(): void
+        public function collect(?callable $collector = null): int
         {
+            if (is_subclass_of($this, \pmmp\thread\Worker::class)) {
+                try {
+                    return parent::collect($collector);
+                } catch (\Throwable) {
+                    return 0;
+                }
+            }
+            return 0;
         }
     }
 

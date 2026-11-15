@@ -429,6 +429,11 @@ namespace pocketmine\plugin {
     {
         protected Plugin $owningPlugin;
 
+        public function __construct(Plugin $owningPlugin)
+        {
+            $this->owningPlugin = $owningPlugin;
+        }
+
         public function getOwningPlugin(): Plugin
         {
             return $this->owningPlugin;

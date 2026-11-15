@@ -24,13 +24,27 @@ namespace pocketmine\item {
         /** @var array<string,mixed> NBT stub (p. ej. can_place_on, lore) */
         private array $nbt = [];
         private int $damage = 0;
+        protected int $id = 0;
+        protected int $meta = 0;
+        protected int $count = 1;
+        protected ?string $customName = null;
 
         public function __construct(
-            private int $id = 0,
-            private int $meta = 0,
-            private int $count = 1,
-            private ?string $customName = null
+            mixed $id = 0,
+            mixed $meta = 0,
+            int $count = 1,
+            ?string $customName = null
         ) {
+            if ($id instanceof ItemIdentifier) {
+                $this->id = $id->getId();
+                $this->meta = $id->getMeta();
+                $this->customName = is_string($meta) ? $meta : $customName;
+            } else {
+                $this->id = (int)$id;
+                $this->meta = (int)$meta;
+                $this->count = $count;
+                $this->customName = $customName;
+            }
         }
 
         public function getId(): int
@@ -264,6 +278,11 @@ namespace pocketmine\item {
         }
     }
 
+    abstract class SpawnEgg extends Item
+    {
+        abstract protected function createEntity(\pocketmine\world\World $world, \pocketmine\math\Vector3 $pos, float $yaw, float $pitch): \pocketmine\entity\Entity;
+    }
+
     class ItemFactory
     {
         private static ?ItemFactory $instance = null;
@@ -296,6 +315,11 @@ namespace pocketmine\item {
                 $meta = (int)$metaPart;
             }
             return self::get($itemString, $meta, $count);
+        }
+
+        public static function fromString(string $itemString, bool $multiple = false): Item
+        {
+            return self::getFromString($itemString);
         }
 
         public function registerItem(Item $item, bool $override = false): void
@@ -336,5 +360,100 @@ namespace pocketmine\item {
                 \pocketmine\world\BlockFactory::idFromName($name)
             );
         }
+    }
+
+    class ItemTypeIds
+    {
+        private static int $nextId = 10000;
+
+        public static function newId(): int
+        {
+            return self::$nextId++;
+        }
+    }
+
+    class ItemIdentifier
+    {
+        public function __construct(
+            private int $id,
+            private int $meta = 0
+        ) {}
+
+        public function getId(): int { return $this->id; }
+        public function getMeta(): int { return $this->meta; }
+    }
+
+    class StringToItemParser
+    {
+        private static ?self $instance = null;
+        /** @var array<string, \Closure> */
+        private array $parsers = [];
+
+        public static function getInstance(): self
+        {
+            return self::$instance ??= new self();
+        }
+
+        public function register(string $alias, \Closure $remapper): void
+        {
+            $this->parsers[strtolower($alias)] = $remapper;
+        }
+
+        public function override(string $alias, \Closure $remapper): void
+        {
+            $this->parsers[strtolower($alias)] = $remapper;
+        }
+
+        public function parse(string $input): ?Item
+        {
+            $alias = strtolower($input);
+            if (isset($this->parsers[$alias])) {
+                return ($this->parsers[$alias])();
+            }
+            return ItemFactory::fromString($input);
+        }
+    }
+}
+
+namespace pocketmine\world\format\io {
+    class GlobalItemDataHandlers
+    {
+        private static ?ItemSerializer $serializer = null;
+        private static ?ItemDeserializer $deserializer = null;
+
+        public static function getSerializer(): ItemSerializer
+        {
+            return self::$serializer ??= new ItemSerializer();
+        }
+
+        public static function getDeserializer(): ItemDeserializer
+        {
+            return self::$deserializer ??= new ItemDeserializer();
+        }
+    }
+
+    class ItemSerializer
+    {
+        public function map(\pocketmine\item\Item $item, \Closure $serializer): void {}
+    }
+
+    class ItemDeserializer
+    {
+        public function map(string $id, \Closure $deserializer): void {}
+    }
+}
+
+namespace pocketmine\data\bedrock\item {
+    class SavedItemData
+    {
+        public function __construct(
+            private string $name,
+            private int $meta = 0,
+            private mixed $tag = null
+        ) {}
+
+        public function getName(): string { return $this->name; }
+        public function getMeta(): int { return $this->meta; }
+        public function getTag(): mixed { return $this->tag; }
     }
 }

@@ -2,6 +2,409 @@
 
 declare(strict_types=1);
 
+namespace pocketmine\entity {
+
+    class Location extends \pocketmine\world\Location
+    {
+    }
+
+    abstract class Entity
+    {
+        public int|string $id = 0;
+        protected ?\pocketmine\world\World $world = null;
+        protected ?\pocketmine\world\Location $location = null;
+        protected string $nameTag = '';
+        protected bool $nameTagAlwaysVisible = false;
+
+        public function getId(): int|string
+        {
+            return property_exists($this, 'runtimeId') ? $this->runtimeId : $this->id;
+        }
+
+        public function getWorld(): \pocketmine\world\World
+        {
+            if ($this->world !== null) {
+                return $this->world;
+            }
+            if (property_exists($this, 'worldName') && class_exists(\pocketmine\Server::class, false)) {
+                $world = \pocketmine\Server::getInstance()->getWorldManager()->getWorldByName($this->worldName);
+                if ($world !== null) {
+                    return $world;
+                }
+            }
+            if (class_exists(\pocketmine\Server::class, false)) {
+                return \pocketmine\Server::getInstance()->getWorldManager()->getDefaultWorld();
+            }
+            return new \pocketmine\world\World('world');
+        }
+
+        public function getLocation(): \pocketmine\world\Location
+        {
+            if (property_exists($this, 'x') && property_exists($this, 'y') && property_exists($this, 'z')) {
+                return new \pocketmine\world\Location(
+                    $this->x,
+                    $this->y,
+                    $this->z,
+                    $this->yaw ?? 0.0,
+                    $this->pitch ?? 0.0,
+                    property_exists($this, 'worldName') ? $this->worldName : 'world'
+                );
+            }
+            return $this->location ??= new \pocketmine\world\Location(0, 0, 0, 0, 0, 'world');
+        }
+
+        public function getPosition(): \pocketmine\math\Position
+        {
+            return $this->getLocation();
+        }
+
+        public function getNameTag(): string
+        {
+            return $this->nameTag;
+        }
+
+        public function setNameTag(string $name): void
+        {
+            $this->nameTag = $name;
+        }
+
+        public function isNameTagAlwaysVisible(): bool
+        {
+            return $this->nameTagAlwaysVisible;
+        }
+
+        public function setNameTagAlwaysVisible(bool $value = true): void
+        {
+            $this->nameTagAlwaysVisible = $value;
+        }
+
+        public function isAlive(): bool
+        {
+            return true;
+        }
+
+        public function close(): void
+        {
+        }
+    }
+
+    class Living extends Entity
+    {
+        public float $health = 20.0;
+        public float $maxHealth = 20.0;
+
+        public function getHealth(): float
+        {
+            return $this->health;
+        }
+
+        public function getMaxHealth(): float
+        {
+            return $this->maxHealth;
+        }
+
+        public function setHealth(float $amount): void
+        {
+            $this->health = max(0.0, min($this->maxHealth, $amount));
+        }
+
+        public function setMaxHealth(float $amount): void
+        {
+            $this->maxHealth = max(1.0, $amount);
+        }
+    }
+
+    class Human extends Living
+    {
+        protected ?Skin $skin = null;
+
+        public function getSkin(): object
+        {
+            return $this->skin ??= new Skin();
+        }
+
+        public function setSkin(Skin $skin): void
+        {
+            $this->skin = $skin;
+        }
+    }
+
+    /**
+     * PM `pocketmine\entity\Skin` stub (Fase A1): skin Steve por defecto.
+     * TODO(A1): textura 64x64/128x128 real + geometría + capa + `setSkin`.
+     */
+    class Skin
+    {
+        public function __construct(
+            private string $skinId = 'standard',
+            private string $skinData = '',
+            private string $capeData = '',
+            private string $geometryData = ''
+        ) {
+        }
+
+        public function getSkinId(): string
+        {
+            return $this->skinId;
+        }
+
+        public function getSkinData(): string
+        {
+            return $this->skinData;
+        }
+
+        public function getCapeData(): string
+        {
+            return $this->capeData;
+        }
+
+        public function getGeometryData(): string
+        {
+            return $this->geometryData;
+        }
+
+        public function __toString(): string
+        {
+            return 'Skin(' . $this->skinId . ')';
+        }
+    }
+
+    class EntityFactory
+    {
+        private static ?self $instance = null;
+        /** @var array<string, array{class: string, creator: \Closure, saveNames: string[]}> */
+        private array $creators = [];
+        /** @var array<string, string> */
+        private array $saveNames = [];
+
+        public static function getInstance(): self
+        {
+            return self::$instance ??= new self();
+        }
+
+        public function register(string $className, \Closure $creationFunc, array $saveNames = []): void
+        {
+            $this->creators[$className] = [
+                'class' => $className,
+                'creator' => $creationFunc,
+                'saveNames' => $saveNames,
+            ];
+            foreach ($saveNames as $saveName) {
+                $this->saveNames[strtolower($saveName)] = $className;
+            }
+        }
+
+        public function canCreate(string $saveName): bool
+        {
+            return isset($this->saveNames[strtolower($saveName)]);
+        }
+
+        public function createFromData(\pocketmine\world\World $world, mixed $nbt): ?Entity
+        {
+            $id = '';
+            if (is_object($nbt) && method_exists($nbt, 'getString')) {
+                $id = $nbt->getString('id', '');
+            }
+            $className = $this->saveNames[strtolower($id)] ?? null;
+            if ($className !== null && isset($this->creators[$className])) {
+                return ($this->creators[$className]['creator'])($world, $nbt);
+            }
+            return null;
+        }
+
+        public function getSaveNames(): array
+        {
+            return array_keys($this->saveNames);
+        }
+    }
+
+    class EntityDataHelper
+    {
+        public static function parseLocation(mixed $nbt, \pocketmine\world\World $world): \pocketmine\world\Location
+        {
+            $pos = [0.0, 0.0, 0.0];
+            $rot = [0.0, 0.0];
+            if (is_object($nbt) && method_exists($nbt, 'getListTag')) {
+                $posTag = $nbt->getListTag('Pos');
+                if ($posTag !== null && method_exists($posTag, 'getValue')) {
+                    $values = $posTag->getValue();
+                    $pos[0] = isset($values[0]) && method_exists($values[0], 'getValue') ? (float)$values[0]->getValue() : 0.0;
+                    $pos[1] = isset($values[1]) && method_exists($values[1], 'getValue') ? (float)$values[1]->getValue() : 0.0;
+                    $pos[2] = isset($values[2]) && method_exists($values[2], 'getValue') ? (float)$values[2]->getValue() : 0.0;
+                }
+                $rotTag = $nbt->getListTag('Rotation');
+                if ($rotTag !== null && method_exists($rotTag, 'getValue')) {
+                    $values = $rotTag->getValue();
+                    $rot[0] = isset($values[0]) && method_exists($values[0], 'getValue') ? (float)$values[0]->getValue() : 0.0;
+                    $rot[1] = isset($values[1]) && method_exists($values[1], 'getValue') ? (float)$values[1]->getValue() : 0.0;
+                }
+            }
+            return new \pocketmine\world\Location($pos[0], $pos[1], $pos[2], $rot[0], $rot[1], $world);
+        }
+    }
+}
+
+namespace pocketmine\nbt\tag {
+
+    abstract class Tag
+    {
+        abstract public function getValue(): mixed;
+    }
+
+    class StringTag extends Tag
+    {
+        public function __construct(private string $value = '') {}
+        public function getValue(): string { return $this->value; }
+    }
+
+    class IntTag extends Tag
+    {
+        public function __construct(private int $value = 0) {}
+        public function getValue(): int { return $this->value; }
+    }
+
+    class FloatTag extends Tag
+    {
+        public function __construct(private float $value = 0.0) {}
+        public function getValue(): float { return $this->value; }
+    }
+
+    class DoubleTag extends Tag
+    {
+        public function __construct(private float $value = 0.0) {}
+        public function getValue(): float { return $this->value; }
+    }
+
+    class ByteTag extends Tag
+    {
+        public function __construct(private int $value = 0) {}
+        public function getValue(): int { return $this->value; }
+    }
+
+    class ShortTag extends Tag
+    {
+        public function __construct(private int $value = 0) {}
+        public function getValue(): int { return $this->value; }
+    }
+
+    class ListTag extends Tag
+    {
+        /** @var Tag[] */
+        private array $value = [];
+
+        public function __construct(array $value = [])
+        {
+            $this->value = $value;
+        }
+
+        public function getValue(): array
+        {
+            return $this->value;
+        }
+
+        public function push(Tag $tag): self
+        {
+            $this->value[] = $tag;
+            return $this;
+        }
+    }
+
+    class CompoundTag extends Tag
+    {
+        /** @var array<string, Tag> */
+        private array $tags = [];
+
+        public function __construct(array $tags = [])
+        {
+            $this->tags = $tags;
+        }
+
+        public function get(string $name): ?Tag
+        {
+            return $this->tags[$name] ?? null;
+        }
+
+        public function setTag(string $name, Tag $tag): self
+        {
+            $this->tags[$name] = $tag;
+            return $this;
+        }
+
+        public function getString(string $name, string $default = ''): string
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (string)$tag->getValue() : $default;
+        }
+
+        public function getInt(string $name, int $default = 0): int
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
+        }
+
+        public function getFloat(string $name, float $default = 0.0): float
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (float)$tag->getValue() : $default;
+        }
+
+        public function getDouble(string $name, float $default = 0.0): float
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (float)$tag->getValue() : $default;
+        }
+
+        public function getByte(string $name, int $default = 0): int
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
+        }
+
+        public function getShort(string $name, int $default = 0): int
+        {
+            $tag = $this->get($name);
+            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
+        }
+
+        public function getCompoundTag(string $name): ?CompoundTag
+        {
+            $tag = $this->get($name);
+            return $tag instanceof CompoundTag ? $tag : null;
+        }
+
+        public function getListTag(string $name): ?ListTag
+        {
+            $tag = $this->get($name);
+            return $tag instanceof ListTag ? $tag : null;
+        }
+
+        public function setString(string $name, string $value): self
+        {
+            return $this->setTag($name, new StringTag($value));
+        }
+
+        public function setInt(string $name, int $value): self
+        {
+            return $this->setTag($name, new IntTag($value));
+        }
+
+        public function setFloat(string $name, float $value): self
+        {
+            return $this->setTag($name, new FloatTag($value));
+        }
+
+        public function setDouble(string $name, float $value): self
+        {
+            return $this->setTag($name, new DoubleTag($value));
+        }
+
+        public function getValue(): array
+        {
+            return $this->tags;
+        }
+    }
+}
+
 namespace pocketmine\player {
 
     use pocketmine\command\CommandSender;
@@ -14,7 +417,7 @@ namespace pocketmine\player {
     use pocketmine\world\Location;
     use pocketmine\world\World;
 
-    class Player implements CommandSender
+    class Player extends \pocketmine\entity\Human implements CommandSender
     {
         public string $name;
         public string $displayName;
@@ -1458,47 +1861,66 @@ namespace pocketmine\inventory {
             $this->setItem(0, $item);
         }
     }
-}
 
-namespace pocketmine\entity {
-
-    /**
-     * PM `pocketmine\entity\Skin` stub (Fase A1): skin Steve por defecto.
-     * TODO(A1): textura 64x64/128x128 real + geometría + capa + `setSkin`.
-     */
-    class Skin
+    final class CreativeCategory
     {
-        public function __construct(
-            private string $skinId = 'standard',
-            private string $skinData = '',
-            private string $capeData = '',
-            private string $geometryData = ''
-        ) {
+        public const ALL = -1;
+        public const CONSTRUCTION = 1;
+        public const NATURE = 2;
+        public const EQUIPMENT = 3;
+        public const ITEMS = 4;
+        public const COMMANDS = 5;
+    }
+
+    class CreativeInventory
+    {
+        private static ?self $instance = null;
+        /** @var array<int, Item> */
+        private array $items = [];
+
+        public static function getInstance(): self
+        {
+            return self::$instance ??= new self();
         }
 
-        public function getSkinId(): string
+        public static function reset(): void
         {
-            return $this->skinId;
+            self::$instance = null;
         }
 
-        public function getSkinData(): string
+        public function add(Item $item, ?int $category = null, ?string $group = null): void
         {
-            return $this->skinData;
+            $this->items[] = clone $item;
         }
 
-        public function getCapeData(): string
+        public function remove(Item $item): void
         {
-            return $this->capeData;
+            foreach ($this->items as $i => $it) {
+                if (method_exists($it, 'equalsExact') ? $it->equalsExact($item) : ($it->getId() === $item->getId() && $it->getMeta() === $item->getMeta())) {
+                    unset($this->items[$i]);
+                }
+            }
         }
 
-        public function getGeometryData(): string
+        public function contains(Item $item): bool
         {
-            return $this->geometryData;
+            foreach ($this->items as $it) {
+                if (method_exists($it, 'equalsExact') ? $it->equalsExact($item) : ($it->getId() === $item->getId() && $it->getMeta() === $item->getMeta())) {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        public function __toString(): string
+        /** @return array<int, Item> */
+        public function getAll(): array
         {
-            return 'Skin(' . $this->skinId . ')';
+            return array_values($this->items);
+        }
+
+        public function clear(): void
+        {
+            $this->items = [];
         }
     }
 }
