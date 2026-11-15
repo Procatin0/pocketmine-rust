@@ -723,6 +723,30 @@ mod tests {
     }
 
     #[test]
+    fn a_block_placed_in_the_stream_is_never_erased() {
+        let world = world();
+        let stone = block_states::network_id("stone").expect("stone");
+        // Two sources with a gap: the gap cell becomes a source once the flow
+        // reaches it.
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block(2, 4, 0, water(0, false));
+        tick(&world, 40);
+        assert!(Liquid::from_state(world.block_at(1, 4, 0)).is_some());
+
+        // Drop a block into the middle of the current (`Block::canBePlacedAt()`
+        // allows replacing a liquid cell). It must stay there: `can_flow_into()`
+        // only fills flowable cells, and the source-forming rule only ever
+        // rewrites cells that are already liquid.
+        world.set_block(1, 4, 0, stone);
+        tick(&world, 160);
+        assert_eq!(
+            world.block_at(1, 4, 0),
+            stone,
+            "water must never overwrite a solid block, not even when the cell\n             around it becomes a source"
+        );
+    }
+
+    #[test]
     fn water_flows_towards_the_nearest_hole() {
         let world = world();
         // A hole two blocks west of the source: the flow must prefer the west

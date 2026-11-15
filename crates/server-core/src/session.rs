@@ -3117,8 +3117,14 @@ impl PlayerSession {
         if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
             return;
         }
-        // Only place into an empty cell, like `JavaServer::placeBlock()`.
-        if self.world.block_at(x, y, z) != AIR {
+        // PM `Block::canBePlacedAt()` is `$blockReplace->canBeReplaced()`: air,
+        // liquids, fire, snow layers, vines and the like. Requiring an *empty*
+        // cell refused a block placed into a flowing stream, so the client's
+        // predicted block floated there until the next water update erased it
+        // (which looked like the flow deleting the block that was in its way).
+        let target = self.world.block_at(x, y, z);
+        if !physics::is_replaceable(bedrock_world::block_states::state_name(target).unwrap_or(""))
+        {
             return;
         }
         // PM `World::useItemOn` refuses the placement when the placed block's
@@ -10235,6 +10241,84 @@ mod block_sync_tests {
                     z: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_block_can_be_placed_into_the_flowing_stream() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+        use bedrock_protocol::ItemStack;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        // Flowing water (not a source) in the cell the click targets.
+        manager.world().set_block(
+            2,
+            80,
+            3,
+            fluid::Liquid {
+                water: true,
+                decay: 2,
+                falling: false,
+                still: true,
+            }
+            .state(),
+        );
+
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        let mut held = ItemStack::new(1, 1);
+        held.block_runtime_id = stone;
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: (2, 79, 3),
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 123,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes().to_vec())
+            .expect("use item");
+        let actions: Vec<PluginAction> = {
+            let mut map = manager.sessions.write();
+            std::mem::take(&mut map.get_mut(&1).expect("session").pending_actions)
+        };
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                PluginAction::SetBlock { x: 2, y: 80, z: 3, block_id, .. } if *block_id == stone
+            )),
+            "`Block::canBePlacedAt()` accepts a liquid cell, got {actions:?}"
+        );
+        manager.apply_actions(&actions, 0);
+        assert_eq!(manager.world().block_at(2, 80, 3), stone);
+
+        // The flow must not take it back while the area keeps ticking.
+        for _ in 0..40 {
+            manager.tick();
+        }
+        assert_eq!(
+            manager.world().block_at(2, 80, 3),
+            stone,
+            "the placed block survives the water updates"
         );
     }
 
