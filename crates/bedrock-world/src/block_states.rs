@@ -355,6 +355,17 @@ pub fn with_property(network_id: u32, key: &str, value: &str) -> Option<u32> {
     table.by_state.get(&state_key(name, &props)).copied()
 }
 
+/// Reads an integer property (`Int`, or a `Byte`) of a state, `None` when the
+/// state has no such property.
+pub fn int_property(network_id: u32, key: &str) -> Option<i32> {
+    let props = table().props.get(&network_id)?;
+    match props.iter().find(|(candidate, _)| candidate == key)?.1 {
+        Value::Int(value) => Some(value),
+        Value::Byte(value) => Some(value as i32),
+        _ => None,
+    }
+}
+
 /// Reads a byte boolean property (`0`/`1`) of a state, `None` when the state
 /// has no such property.
 pub fn bool_property(network_id: u32, key: &str) -> Option<bool> {

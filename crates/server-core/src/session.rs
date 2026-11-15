@@ -68,6 +68,7 @@ use crate::identity::parse_login_identity;
 use crate::inventory::{
     PlayerInventory, WINDOW_ID_ARMOR, WINDOW_ID_CURSOR, WINDOW_ID_INVENTORY, WINDOW_ID_OFFHAND,
 };
+use crate::fluid;
 use crate::physics;
 use crate::plugin_host::PlayerRegistry;
 use crate::scoreboard::{PacketBytes as ScoreboardPacketBytes, Scoreboard};
@@ -3089,6 +3090,11 @@ impl PlayerSession {
         if self.handle_block_interact(use_item) {
             return;
         }
+        // PM `Bucket::onInteractBlock()` / `LiquidBucket::onInteractBlock()`:
+        // a bucket acts on the clicked block and never places one.
+        if self.handle_bucket_use(use_item) {
+            return;
+        }
         let block_id = if use_item.item_in_hand.block_runtime_id != 0 {
             use_item.item_in_hand.block_runtime_id
         } else {
@@ -3199,6 +3205,148 @@ impl PlayerSession {
                     self.inventory.set_window_slot(WINDOW_ID_INVENTORY, slot, new_item);
                 }
             }
+        }
+    }
+
+    /// PM `Bucket::onInteractBlock()` (fill) and
+    /// `LiquidBucket::onInteractBlock()` (empty).
+    ///
+    /// - An empty bucket clicked on a liquid **source** takes it: the cell
+    ///   becomes air (`setBlock(..., AIR)`), the bucket becomes the matching
+    ///   liquid bucket and `bucket.fill.water`/`bucket.fill.lava` plays at the
+    ///   block centre.
+    /// - A liquid bucket clicked against a replaceable cell places the
+    ///   liquid's **flowing** form there (`getFlowingForm()`), plays
+    ///   `bucket.empty.*` and turns back into an empty bucket.
+    ///
+    /// Returns true whenever the held item is a bucket, because a bucket is
+    /// not a block item: the click must never fall through to block placement
+    /// (PM returns `ItemUseResult::NONE`/`FAIL` in those cases).
+    fn handle_bucket_use(&mut self, use_item: &UseItemData) -> bool {
+        let held = use_item.item_in_hand.network_id;
+        let empty_bucket = held == fluid::BUCKET_ITEM;
+        let liquid_bucket = if held == fluid::WATER_BUCKET_ITEM {
+            Some(true)
+        } else if held == fluid::LAVA_BUCKET_ITEM {
+            Some(false)
+        } else {
+            None
+        };
+        if !empty_bucket && liquid_bucket.is_none() {
+            return false;
+        }
+
+        let (bx, by, bz) = use_item.block_position;
+        if empty_bucket {
+            let clicked = self.world.block_at(bx, by, bz);
+            let Some(liquid) = fluid::Liquid::from_state(clicked) else {
+                return true;
+            };
+            if !liquid.is_source() {
+                return true;
+            }
+            let filled = if liquid.water {
+                fluid::WATER_BUCKET_ITEM
+            } else {
+                fluid::LAVA_BUCKET_ITEM
+            };
+            self.pending_actions.push(PluginAction::SetBlock {
+                world: self.world.name.clone(),
+                x: bx,
+                y: by,
+                z: bz,
+                block_id: AIR,
+            });
+            self.pending_actions.push(PluginAction::BroadcastSound {
+                sound: if liquid.water {
+                    "bucket.fill.water".to_string()
+                } else {
+                    "bucket.fill.lava".to_string()
+                },
+                extra_data: -1,
+                x: bx,
+                y: by,
+                z: bz,
+            });
+            self.exchange_held_item(filled);
+            return true;
+        }
+
+        // `LiquidBucket::onInteractBlock()`: the cell the click points at must
+        // be replaceable (`canBeReplaced()`).
+        let Some(water) = liquid_bucket else {
+            return true;
+        };
+        let offset: (i32, i32, i32) = match use_item.face {
+            0 => (0, -1, 0),
+            1 => (0, 1, 0),
+            2 => (0, 0, -1),
+            3 => (0, 0, 1),
+            4 => (-1, 0, 0),
+            5 => (1, 0, 0),
+            _ => return true,
+        };
+        let (x, y, z) = (bx + offset.0, by + offset.1, bz + offset.2);
+        if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
+            return true;
+        }
+        if !fluid::can_be_flowed_into(self.world.block_at(x, y, z)) {
+            return true;
+        }
+        let placed = fluid::Liquid {
+            water,
+            decay: 0,
+            falling: false,
+            // `getFlowingForm()`: the placed bucket is a flowing source.
+            still: false,
+        };
+        self.pending_actions.push(PluginAction::SetBlock {
+            world: self.world.name.clone(),
+            x,
+            y,
+            z,
+            block_id: placed.state(),
+        });
+        self.pending_actions.push(PluginAction::BroadcastSound {
+            sound: if water {
+                "bucket.empty.water".to_string()
+            } else {
+                "bucket.empty.lava".to_string()
+            },
+            extra_data: -1,
+            x,
+            y,
+            z,
+        });
+        self.exchange_held_item(fluid::BUCKET_ITEM);
+        true
+    }
+
+    /// `Item::pop()` plus the item PM pushes into `$returnedItems`: one held
+    /// item is consumed and `new_id` takes its place in the hotbar slot when
+    /// the stack runs out (a bucket never stacks past one of these swaps).
+    fn exchange_held_item(&mut self, new_id: i16) {
+        let slot = self.inventory.selected_hotbar_slot() as u32;
+        let Some(item) = self
+            .inventory
+            .window_slot(WINDOW_ID_INVENTORY, slot)
+            .cloned()
+        else {
+            return;
+        };
+        if item.is_empty() {
+            return;
+        }
+        let result = ItemStack::new(new_id, 1);
+        let mut remaining = item;
+        remaining.count = remaining.count.saturating_sub(1);
+        if remaining.count == 0 {
+            self.inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, slot, result);
+        } else {
+            self.inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, slot, remaining);
+            self.inventory.add_item(&result);
         }
     }
 
@@ -10087,6 +10235,137 @@ mod block_sync_tests {
                     z: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn water_bucket_fills_and_empties_like_the_reference() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+        use bedrock_protocol::ItemStack;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        // The hotbar slot must hold the bucket: PM swaps the held item
+        // (`Item::pop()` + `$returnedItems`), it does not invent one.
+        placer
+            .inventory
+            .set_window_slot(WINDOW_ID_INVENTORY, 0, ItemStack::new(fluid::WATER_BUCKET_ITEM, 1));
+        manager.add_session(placer);
+
+        let click = |held: i16, block_position: (i32, i32, i32), face: u8| {
+            let packet = InventoryTransactionPacket {
+                request_id: 0,
+                request_changed_slots: None,
+                actions: vec![],
+                data: TransactionData::UseItem(UseItemData {
+                    action_type: ACTION_CLICK_BLOCK,
+                    trigger_type: 0,
+                    block_position,
+                    face,
+                    hotbar_slot: 0,
+                    hand: 0,
+                    item_in_hand: ItemStack::new(held, 1),
+                    player_position: (2.5, 80.06, 3.5),
+                    click_position: (2.5, 80.0, 3.5),
+                    block_runtime_id: 123,
+                    client_interact_prediction: 0,
+                    client_cooldown_state: 0,
+                }),
+            };
+            let mut writer = Writer::new();
+            packet.encode_payload(&mut writer);
+            let payload = writer.into_bytes().to_vec();
+            manager
+                .handle_session_packet(1, 0x1E, &payload)
+                .expect("use item");
+            let actions: Vec<PluginAction> = {
+                let mut map = manager.sessions.write();
+                std::mem::take(&mut map.get_mut(&1).expect("session").pending_actions)
+            };
+            manager.apply_actions(&actions, 0);
+            actions
+        };
+        let held_after = |manager: &SessionManager| {
+            manager.sessions.read()[&1]
+                .inventory
+                .window_slot(WINDOW_ID_INVENTORY, 0)
+                .map(|item| (item.network_id, item.count))
+        };
+
+        // Emptying: `LiquidBucket::onInteractBlock()` places the *flowing*
+        // form into the cell the click points at.
+        let actions = click(fluid::WATER_BUCKET_ITEM, (2, 79, 3), 1);
+        let flowing = fluid::Liquid {
+            water: true,
+            decay: 0,
+            falling: false,
+            still: false,
+        }
+        .state();
+        assert_eq!(
+            manager.world().block_at(2, 80, 3),
+            flowing,
+            "a placed bucket is a flowing source"
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                PluginAction::BroadcastSound { sound, .. } if sound == "bucket.empty.water"
+            )),
+            "PM plays `BucketEmptyWaterSound`"
+        );
+        assert_eq!(
+            held_after(&manager),
+            Some((fluid::BUCKET_ITEM, 1)),
+            "the water bucket turns back into an empty bucket"
+        );
+
+        // Filling: `Bucket::onInteractBlock()` takes a source and gives the
+        // matching liquid bucket back.
+        let actions = click(fluid::BUCKET_ITEM, (2, 80, 3), 1);
+        assert_eq!(manager.world().block_at(2, 80, 3), AIR);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                PluginAction::BroadcastSound { sound, .. } if sound == "bucket.fill.water"
+            )),
+            "PM plays `BucketFillWaterSound`"
+        );
+        assert_eq!(
+            held_after(&manager),
+            Some((fluid::WATER_BUCKET_ITEM, 1)),
+            "the empty bucket becomes a water bucket"
+        );
+
+        // A flowing cell is not a source: the bucket stays empty.
+        manager
+            .sessions
+            .write()
+            .get_mut(&1)
+            .expect("session")
+            .inventory
+            .set_window_slot(WINDOW_ID_INVENTORY, 0, ItemStack::new(fluid::BUCKET_ITEM, 1));
+        manager.world().set_block(
+            2,
+            80,
+            3,
+            fluid::Liquid {
+                water: true,
+                decay: 2,
+                falling: false,
+                still: true,
+            }
+            .state(),
+        );
+        let actions = click(fluid::BUCKET_ITEM, (2, 80, 3), 1);
+        assert!(actions.is_empty());
+        assert_eq!(
+            held_after(&manager),
+            Some((fluid::BUCKET_ITEM, 1)),
+            "`isSource()` is required to fill a bucket"
         );
     }
 

@@ -8,6 +8,7 @@ pub mod chat;
 pub mod crafting;
 pub mod command;
 pub mod entity;
+pub mod fluid;
 pub mod config;
 pub mod crash;
 pub mod identity;

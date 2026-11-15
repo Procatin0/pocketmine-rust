@@ -158,6 +158,11 @@ pub struct WorldState {
     /// linear scan beats a heap. Each entry restores a block state and queues
     /// the sound PM plays from `onScheduledUpdate()`.
     scheduled_block_updates: Mutex<Vec<(i32, (i32, i32, i32), u32, Option<String>)>>,
+    /// PM `Liquid::onNearbyBlockChange()` -> `scheduleDelayedBlockUpdate()`:
+    /// `position -> due tick`. Every liquid cell re-evaluates itself every
+    /// `tickRate()` ticks (5 for water, 30 for lava); keeping the earliest due
+    /// tick per cell means repeated neighbour notifications cannot pile up.
+    fluid_updates: Mutex<HashMap<(i32, i32, i32), i32>>,
     /// Tick counter driving the scheduled queue. It advances even with
     /// `/time stop`, because scheduled updates are counted in ticks.
     scheduled_tick: AtomicI32,
@@ -270,6 +275,7 @@ impl WorldState {
             auto_save_interval: std::sync::atomic::AtomicI32::new(6000),
             tick_count: std::sync::atomic::AtomicI32::new(0),
             scheduled_block_updates: Mutex::new(Vec::new()),
+            fluid_updates: Mutex::new(HashMap::new()),
             scheduled_tick: AtomicI32::new(0),
             pending_sounds: Mutex::new(Vec::new()),
             edits: RwLock::new(HashMap::new()),
@@ -368,6 +374,7 @@ impl WorldState {
         // scheduled updates first, then the clock).
         let now = self.scheduled_tick.fetch_add(1, Ordering::Relaxed) + 1;
         self.run_scheduled_block_updates(now);
+        self.run_fluid_updates(now);
         if self.is_time_running() {
             self.set_time(self.time().saturating_add(1))
         } else {
@@ -419,6 +426,66 @@ impl WorldState {
                 self.pending_sounds.lock().push((sound, -1, x, y, z));
             }
         }
+    }
+
+    /// PM `World::doTick()` -> `Liquid::onScheduledUpdate()` for every liquid
+    /// cell whose tick is due.
+    ///
+    /// Each update goes through [`WorldState::set_block`], so viewers get the
+    /// new level (or the air where the flow dried up) in the same tick, and the
+    /// cells it touches are scheduled again (`onNearbyBlockChange`) — the flow
+    /// spreads one block per `tickRate()`, like the reference.
+    fn run_fluid_updates(&self, now: i32) {
+        /// A large pool must not drain the whole tick budget; the rest stays
+        /// queued and runs on the following ticks.
+        const MAX_FLUID_UPDATES_PER_TICK: usize = 256;
+
+        let ready: Vec<(i32, i32, i32)> = {
+            let mut queue = self.fluid_updates.lock();
+            let mut ready = Vec::new();
+            queue.retain(|position, due| {
+                if *due <= now {
+                    ready.push(*position);
+                    false
+                } else {
+                    true
+                }
+            });
+            ready
+        };
+        for (x, y, z) in ready.into_iter().take(MAX_FLUID_UPDATES_PER_TICK) {
+            crate::fluid::on_scheduled_update(self, x, y, z);
+        }
+    }
+
+    /// Queues the changed cell and its six neighbours for a liquid tick.
+    ///
+    /// This is PocketMine's `onNearbyBlockChange()` for liquids: every block
+    /// update wakes the liquid around it, which recomputes its level (a broken
+    /// source drains the flow away) or spreads further.
+    fn schedule_fluid_neighbours(&self, x: i32, y: i32, z: i32) {
+        let now = self.scheduled_tick.load(Ordering::Relaxed);
+        let mut positions: [(i32, i32, i32); 7] = [(x, y, z); 7];
+        for (index, face) in crate::physics::ALL_FACES.iter().enumerate() {
+            let (dx, dy, dz) = crate::physics::offset(*face);
+            positions[index + 1] = (x + dx, y + dy, z + dz);
+        }
+        let mut queue = self.fluid_updates.lock();
+        for (bx, by, bz) in positions {
+            let Some(liquid) = crate::fluid::Liquid::from_state(self.block_at(bx, by, bz)) else {
+                continue;
+            };
+            let due = now + liquid.tick_rate();
+            queue
+                .entry((bx, by, bz))
+                .and_modify(|existing| *existing = (*existing).min(due))
+                .or_insert(due);
+        }
+    }
+
+    /// Number of liquid cells waiting for their scheduled tick (tests).
+    pub fn fluid_update_count(&self) -> usize {
+        self.fluid_updates.lock().len()
     }
 
     /// Sounds queued by scheduled block updates, in firing order.
@@ -565,6 +632,9 @@ impl WorldState {
         if physics {
             self.propagate_physics(x, y, z, &mut changes);
         }
+        // `Liquid::onNearbyBlockChange()`: wake the liquid around the edit so
+        // it re-evaluates its level or keeps spreading.
+        self.schedule_fluid_neighbours(x, y, z);
         self.flush_changes(changes);
         true
     }
