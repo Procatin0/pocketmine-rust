@@ -141,7 +141,7 @@ impl Liquid {
 /// `Liquid::canFlowInto($block)`: inside the world, flowable, and not a
 /// source of any liquid (the reference leaves a TODO about limiting this to
 /// the same liquid; the behaviour is kept as it is).
-pub fn can_flow_into(world: &WorldState, x: i32, y: i32, z: i32, water: bool) -> bool {
+pub fn can_flow_into(world: &WorldState, x: i32, y: i32, z: i32) -> bool {
     if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
         return false;
     }
@@ -149,7 +149,7 @@ pub fn can_flow_into(world: &WorldState, x: i32, y: i32, z: i32, water: bool) ->
     if !can_be_flowed_into(target) {
         return false;
     }
-    !Liquid::from_state(target).is_some_and(|liquid| liquid.water == water && liquid.is_source())
+    !Liquid::from_state(target).is_some_and(|liquid| liquid.is_source())
 }
 
 /// `$block->canBeFlowedInto()`: `Flowable` blocks (air, liquids, plants, ...)
@@ -286,6 +286,11 @@ pub fn on_scheduled_update(world: &WorldState, x: i32, y: i32, z: i32) {
             }
         }
     }
+
+    // `Liquid::onScheduledUpdate()` ends with `$this->checkForHarden()`.
+    if let Some(liquid) = Liquid::from_state(world.block_at(x, y, z)) {
+        check_for_harden(world, x, y, z, liquid);
+    }
 }
 
 /// `Liquid::flowIntoBlock()`: only fills a cell that is flowable and not
@@ -299,7 +304,16 @@ fn flow_into(
     falling: bool,
     water: bool,
 ) {
-    if !can_flow_into(world, x, y, z, water) {
+    // `Lava::flowIntoBlock()`: lava flowing into water turns that water into
+    // stone instead of being blocked by it (the cell keeps the lava, the water
+    // is replaced in its own position).
+    if !water
+        && Liquid::from_state(world.block_at(x, y, z)).is_some_and(|other| other.water)
+    {
+        liquid_collide(world, x, y, z, "stone");
+        return;
+    }
+    if !can_flow_into(world, x, y, z) {
         return;
     }
     if Liquid::from_state(world.block_at(x, y, z)).is_some() {
@@ -320,6 +334,77 @@ fn flow_into(
     world.set_block(x, y, z, new.state());
 }
 
+/// `Liquid::liquidCollide()`: `BlockEventHelper::form()` replaces the cell and
+/// the world plays `FizzSound` at its centre.
+fn liquid_collide(world: &WorldState, x: i32, y: i32, z: i32, result: &str) {
+    let Some(state) = block_states::network_id(result) else {
+        return;
+    };
+    world.set_block(x, y, z, state);
+    world.add_sound(
+        bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_FIZZ,
+        -1,
+        x,
+        y,
+        z,
+    );
+}
+
+/// `Lava::checkForHarden()`: lava touching water hardens, and the result
+/// depends on how thin the lava was.
+///
+/// - a lava source (`decay == 0`) becomes obsidian,
+/// - lava with `decay <= 4` becomes cobblestone,
+/// - thinner flow (or falling lava) is left alone.
+///
+/// Only the sides and the top are considered (`Facing::ALL` except `DOWN`),
+/// so a falling column pouring onto water does not harden this way — that path
+/// goes through [`flow_into`], which turns the water into stone.
+fn check_for_harden(world: &WorldState, x: i32, y: i32, z: i32, liquid: Liquid) -> bool {
+    if liquid.water || liquid.falling {
+        return false;
+    }
+    for face in [physics::UP, physics::NORTH, physics::SOUTH, physics::WEST, physics::EAST] {
+        let (dx, dy, dz) = physics::offset(face);
+        let Some(colliding) = Liquid::from_state(world.block_at(x + dx, y + dy, z + dz)) else {
+            continue;
+        };
+        if !colliding.water {
+            continue;
+        }
+        if liquid.decay == 0 {
+            liquid_collide(world, x, y, z, "obsidian");
+            return true;
+        }
+        if liquid.decay <= 4 {
+            liquid_collide(world, x, y, z, "cobblestone");
+            return true;
+        }
+    }
+    false
+}
+
+/// `Liquid::onNearbyBlockChange()` -> `checkForHarden()` for the edited cell
+/// and its six neighbours.
+///
+/// PocketMine hardens on the block update itself, not on the flow tick, so two
+/// liquids meeting react immediately instead of waiting up to `tickRate()`
+/// ticks (30 for lava). Called after the edit is flushed, so the hardening
+/// state is the last thing a viewer sees for that cell.
+pub fn harden_around(world: &WorldState, x: i32, y: i32, z: i32) {
+    let mut positions: [(i32, i32, i32); 7] = [(x, y, z); 7];
+    for (index, face) in physics::ALL_FACES.iter().enumerate() {
+        let (dx, dy, dz) = physics::offset(*face);
+        positions[index + 1] = (x + dx, y + dy, z + dz);
+    }
+    for (bx, by, bz) in positions {
+        let Some(liquid) = Liquid::from_state(world.block_at(bx, by, bz)) else {
+            continue;
+        };
+        check_for_harden(world, bx, by, bz, liquid);
+    }
+}
+
 /// `MinimumCostFlowCalculator::getOptimalFlowDirections()`: the horizontal
 /// directions the liquid should spread into, cheapest first.
 fn optimal_flow_directions(world: &WorldState, x: i32, y: i32, z: i32, water: bool) -> Vec<i32> {
@@ -331,7 +416,7 @@ fn optimal_flow_directions(world: &WorldState, x: i32, y: i32, z: i32, water: bo
     for (index, face) in HORIZONTAL.iter().enumerate() {
         let (dx, _, dz) = physics::offset(*face);
         let (nx, nz) = (x + dx, z + dz);
-        if !can_flow_into(world, nx, y, nz, water) {
+        if !can_flow_into(world, nx, y, nz) {
             visited.insert((nx, y, nz), BLOCKED);
         } else if can_be_flowed_into(world.block_at(nx, y - 1, nz)) {
             // A neighbour with a hole under it wins outright.
@@ -351,7 +436,6 @@ fn optimal_flow_directions(world: &WorldState, x: i32, y: i32, z: i32, water: bo
                 opposite,
                 opposite,
                 &mut visited,
-                water,
             );
             max_cost = max_cost.min(costs[index]);
         }
@@ -379,7 +463,6 @@ fn calculate_flow_cost(
     origin_opposite: i32,
     last_opposite: i32,
     visited: &mut HashMap<(i32, i32, i32), i8>,
-    water: bool,
 ) -> i32 {
     let mut cost = 1000;
     for face in HORIZONTAL {
@@ -390,7 +473,7 @@ fn calculate_flow_cost(
         let (x, z) = (block_x + dx, block_z + dz);
 
         let status = *visited.entry((x, block_y, z)).or_insert_with(|| {
-            if !can_flow_into(world, x, block_y, z, water) {
+            if !can_flow_into(world, x, block_y, z) {
                 BLOCKED
             } else if can_be_flowed_into(world.block_at(x, block_y - 1, z)) {
                 CAN_FLOW_DOWN
@@ -419,7 +502,6 @@ fn calculate_flow_cost(
             origin_opposite,
             physics::opposite(face),
             visited,
-            water,
         );
         if real_cost < cost {
             cost = real_cost;
@@ -450,6 +532,24 @@ mod tests {
             still: true,
         }
         .state()
+    }
+
+    fn lava(decay: i32, falling: bool) -> u32 {
+        Liquid {
+            water: false,
+            decay,
+            falling,
+            still: true,
+        }
+        .state()
+    }
+
+    fn sounds(world: &WorldState) -> Vec<String> {
+        world
+            .take_pending_sounds()
+            .into_iter()
+            .map(|(sound, ..)| sound)
+            .collect()
     }
 
     /// Ticks the world `n` times so scheduled liquid updates fire.
@@ -556,6 +656,70 @@ mod tests {
             None,
             "flow without a source must drain away"
         );
+    }
+
+    #[test]
+    fn lava_touching_water_hardens_by_its_own_level() {
+        let world = world();
+        let obsidian = block_states::network_id("obsidian").expect("obsidian");
+        let cobblestone = block_states::network_id("cobblestone").expect("cobblestone");
+
+        // `Lava::checkForHarden()`: a source becomes obsidian, and the world
+        // plays `FizzSound` at the block centre.
+        world.set_block(0, 4, 0, lava(0, false));
+        world.set_block(1, 4, 0, water(0, false));
+        assert_eq!(world.block_at(0, 4, 0), obsidian);
+        assert!(
+            sounds(&world).iter().any(|sound| sound == "fizz"),
+            "the collision must play `fizz`"
+        );
+
+        // `decay <= 4` becomes cobblestone.
+        world.set_block(10, 4, 0, lava(3, false));
+        world.set_block(11, 4, 0, water(0, false));
+        assert_eq!(world.block_at(10, 4, 0), cobblestone);
+
+        // Thinner flow (and falling lava) is not hardened.
+        world.set_block(20, 4, 0, lava(5, false));
+        world.set_block(21, 4, 0, water(0, false));
+        assert_eq!(
+            Liquid::from_state(world.block_at(20, 4, 0)).map(|liquid| liquid.decay),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn lava_flowing_into_water_turns_the_water_into_stone() {
+        let world = world();
+        let stone = block_states::network_id("stone").expect("stone");
+        // `checkForHarden()` skips DOWN, so water directly under lava only
+        // reacts when the flow tick tries to flow into it
+        // (`Lava::flowIntoBlock()`).
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block(0, 5, 0, lava(0, false));
+        assert!(Liquid::from_state(world.block_at(0, 4, 0)).is_some());
+
+        tick(&world, 40);
+        assert_eq!(world.block_at(0, 4, 0), stone);
+        assert!(
+            sounds(&world).iter().any(|sound| sound == "fizz"),
+            "the collision must play `fizz`"
+        );
+    }
+
+    #[test]
+    fn lava_never_forms_a_source_from_two_neighbours() {
+        let world = world();
+        world.set_block(0, 4, 0, lava(0, false));
+        world.set_block(2, 4, 0, lava(0, false));
+
+        tick(&world, 120);
+        let gap = Liquid::from_state(world.block_at(1, 4, 0)).expect("lava reached the gap");
+        assert!(
+            !gap.is_source(),
+            "only `Water` forms a source (`getMinAdjacentSourcesToFormSource()` is null for lava)"
+        );
+        assert_eq!(gap.decay, 2, "lava loses two levels per block");
     }
 
     #[test]

@@ -636,6 +636,10 @@ impl WorldState {
         // it re-evaluates its level or keeps spreading.
         self.schedule_fluid_neighbours(x, y, z);
         self.flush_changes(changes);
+        // `Lava::checkForHarden()` arrives with the block update itself, not
+        // with the flow tick: water meeting lava hardens immediately. Runs
+        // after the flush so the hardened state is what viewers end up with.
+        crate::fluid::harden_around(self, x, y, z);
         true
     }
 

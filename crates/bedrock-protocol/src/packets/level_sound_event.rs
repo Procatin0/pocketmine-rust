@@ -43,6 +43,10 @@ pub const LEVEL_SOUND_LAND: &str = "land";
 /// broken block's runtime id).
 pub const LEVEL_SOUND_BREAK: &str = "break";
 
+/// `LevelSoundEvent::FIZZ` (PM `FizzSound`): lava colliding with water
+/// (`Liquid::liquidCollide()`).
+pub const LEVEL_SOUND_FIZZ: &str = "fizz";
+
 /// Encodes a `LevelSoundEventPacket` payload for a non-actor sound.
 pub fn level_sound_event_wire(sound: &str, x: f32, y: f32, z: f32, extra_data: i32) -> Vec<u8> {
     level_sound_actor_event_wire(sound, x, y, z, extra_data, ":", -1)
