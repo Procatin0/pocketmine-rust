@@ -36,11 +36,18 @@ pub const LEVEL_EVENT_SOUND_ANVIL_FALL: i32 = 1022;
 /// Encodes a `LevelEventPacket` payload with the exact reference wire
 /// (eventId zigzag varint, position 3x f32 LE, eventData zigzag varint).
 pub fn level_event_wire(event_id: i32, event_data: i32, x: i32, y: i32, z: i32) -> Vec<u8> {
+    level_event_wire_at(event_id, event_data, x as f32, y as f32, z as f32)
+}
+
+/// `level_event_wire` for fractional positions, which is what
+/// `World::addParticle()`/`World::addSound()` take: PocketMine encodes the
+/// break particle at `$pos->add(0.5, 0.5, 0.5)`, the block's centre.
+pub fn level_event_wire_at(event_id: i32, event_data: i32, x: f32, y: f32, z: f32) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.write_var_i32(event_id);
-    writer.write_f32_le(x as f32);
-    writer.write_f32_le(y as f32);
-    writer.write_f32_le(z as f32);
+    writer.write_f32_le(x);
+    writer.write_f32_le(y);
+    writer.write_f32_le(z);
     writer.write_var_i32(event_data);
     writer.into_bytes().to_vec()
 }
@@ -51,6 +58,19 @@ mod tests {
 
     /// 3600 zigzag-encodes as 7200 unsigned -> varint [0xA0, 0x38];
     /// position (1,2,3) as three f32 LEs; eventData -1 zigzag -> 1 -> [0x01].
+    #[test]
+    fn fractional_positions_keep_their_half_block_offset() {
+        use crate::binary::Reader;
+        let wire = level_event_wire_at(LEVEL_EVENT_PARTICLE_DESTROY_BLOCK, 42, 1.5, 2.5, 3.5);
+        let mut reader = Reader::new(&wire);
+        assert_eq!(reader.read_var_i32().unwrap(), LEVEL_EVENT_PARTICLE_DESTROY_BLOCK);
+        assert_eq!(reader.read_f32_le().unwrap(), 1.5);
+        assert_eq!(reader.read_f32_le().unwrap(), 2.5);
+        assert_eq!(reader.read_f32_le().unwrap(), 3.5);
+        assert_eq!(reader.read_var_i32().unwrap(), 42);
+        assert_eq!(reader.remaining(), 0);
+    }
+
     #[test]
     fn start_break_wire_is_zigzag_eventid_f32_pos_zigzag_data() {
         let wire = level_event_wire(3600, -1, 1, 2, 3);

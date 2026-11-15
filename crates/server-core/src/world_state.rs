@@ -794,6 +794,19 @@ impl WorldState {
                 })
                 && self.write_block(bx, by, bz, AIR, changes)
             {
+                // `World::useBreakOn($this->position)`: the block is
+                // destroyed, not silently swapped for air. The destroy event
+                // is what makes viewers see the break particles and hear the
+                // block's break sound (`BlockBreakParticle` ->
+                // `LevelEventPacket(EVENT_PARTICLE_DESTROY)`); a bare
+                // `UpdateBlockPacket` to air produces neither.
+                self.add_level_event(
+                    bedrock_protocol::packets::level_event::LEVEL_EVENT_PARTICLE_DESTROY_BLOCK,
+                    id as i32,
+                    bx,
+                    by,
+                    bz,
+                );
                 tracing::debug!("world.physics_break: ({},{},{}) {:#010X}", bx, by, bz, id);
                 for face in crate::physics::ALL_FACES {
                     let (dx, dy, dz) = crate::physics::offset(face);
@@ -1683,6 +1696,33 @@ mod tests {
         // `Torch::onNearbyBlockChange()` -> `World::useBreakOn()`.
         world.set_block(5, 20, 5, AIR);
         assert_eq!(world.block_at(5, 21, 5), AIR);
+    }
+
+    #[test]
+    fn a_torch_that_loses_its_support_is_destroyed_with_its_particles() {
+        use bedrock_protocol::packets::level_event::LEVEL_EVENT_PARTICLE_DESTROY_BLOCK;
+        use bedrock_world::block_id::AIR;
+        use bedrock_world::block_states;
+
+        let world = WorldState::new("world", Arc::new(FlatGenerator::new()));
+        let stone = block_states::network_id("stone").unwrap();
+        let torch = block_states::network_id("torch").unwrap();
+        world.set_block(6, 20, 6, stone);
+        world.set_block(6, 21, 6, torch);
+        world.take_pending_level_events();
+
+        // `StaticSupportTrait::onNearbyBlockChange()` -> `World::useBreakOn()`.
+        world.set_block(6, 20, 6, AIR);
+        assert_eq!(world.block_at(6, 21, 6), AIR);
+        let events = world.take_pending_level_events();
+        assert!(
+            events.iter().any(|(event_id, data, x, y, z)| {
+                *event_id == LEVEL_EVENT_PARTICLE_DESTROY_BLOCK
+                    && *data == torch as i32
+                    && (*x, *y, *z) == (6, 21, 6)
+            }),
+            "the destroyed torch must queue EVENT_PARTICLE_DESTROY: {events:?}"
+        );
     }
 
     #[test]

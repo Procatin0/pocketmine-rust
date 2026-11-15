@@ -128,7 +128,7 @@ pub use set_display_objective::{SetDisplayObjectivePacket, display_slot, sort_or
 pub use set_score::{ScorePacketEntry, ScorePacketEntryAction, SetScorePacket};
 pub use set_scoreboard_identity::{ScoreboardIdentityPacketEntry, SetScoreboardIdentityPacket};
 pub use level_event::{
-    level_event_wire, LEVEL_EVENT_BLOCK_BREAK_SPEED, LEVEL_EVENT_BLOCK_START_BREAK,
+    level_event_wire, level_event_wire_at, LEVEL_EVENT_BLOCK_BREAK_SPEED, LEVEL_EVENT_BLOCK_START_BREAK,
     LEVEL_EVENT_BLOCK_STOP_BREAK, LEVEL_EVENT_PACKET_ID,
 };
 pub use level_sound_event::{

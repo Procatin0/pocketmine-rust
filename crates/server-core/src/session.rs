@@ -37,7 +37,7 @@ use bedrock_protocol::packets::player_auth_input::{
     INPUT_FLAG_STOP_SPRINTING, INPUT_FLAG_STOP_SWIMMING,
 };
 use bedrock_protocol::packets::level_event::{
-    level_event_wire as level_packet_wire, LEVEL_EVENT_BLOCK_START_BREAK,
+    level_event_wire_at as level_packet_wire_at, LEVEL_EVENT_BLOCK_START_BREAK,
     LEVEL_EVENT_BLOCK_STOP_BREAK, LEVEL_EVENT_PACKET_ID, LEVEL_EVENT_PARTICLE_DESTROY_BLOCK,
     LEVEL_EVENT_SOUND_DOOR,
 };
@@ -8766,7 +8766,20 @@ impl SessionManager {
         y: i32,
         z: i32,
     ) -> usize {
-        let chunk = (x >> 4, z >> 4);
+        self.broadcast_level_event_at(event_id, event_data, x as f32, y as f32, z as f32)
+    }
+
+    /// `broadcast_level_event` for the fractional positions PocketMine passes
+    /// to `World::addParticle()`/`World::addSound()` (block centre, +0.5).
+    pub(crate) fn broadcast_level_event_at(
+        &self,
+        event_id: i32,
+        event_data: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+    ) -> usize {
+        let chunk = ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4);
         // `RawWire` carries the packet id inside the buffer (same convention
         // as [`update_block_wire`]); the crate helper emits the payload only.
         let mut wire = Vec::with_capacity(16);
@@ -8775,7 +8788,7 @@ impl SessionManager {
             writer.write_var_u32(LEVEL_EVENT_PACKET_ID);
             wire.extend_from_slice(&writer.into_bytes());
         }
-        wire.extend_from_slice(&level_packet_wire(event_id, event_data, x, y, z));
+        wire.extend_from_slice(&level_packet_wire_at(event_id, event_data, x, y, z));
         let mut map = self.sessions.write();
         let mut recipients = 0usize;
         for session in map.values_mut() {
@@ -8894,8 +8907,16 @@ impl SessionManager {
         let landed = self.world.tick_entities();
         // `World::addSound()` / `addParticle()` level events queued by the
         // world itself (e.g. `AnvilFallSound` when an anvil lands).
+        // `World::addSound()`/`addParticle()` take a `Vector3`: the block
+        // centre, not the cell corner.
         for (event_id, event_data, x, y, z) in self.world.take_pending_level_events() {
-            self.broadcast_level_event(event_id, event_data, x, y, z);
+            self.broadcast_level_event_at(
+                event_id,
+                event_data,
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                z as f32 + 0.5,
+            );
         }
         self.apply_falling_block_damage(&landed);
         self.flush_actor_sounds();
@@ -11845,6 +11866,47 @@ mod engine_physics_tests {
             .pending_outgoing
             .iter()
             .any(|packet| matches!(packet, OutgoingPacket::TakeItemActor(_))));
+    }
+
+    #[test]
+    fn a_support_break_reaches_viewers_as_a_destroy_event() {
+        let manager = Arc::new(SessionManager::with_generator(Arc::new(FlatGenerator::new())));
+        let mut viewer = joined(1, &[(0, 0)]);
+        viewer.world = Arc::clone(manager.world());
+        manager.add_session(viewer);
+
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        let torch = bedrock_world::block_states::network_id("torch").unwrap();
+        assert!(manager.world().set_block(5, 20, 5, stone));
+        assert!(manager.world().set_block(5, 21, 5, torch));
+        manager.tick();
+        // `StaticSupportTrait::onNearbyBlockChange()` breaks the torch.
+        assert!(manager.world().set_block(5, 20, 5, AIR));
+        assert_eq!(manager.world().block_at(5, 21, 5), AIR);
+        manager.tick();
+
+        let map = manager.sessions.read();
+        let mut found = false;
+        for packet in &map[&1].pending_outgoing {
+            let OutgoingPacket::RawWire(bytes) = packet else {
+                continue;
+            };
+            let mut reader = Reader::new(bytes);
+            if reader.read_var_u32().ok() != Some(LEVEL_EVENT_PACKET_ID) {
+                continue;
+            }
+            let event_id = reader.read_var_i32().expect("event id");
+            let x = reader.read_f32_le().expect("x");
+            let y = reader.read_f32_le().expect("y");
+            let z = reader.read_f32_le().expect("z");
+            let data = reader.read_var_i32().expect("event data");
+            if event_id == LEVEL_EVENT_PARTICLE_DESTROY_BLOCK && data == torch as i32 {
+                // `World::addParticle($pos->add(0.5, 0.5, 0.5), ...)`.
+                assert_eq!((x, y, z), (5.5, 21.5, 5.5));
+                found = true;
+            }
+        }
+        assert!(found, "the destroyed torch must reach the viewer as 2001");
     }
 
     #[test]
