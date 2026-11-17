@@ -24,9 +24,6 @@
 > While it implements essential native gameplay mechanics (procedural world generation, authoritative inventories, crafting tables, anvils, falling block physics, scoreboards, and basic entity handling), it is **not** an exhaustive vanilla survival implementation (for example, full vanilla mob AI behaviors, Nether/The End dimensions, and complex vanilla redstone machines are not fully provided).
 >
 > If you are trying to host a purely vanilla survival multiplayer server, please use the [official Minecraft: Bedrock Dedicated Server](https://minecraft.net/download/server/bedrock).
->
-> ---
-> 🇪🇸 **Nota:** **PocketMine-Rust (Axolotl-PM) NO es un servidor de Minecraft vanilla.** Está diseñado principalmente para alto rendimiento, modos de juego personalizados, minijuegos, lobbies y compatibilidad con plugins de PocketMine-MP 5 junto a cross-play nativo Bedrock + Java. Si buscas alojar un servidor de supervivencia puramente vanilla, por favor utiliza el software oficial [Minecraft: Bedrock Dedicated Server](https://minecraft.net/download/server/bedrock).
 
 ---
 
