@@ -1,7 +1,7 @@
-# ⚡ AmberPM (PocketMine-Rust)
+# ⚡ PocketMine-Rust (Axolotl-PM)
 
 <p align="center">
-  <img src="architecture.svg" alt="AmberPM Architecture" width="700"/>
+  <img src="architecture.svg" alt="PocketMine-Rust Architecture" width="700"/>
 </p>
 
 <p align="center">
@@ -18,16 +18,21 @@
 </p>
 
 > [!WARNING]
-> ### ❌ AmberPM is NOT a vanilla Minecraft server software.
-> It is designed primarily for custom game modes, minigames, and lobby servers. AmberPM implements selected native gameplay mechanics, including redstone circuits, pistons, dispensers, and droppers, but it is not a complete vanilla survival implementation (for example, full vanilla mob AI and vanilla world generation are not provided).
+> ### ⚠️ PocketMine-Rust is NOT a vanilla Minecraft server software
+> **PocketMine-Rust (Axolotl-PM)** is designed primarily for high-performance networks, custom game modes, minigames, lobbies, and running **PocketMine-MP 5** PHP plugins with native **Bedrock + Java** cross-play.
 >
-> If you are trying to host a purely vanilla survival multiplayer server, please use the [official Minecraft: Bedrock server software](https://minecraft.net/download/server/bedrock).
+> While it implements essential native gameplay mechanics (procedural world generation, authoritative inventories, crafting tables, anvils, falling block physics, scoreboards, and basic entity handling), it is **not** an exhaustive vanilla survival implementation (for example, full vanilla mob AI behaviors, Nether/The End dimensions, and complex vanilla redstone machines are not fully provided).
+>
+> If you are trying to host a purely vanilla survival multiplayer server, please use the [official Minecraft: Bedrock Dedicated Server](https://minecraft.net/download/server/bedrock).
+>
+> ---
+> 🇪🇸 **Nota:** **PocketMine-Rust (Axolotl-PM) NO es un servidor de Minecraft vanilla.** Está diseñado principalmente para alto rendimiento, modos de juego personalizados, minijuegos, lobbies y compatibilidad con plugins de PocketMine-MP 5 junto a cross-play nativo Bedrock + Java. Si buscas alojar un servidor de supervivencia puramente vanilla, por favor utiliza el software oficial [Minecraft: Bedrock Dedicated Server](https://minecraft.net/download/server/bedrock).
 
 ---
 
 ## 🌟 Overview / Descripción General
 
-**AmberPM** (PocketMine-Rust / Axolotl-PM) is an ultra-fast, cross-platform Minecraft server engine built from the ground up in **Rust**. It eliminates the single-threaded bottlenecks and garbage collection pauses typical of traditional PHP and Java server implementations while preserving 100% compatibility with **PocketMine-MP 5** plugins and allowing **Minecraft Bedrock and Java Edition** players to play together natively without third-party proxies.
+**PocketMine-Rust (Axolotl-PM)** is an ultra-fast, cross-platform Minecraft server engine built from the ground up in **Rust**. It eliminates the single-threaded bottlenecks and garbage collection pauses typical of traditional PHP and Java server implementations while preserving 100% compatibility with **PocketMine-MP 5** plugins and allowing **Minecraft Bedrock and Java Edition** players to play together natively without third-party proxies.
 
 > 🇪🇸 **En español:** Servidor de Minecraft de alto rendimiento escrito en Rust nativo, con soporte simultáneo para clientes Bedrock y Java (cross-play integrado sin proxies externos) y compatibilidad con plugins de PocketMine-MP 5 en PHP 8.2.
 
@@ -148,6 +153,29 @@ Explore detailed documentation in the [`docs/wiki/`](docs/wiki/) directory:
 - ☕ [16 — Puente con Minecraft Java](docs/wiki/16-java-bridge.md)
 - 🌍 [17 — Persistencia de mundos y estados](docs/wiki/17-mundo-persistencia.md)
 - 🚢 [18 — Guía de despliegue y producción](docs/wiki/18-deploy.md)
+
+---
+
+## 🙏 Credits / Créditos
+
+- **[cubiomes](https://github.com/Cubitect/cubiomes)** by **Cubitect** (MIT) — the
+  world generator uses its Minecraft biome generator to decide the biome of every
+  surface column. The full library is vendored in
+  [`crates/bedrock-world/vendor/cubiomes`](crates/bedrock-world/vendor/cubiomes)
+  and compiled by `crates/bedrock-world/build.rs`; its MIT license is kept next to
+  the sources in
+  [`vendor/cubiomes/LICENSE`](crates/bedrock-world/vendor/cubiomes/LICENSE).
+
+  **ES:** el generador de mundo usa **cubiomes** (de **Cubitect**) para elegir el
+  bioma de cada columna de superficie — es el generador de biomas real de
+  Minecraft, no una reimplementación. La librería completa está incluida en
+  [`crates/bedrock-world/vendor/cubiomes`](crates/bedrock-world/vendor/cubiomes),
+  se compila desde `crates/bedrock-world/build.rs` y conserva su licencia MIT en
+  [`vendor/cubiomes/LICENSE`](crates/bedrock-world/vendor/cubiomes/LICENSE).
+
+  ```text
+  MIT License — Copyright (c) 2020 Cubitect
+  ```
 
 ---
 
