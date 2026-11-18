@@ -9,8 +9,10 @@ use bedrock_protocol::packets::container_close::ContainerClosePacket;
 use bedrock_protocol::packets::container_open::ContainerOpenPacket;
 
 pub use bedrock_protocol::packets::container_open::{
-    BLOCK_CONTAINER_ACTOR_ID, CONTAINER_TYPE_ANVIL, CONTAINER_TYPE_CONTAINER,
-    CONTAINER_TYPE_INVENTORY, CONTAINER_TYPE_WORKBENCH,
+    BLOCK_CONTAINER_ACTOR_ID, CONTAINER_TYPE_ANVIL, CONTAINER_TYPE_BLAST_FURNACE,
+    CONTAINER_TYPE_BREWING_STAND, CONTAINER_TYPE_CONTAINER, CONTAINER_TYPE_DISPENSER,
+    CONTAINER_TYPE_DROPPER, CONTAINER_TYPE_FURNACE, CONTAINER_TYPE_HOPPER,
+    CONTAINER_TYPE_INVENTORY, CONTAINER_TYPE_SMOKER, CONTAINER_TYPE_WORKBENCH,
 };
 use bedrock_protocol::packets::item_stack_response::ItemStackResponsePacket;
 use bedrock_protocol::{BlockPos, ItemStack};
@@ -31,6 +33,26 @@ pub fn container_open_wire(
         BlockPos::new(position.0, position.1, position.2),
         actor_unique_id,
     )
+    .encode_payload(&mut writer);
+    writer.into_bytes().to_vec()
+}
+
+/// `InventoryContentPacket` (0x31): every slot of one window.
+///
+/// PocketMine sends `FullContainerName(0, null)` for all windows, so
+/// `container_id` stays 0 and no dynamic id is emitted.
+pub fn inventory_content_wire(window_id: u32, items: &[ItemStack]) -> Vec<u8> {
+    use bedrock_protocol::packets::inventory_content::InventoryContentPacket;
+
+    let mut writer = Writer::new();
+    writer.write_var_u32(InventoryContentPacket::PACKET_ID);
+    InventoryContentPacket {
+        window_id,
+        items: items.to_vec(),
+        container_id: 0,
+        dynamic_container_id: None,
+        storage: ItemStack::empty(),
+    }
     .encode_payload(&mut writer);
     writer.into_bytes().to_vec()
 }

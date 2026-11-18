@@ -23,6 +23,7 @@
 //! (varint lengths/ints), so each entry is parsed and re-serialized in the
 //! little-endian form the hash is defined over.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -51,6 +52,12 @@ struct BlockStateTable {
     by_name: HashMap<String, u32>,
     props: HashMap<u32, Vec<(String, Value)>>,
     by_state: HashMap<String, u32>,
+    /// Position in the canonical palette (order of
+    /// `data/canonical_block_states.nbt`), which is the index
+    /// `data/block_state_meta_map.json` uses.
+    index_by_hash: HashMap<u32, usize>,
+    /// Inverse of `index_by_hash`: palette position -> network id.
+    id_at_index: Vec<u32>,
     /// Connectable states only: network id -> index into the Java per-connection
     /// table (`data/java/connections/<protocol>.json`). Sparse (~5k of the
     /// 23960 states), so plain blocks pay one small-map lookup at most.
@@ -78,9 +85,115 @@ pub fn network_id(name: &str) -> Option<u32> {
     table().by_name.get(bare).copied()
 }
 
+/// Bedrock block name for a Java block/item name, translating the families
+/// where Bedrock kept a legacy name.
+///
+/// Most blocks share their name across editions; these are the exceptions
+/// (`wooden_door` for `oak_door`, `brick_block` for `bricks`, `web` for
+/// `cobweb`, `reeds` for `sugar_cane`, `normal_stone_slab` for `stone_slab`,
+/// ...). Without this translation a Java placement of any of them resolved to
+/// no Bedrock block and silently did nothing.
+pub fn java_to_bedrock_block_name(name: &str) -> Option<Cow<'_, str>> {
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    if network_id(bare).is_some() {
+        return Some(Cow::Borrowed(bare));
+    }
+    if let Some(mapped) = legacy_bedrock_name(bare) {
+        return network_id(mapped).map(|_| Cow::Borrowed(mapped));
+    }
+    // Java `oak_*` is Bedrock `wooden_*` (`wooden_door`, `wooden_button`, ...)
+    // or the bare family name (`trapdoor`, `fence_gate`).
+    if let Some(rest) = bare.strip_prefix("oak_") {
+        let wooden = format!("wooden_{rest}");
+        if network_id(&wooden).is_some() {
+            return Some(Cow::Owned(wooden));
+        }
+        if network_id(rest).is_some() {
+            return Some(Cow::Borrowed(rest));
+        }
+    }
+    // `<wood>_sign` is Bedrock's `<wood>_standing_sign` (dark oak is
+    // `darkoak_*` there), with the plain oak sign as the last resort.
+    if let Some(wood) = bare.strip_suffix("_sign") {
+        let wood = wood.replace("dark_oak", "darkoak");
+        let standing = format!("{wood}_standing_sign");
+        if network_id(&standing).is_some() {
+            return Some(Cow::Owned(standing));
+        }
+        if network_id("standing_sign").is_some() {
+            return Some(Cow::Borrowed("standing_sign"));
+        }
+    }
+    // Every bed and banner is one Bedrock block; the colour lives in the block
+    // entity, so the dyed variants still get a block to place.
+    if bare.ends_with("_bed") && network_id("bed").is_some() {
+        return Some(Cow::Borrowed("bed"));
+    }
+    if bare.ends_with("_banner") && network_id("standing_banner").is_some() {
+        return Some(Cow::Borrowed("standing_banner"));
+    }
+    None
+}
+
+/// Bedrock names that replaced a Java name one to one (see
+/// [`java_to_bedrock_block_name`]). The creative test blocks have no Bedrock
+/// equivalent and are intentionally absent.
+fn legacy_bedrock_name(java: &str) -> Option<&'static str> {
+    Some(match java {
+        "rooted_dirt" => "dirt_with_roots",
+        "nether_quartz_ore" => "quartz_ore",
+        "waxed_copper_block" => "waxed_copper",
+        "flowering_azalea_leaves" => "azalea_leaves_flowered",
+        "cobweb" => "web",
+        "dead_bush" => "deadbush",
+        "sugar_cane" => "reeds",
+        "small_dripleaf" => "small_dripleaf_block",
+        "stone_slab" => "normal_stone_slab",
+        "bricks" => "brick_block",
+        "spawner" => "mob_spawner",
+        "cobblestone_stairs" => "stone_stairs",
+        "snow_block" => "snow",
+        "jack_o_lantern" => "lit_pumpkin",
+        "melon" => "melon_block",
+        "lily_pad" => "waterlily",
+        "nether_bricks" => "nether_brick",
+        "red_nether_bricks" => "red_nether_brick",
+        "end_stone_bricks" => "end_bricks",
+        "light" => "light_block_15",
+        "terracotta" => "hardened_clay",
+        "dirt_path" => "grass_path",
+        "prismarine_brick_stairs" => "prismarine_bricks_stairs",
+        "magma_block" => "magma",
+        "shulker_box" => "undyed_shulker_box",
+        "light_gray_glazed_terracotta" => "silver_glazed_terracotta",
+        "end_stone_brick_stairs" => "end_brick_stairs",
+        "repeater" => "unpowered_repeater",
+        "comparator" => "unpowered_comparator",
+        "slime_block" => "slime",
+        "note_block" => "noteblock",
+        "powered_rail" => "golden_rail",
+        "chain" => "iron_chain",
+        "frogspawn" => "frog_spawn",
+        _ => return None,
+    })
+}
+
 /// Number of properties of a state, when known (0 for simple blocks).
 pub fn state_property_count(network_id: u32) -> Option<usize> {
     table().by_hash.get(&network_id).map(|(_, count)| *count)
+}
+
+/// Position of a state in the canonical palette.
+///
+/// BDS ships per-state data as arrays indexed by this position (the legacy
+/// meta map, for instance); the runtime network id is its hash instead.
+pub fn state_index(network_id: u32) -> Option<usize> {
+    table().index_by_hash.get(&network_id).copied()
+}
+
+/// Network id of the state at a canonical palette position.
+pub fn state_id_at(index: usize) -> Option<u32> {
+    table().id_at_index.get(index).copied()
 }
 
 fn build() -> BlockStateTable {
@@ -92,11 +205,15 @@ fn build() -> BlockStateTable {
     let mut props = HashMap::with_capacity(states.len());
     let mut by_state = HashMap::with_capacity(states.len());
     let mut connection_index = HashMap::with_capacity(4096);
+    let mut index_by_hash = HashMap::with_capacity(states.len());
+    let mut id_at_index = Vec::with_capacity(states.len());
 
-    for (name, properties) in &states {
+    for (position, (name, properties)) in states.iter().enumerate() {
         let hash = state_hash(name, properties);
         let bare = name.strip_prefix("minecraft:").unwrap_or(name).to_string();
         by_hash.insert(hash, (bare.clone(), properties.len()));
+        index_by_hash.insert(hash, position);
+        id_at_index.push(hash);
         by_state.insert(state_key(&bare, properties), hash);
         if let Some(index) = connection_index_of(&bare, properties) {
             connection_index.insert(hash, index);
@@ -124,6 +241,8 @@ fn build() -> BlockStateTable {
         by_name,
         props,
         by_state,
+        index_by_hash,
+        id_at_index,
         connection_index,
     }
 }
@@ -338,6 +457,18 @@ pub fn recalculate_connections(
     (rebuilt != network_id).then_some(rebuilt)
 }
 
+/// Index of a property in a state, accepting both spellings the canonical
+/// table uses: some blocks carry the `minecraft:` prefix
+/// (`minecraft:cardinal_direction`) and others do not (`repeater_delay`), so a
+/// caller that only knows the bare name must still find the value.
+fn property_slot(props: &[(String, Value)], key: &str) -> Option<usize> {
+    if let Some(index) = props.iter().position(|(candidate, _)| candidate == key) {
+        return Some(index);
+    }
+    let prefixed = format!("minecraft:{key}");
+    props.iter().position(|(candidate, _)| *candidate == prefixed)
+}
+
 /// Rebuilds a state with one property replaced, keeping the property's own
 /// type (`true`/`false` for the byte booleans, the enum name for strings).
 /// Returns `None` when the state has no such property.
@@ -345,7 +476,8 @@ pub fn with_property(network_id: u32, key: &str, value: &str) -> Option<u32> {
     let table = table();
     let (name, _) = table.by_hash.get(&network_id)?;
     let mut props = table.props.get(&network_id)?.clone();
-    let slot = props.iter_mut().find(|(candidate, _)| candidate == key)?;
+    let slot = property_slot(&props, key)?;
+    let slot = &mut props[slot];
     slot.1 = match &slot.1 {
         Value::Byte(_) => Value::Byte(matches!(value, "true" | "1") as i8),
         Value::Int(_) => Value::Int(value.parse().ok()?),
@@ -355,11 +487,25 @@ pub fn with_property(network_id: u32, key: &str, value: &str) -> Option<u32> {
     table.by_state.get(&state_key(name, &props)).copied()
 }
 
+/// Rebuilds a state as another block of the same family, keeping every
+/// property (`repeater` <-> `powered_repeater`, `redstone_torch` <->
+/// `unlit_redstone_torch`, `redstone_lamp` <-> `lit_redstone_lamp`).
+///
+/// Returns `None` when the source id is not canonical or the target block has
+/// no state with exactly those properties.
+pub fn with_name(network_id: u32, name: &str) -> Option<u32> {
+    let table = table();
+    table.by_hash.get(&network_id)?;
+    let props = table.props.get(&network_id)?.clone();
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    table.by_state.get(&state_key(bare, &props)).copied()
+}
+
 /// Reads an integer property (`Int`, or a `Byte`) of a state, `None` when the
 /// state has no such property.
 pub fn int_property(network_id: u32, key: &str) -> Option<i32> {
     let props = table().props.get(&network_id)?;
-    match props.iter().find(|(candidate, _)| candidate == key)?.1 {
+    match props.get(property_slot(props, key)?)?.1 {
         Value::Int(value) => Some(value),
         Value::Byte(value) => Some(value as i32),
         _ => None,
@@ -370,9 +516,76 @@ pub fn int_property(network_id: u32, key: &str) -> Option<i32> {
 /// has no such property.
 pub fn bool_property(network_id: u32, key: &str) -> Option<bool> {
     let props = table().props.get(&network_id)?;
-    match props.iter().find(|(candidate, _)| candidate == key)?.1 {
+    match props.get(property_slot(props, key)?)?.1 {
         Value::Byte(value) => Some(value != 0),
         _ => None,
+    }
+}
+
+/// Reads a string property (a facing/direction enum), `None` when the state
+/// has no such property.
+pub fn string_property(network_id: u32, key: &str) -> Option<&'static str> {
+    let props = table().props.get(&network_id)?;
+    match &props.get(property_slot(props, key)?)?.1 {
+        Value::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// Container window a right-clicked block opens, mirroring the PocketMine
+/// `onInteract()` implementations that call `Player::setCurrentWindow()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// 3x3 crafting grid (`CraftingTable::onInteract`).
+    CraftingTable,
+    /// 2-slot repair/rename inventory (`Anvil::onInteract`).
+    Anvil,
+    BrewingStand,
+    Furnace,
+    BlastFurnace,
+    Smoker,
+    Chest,
+    Barrel,
+    Dispenser,
+    Dropper,
+    Hopper,
+    ShulkerBox,
+    EnderChest,
+    EnchantingTable,
+    Grindstone,
+    Loom,
+    CartographyTable,
+    SmithingTable,
+    Stonecutter,
+    Beacon,
+}
+
+impl ContainerKind {
+    /// Stable snake_case name (`"crafting_table"`, `"brewing_stand"`, ...),
+    /// used for logs and for the session container bookkeeping.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CraftingTable => "crafting_table",
+            Self::Anvil => "anvil",
+            Self::BrewingStand => "brewing_stand",
+            Self::Furnace => "furnace",
+            Self::BlastFurnace => "blast_furnace",
+            Self::Smoker => "smoker",
+            Self::Chest => "chest",
+            Self::Barrel => "barrel",
+            Self::Dispenser => "dispenser",
+            Self::Dropper => "dropper",
+            Self::Hopper => "hopper",
+            Self::ShulkerBox => "shulker_box",
+            Self::EnderChest => "ender_chest",
+            Self::EnchantingTable => "enchanting_table",
+            Self::Grindstone => "grindstone",
+            Self::Loom => "loom",
+            Self::CartographyTable => "cartography_table",
+            Self::SmithingTable => "smithing_table",
+            Self::Stonecutter => "stonecutter",
+            Self::Beacon => "beacon",
+        }
     }
 }
 
@@ -386,19 +599,67 @@ pub struct Interaction {
     /// Whether the block is powered after the click (button pressed, lever
     /// on). Fence gates report [`Interaction::door_sound`] instead.
     pub powered: bool,
-    /// PM `FenceGate::onInteract()` plays `DoorSound`
+    /// PM `FenceGate::onInteract()` and `Door::onInteract` play `DoorSound`
     /// (`LevelEvent::SOUND_DOOR`), not a redstone sound.
     pub door_sound: bool,
     /// PM `Button::getActivationTime()`: ticks until the button releases
     /// itself. `None` for levers and gates, whose change is permanent.
     pub reset_after_ticks: Option<i32>,
+    /// Container screen the click opens (`Chest::onInteract`,
+    /// `CraftingTable::onInteract`, `BrewingStand::onInteract`, ...).
+    /// `None` for the pure state toggles above.
+    pub open_container: Option<ContainerKind>,
+}
+
+/// Container kind of a block name, when the block has a container inventory.
+fn container_of(name: &str) -> Option<ContainerKind> {
+    Some(match name {
+        "crafting_table" => ContainerKind::CraftingTable,
+        "anvil" | "chipped_anvil" | "damaged_anvil" | "deprecated_anvil" => {
+            ContainerKind::Anvil
+        }
+        "brewing_stand" => ContainerKind::BrewingStand,
+        "furnace" | "lit_furnace" => ContainerKind::Furnace,
+        "blast_furnace" | "lit_blast_furnace" => ContainerKind::BlastFurnace,
+        "smoker" | "lit_smoker" => ContainerKind::Smoker,
+        "barrel" => ContainerKind::Barrel,
+        "dispenser" => ContainerKind::Dispenser,
+        "dropper" => ContainerKind::Dropper,
+        "hopper" => ContainerKind::Hopper,
+        "ender_chest" => ContainerKind::EnderChest,
+        "enchanting_table" => ContainerKind::EnchantingTable,
+        "grindstone" => ContainerKind::Grindstone,
+        "loom" => ContainerKind::Loom,
+        "cartography_table" => ContainerKind::CartographyTable,
+        "smithing_table" => ContainerKind::SmithingTable,
+        "stonecutter" | "stonecutter_block" => ContainerKind::Stonecutter,
+        "beacon" => ContainerKind::Beacon,
+        // `chest`, `trapped_chest` and the copper chest family.
+        _ if name == "chest" || name.ends_with("_chest") => ContainerKind::Chest,
+        _ if name.ends_with("shulker_box") => ContainerKind::ShulkerBox,
+        _ => return None,
+    })
 }
 
 /// Right-click behaviour for the blocks PM gives an `onInteract()`:
-/// buttons, levers and fence gates. `None` means the click is not an
-/// interaction and must fall through to item placement.
+/// buttons, levers, fence gates, doors, trapdoors and the container blocks.
+/// `None` means the click is not an interaction and must fall through to
+/// item placement.
 pub fn interact(network_id: u32) -> Option<Interaction> {
     let name = state_name(network_id)?;
+
+    // Container blocks (`Chest::onInteract`, `CraftingTable::onInteract`,
+    // `BrewingStand::onInteract`, `Dispenser::onInteract`, ...): the click
+    // opens a window and is always consumed, never a placement.
+    if let Some(kind) = container_of(name) {
+        return Some(Interaction {
+            new_state: network_id,
+            powered: false,
+            door_sound: false,
+            reset_after_ticks: None,
+            open_container: Some(kind),
+        });
+    }
 
     // `Button::onInteract()`: press once, then let the scheduled update
     // release it. A pressed button still consumes the click.
@@ -409,6 +670,7 @@ pub fn interact(network_id: u32) -> Option<Interaction> {
                 powered: true,
                 door_sound: false,
                 reset_after_ticks: None,
+                open_container: None,
             });
         }
         let new_state = with_property(network_id, "button_pressed_bit", "true")?;
@@ -418,6 +680,7 @@ pub fn interact(network_id: u32) -> Option<Interaction> {
             door_sound: false,
             // `StoneButton::getActivationTime()` = 20, `WoodenButton` = 30.
             reset_after_ticks: Some(if name.contains("stone") { 20 } else { 30 }),
+            open_container: None,
         });
     }
 
@@ -429,6 +692,7 @@ pub fn interact(network_id: u32) -> Option<Interaction> {
             powered,
             door_sound: false,
             reset_after_ticks: None,
+            open_container: None,
         });
     }
 
@@ -443,6 +707,24 @@ pub fn interact(network_id: u32) -> Option<Interaction> {
             powered: open,
             door_sound: true,
             reset_after_ticks: None,
+            open_container: None,
+        });
+    }
+
+    // `Door::onInteract()` / `Trapdoor::onInteract()`: toggle `open_bit` and
+    // play the door sound. The other door half is mirrored by the world (it
+    // needs the neighbouring block); iron doors and trapdoors only react to
+    // redstone (`canBeActivated()` is false), so a hand click falls through.
+    let door_or_trapdoor =
+        name.ends_with("_door") || name == "trapdoor" || name.ends_with("_trapdoor");
+    if door_or_trapdoor && !name.starts_with("iron_") {
+        let open = !bool_property(network_id, "open_bit").unwrap_or(false);
+        return Some(Interaction {
+            new_state: with_property(network_id, "open_bit", if open { "true" } else { "false" })?,
+            powered: open,
+            door_sound: true,
+            reset_after_ticks: None,
+            open_container: None,
         });
     }
 
@@ -930,6 +1212,29 @@ mod tests {
     use super::*;
     use crate::block_id;
 
+    /// The hand written network ids must be exactly what `ComputeBlockHash`
+    /// produces for the block's canonical state, otherwise the client resolves
+    /// them to something else. Comparing against a handful of ids pins the
+    /// serialization down, which is what lets derived entries such as clay be
+    /// trusted instead of guessed.
+    #[test]
+    fn block_id_constants_match_the_state_hash() {
+        let plain = |name: &str, id: u32| assert_eq!(state_hash(name, &[]), id, "{name}");
+        plain("minecraft:stone", block_id::STONE);
+        plain("minecraft:dirt", block_id::DIRT);
+        plain("minecraft:sand", block_id::SAND);
+        plain("minecraft:sandstone", block_id::SANDSTONE);
+        plain("minecraft:gravel", block_id::GRAVEL);
+        plain("minecraft:clay", block_id::CLAY);
+        // Surface blocks: every one of these is a bare state, so the hash is
+        // taken over the empty property list.
+        plain("minecraft:podzol", block_id::PODZOL);
+        plain("minecraft:coarse_dirt", block_id::COARSE_DIRT);
+        plain("minecraft:red_sand", block_id::RED_SAND);
+        plain("minecraft:red_sandstone", block_id::RED_SANDSTONE);
+        plain("minecraft:ice", block_id::ICE);
+    }
+
     /// Blocks outside the hand-written tables must resolve on the Java side
     /// too, otherwise a Bedrock placement still rendered as air.
     #[test]
@@ -1226,6 +1531,60 @@ mod tests {
     }
 
     #[test]
+    fn a_wooden_door_swings_with_the_door_sound() {
+        let door = network_id("spruce_door").expect("spruce_door");
+        let open = interact(door).expect("a door is interactive");
+        assert!(open.door_sound);
+        assert!(open.open_container.is_none());
+        assert_eq!(bool_property(open.new_state, "open_bit"), Some(true));
+
+        // The other half is mirrored by `WorldState::interact_block`, which
+        // has the neighbouring block; `interact` only sees one state.
+        let closed = interact(open.new_state).expect("a door closes");
+        assert!(!closed.powered);
+        assert_eq!(bool_property(closed.new_state, "open_bit"), Some(false));
+    }
+
+    #[test]
+    fn a_trapdoor_swings_but_iron_ones_only_react_to_redstone() {
+        let trapdoor = network_id("trapdoor").expect("trapdoor");
+        let open = interact(trapdoor).expect("a trapdoor is interactive");
+        assert!(open.door_sound);
+        assert_eq!(bool_property(open.new_state, "open_bit"), Some(true));
+
+        // `IronDoor`/`IronTrapdoor` are not hand-openable (`canBeActivated()`).
+        assert_eq!(interact(network_id("iron_trapdoor").unwrap()), None);
+        assert_eq!(interact(network_id("iron_door").unwrap()), None);
+    }
+
+    #[test]
+    fn container_blocks_resolve_their_window() {
+        let table = network_id("crafting_table").unwrap();
+        let open = interact(table).expect("crafting table is interactive");
+        assert_eq!(open.open_container, Some(ContainerKind::CraftingTable));
+        assert_eq!(open.new_state, table, "no state change, only a window");
+        assert!(!open.door_sound);
+
+        for (name, kind) in [
+            ("chipped_anvil", ContainerKind::Anvil),
+            ("brewing_stand", ContainerKind::BrewingStand),
+            ("dispenser", ContainerKind::Dispenser),
+            ("dropper", ContainerKind::Dropper),
+            ("hopper", ContainerKind::Hopper),
+            ("chest", ContainerKind::Chest),
+            ("trapped_chest", ContainerKind::Chest),
+            ("furnace", ContainerKind::Furnace),
+            ("lit_furnace", ContainerKind::Furnace),
+            ("barrel", ContainerKind::Barrel),
+            ("enchanting_table", ContainerKind::EnchantingTable),
+            ("stonecutter_block", ContainerKind::Stonecutter),
+        ] {
+            let id = network_id(name).unwrap_or_else(|| panic!("no default state for {name}"));
+            assert_eq!(interact(id).map(|i| i.open_container), Some(Some(kind)), "{name}");
+        }
+    }
+
+    #[test]
     fn plain_blocks_are_not_interactive() {
         for name in ["stone", "torch", "oak_fence", "glass_pane", "cobblestone_wall"] {
             let id = network_id(name).unwrap_or_else(|| panic!("no default state for {name}"));
@@ -1236,5 +1595,20 @@ mod tests {
     #[test]
     fn prefixed_and_bare_names_resolve_alike() {
         assert_eq!(network_id("stone"), network_id("minecraft:stone"));
+    }
+
+    /// Doors keep `minecraft:cardinal_direction` as a string state, so the
+    /// facing can be rebuilt for each quarter turn.
+    #[test]
+    fn a_door_facing_can_be_rebuilt_for_every_direction() {
+        let door = network_id("spruce_door").unwrap();
+        for facing in ["north", "east", "south", "west"] {
+            let state = with_property(door, "minecraft:cardinal_direction", facing)
+                .expect("door keeps a cardinal_direction state");
+            assert_eq!(
+                string_property(state, "minecraft:cardinal_direction"),
+                Some(facing)
+            );
+        }
     }
 }

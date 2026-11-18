@@ -15,11 +15,12 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bedrock_protocol::types::Vector3f;
 use bedrock_world::block_id;
 use bedrock_world::java_chunk::{ChunkBuilder, ModernChunk, ModernProfile};
 use java_bridge::{
-    BlockChange, BossBarFrame, ChatOutcome, LegacyChunk, LoadedData, ModernChunkData,
-    PlayerSnapshot, ScoreboardFrame, ServerHooks,
+    ActorSnapshot, BlockChange, BossBarFrame, ChatOutcome, LegacyChunk, LoadedData,
+    ModernChunkData, PlayerSnapshot, ScoreboardFrame, ServerHooks,
 };
 use java_bridge::display::bedrock_view_display_name;
 use parking_lot::Mutex;
@@ -35,10 +36,20 @@ pub struct CoreHooks {
     default_gamemode: i32,
     level_type: String,
     /// Converted legacy columns keyed by `(cx, cz, world version)`.
-    legacy_cache: Mutex<PayloadCache<(i32, i32, u64), LegacyChunk>>,
+    legacy_cache: Mutex<PayloadCache<(i32, i32, u64), Arc<LegacyChunk>>>,
     /// Converted modern columns keyed by `(protocol, cx, cz, version)`.
-    modern_cache: Mutex<PayloadCache<(i32, i32, i32, u64), ModernChunkData>>,
+    ///
+    /// Values are `Arc`s: `streamChunks` fans one column out to every observer,
+    /// and returning an owned payload made each observer copy ~80 KB.
+    modern_cache: Mutex<PayloadCache<(i32, i32, i32, u64), Arc<ModernChunkData>>>,
+    /// Java entity ids for Bedrock runtime ids ([`Self::actor_entity_id`]).
+    actor_ids: Mutex<HashMap<u64, i32>>,
+    next_actor_id: Mutex<i32>,
 }
+
+/// Java actor entity ids start here, above `entity_id_for`'s player range
+/// (`1_000_000+`), so a mob can never collide with a player body.
+const FIRST_ACTOR_ENTITY_ID: i32 = 2_000_000;
 
 /// Bound for converted Java chunk payloads. One modern payload is
 /// ~62 KB (measured: 8.4 KB data + 53 KB light + heightmaps), and the
@@ -114,6 +125,8 @@ impl CoreHooks {
             level_type,
             legacy_cache: Mutex::new(PayloadCache::new()),
             modern_cache: Mutex::new(PayloadCache::new()),
+            actor_ids: Mutex::new(HashMap::new()),
+            next_actor_id: Mutex::new(FIRST_ACTOR_ENTITY_ID),
         }
     }
 
@@ -160,12 +173,17 @@ impl CoreHooks {
             }
         }
         let generated = cold.len();
-        cold.par_iter().for_each(|&(cx, cz)| {
-            let world = self.manager.world();
-            if !world.has_chunk_cached(cx, cz) {
-                let _ = world.get_chunk_cached(cx, cz);
-            }
-            self.warm_payloads(cx, cz, protocols);
+        // Run on the generation pool (every core but one), so warming Java
+        // chunks can never take the core the central tick needs: with the whole
+        // machine busy, the tick was being descheduled for hundreds of ms.
+        crate::chunk_pipeline::generation_pool_ref().install(|| {
+            cold.par_iter().for_each(|&(cx, cz)| {
+                let world = self.manager.world();
+                if !world.has_chunk_cached(cx, cz) {
+                    let _ = world.get_chunk_cached(cx, cz);
+                }
+                self.warm_payloads(cx, cz, protocols);
+            });
         });
         generated
     }
@@ -183,10 +201,10 @@ impl CoreHooks {
             let (bitmap, data) = ChunkBuilder::from_chunk(&chunk);
             self.legacy_cache.lock().insert(
                 (cx, cz, version),
-                LegacyChunk {
+                Arc::new(LegacyChunk {
                     bitmap: bitmap as i32,
                     data,
-                },
+                }),
             );
         }
     }
@@ -206,11 +224,11 @@ impl CoreHooks {
             let heights = ModernChunk::heights_from_chunk(&chunk);
             self.modern_cache.lock().insert(
                 key,
-                ModernChunkData {
+                Arc::new(ModernChunkData {
                     heightmaps: ModernChunk::heightmaps(&heights, &profile),
                     light: ModernChunk::light(),
                     data,
-                },
+                }),
             );
         }
     }
@@ -261,6 +279,12 @@ impl ServerHooks for CoreHooks {
 
     fn world_time(&self) -> i64 {
         i64::from(self.manager.world().time())
+    }
+
+    /// `World::getTick()`: the game time (ticks since load), which Java's
+    /// `set_time` carries as the world age and uses to animate the clouds.
+    fn world_age(&self) -> i64 {
+        i64::from(self.manager.world().game_time())
     }
 
     fn world_time_running(&self) -> bool {
@@ -337,6 +361,49 @@ impl ServerHooks for CoreHooks {
         })
     }
 
+    /// Non-player entities as the Java listener sees them: every live actor in
+    /// `WorldState` (falling blocks, mobs, items, projectiles, TNT, XP orbs).
+    /// Positions and rotations are Bedrock-canonical; `java-bridge` converts
+    /// yaw/pitch and resolves the per-version Java entity-type id.
+    fn actor_snapshots(&self) -> Vec<ActorSnapshot> {
+        let world = self.manager.world();
+        world
+            .entities_snapshot()
+            .into_iter()
+            .filter(|entity| !entity.closed)
+            .map(|entity| ActorSnapshot {
+                runtime_id: entity.runtime_id,
+                type_id: entity.network_type_id(),
+                x: f64::from(entity.position.x),
+                y: f64::from(entity.position.y),
+                z: f64::from(entity.position.z),
+                yaw: f64::from(entity.yaw),
+                pitch: f64::from(entity.pitch),
+                head_yaw: f64::from(entity.head_yaw),
+                name_tag: entity.name_tag.clone(),
+                block_network_id: match entity.kind {
+                    crate::entity::EntityKind::FallingBlock { block_id } => Some(block_id),
+                    _ => None,
+                },
+            })
+            .collect()
+    }
+
+    /// Stable Java entity id per Bedrock runtime id, allocated from
+    /// [`FIRST_ACTOR_ENTITY_ID`] so every Java observer of an actor uses the
+    /// same id (and none collides with a player body).
+    fn actor_entity_id(&self, runtime_id: u64) -> i32 {
+        let mut ids = self.actor_ids.lock();
+        if let Some(id) = ids.get(&runtime_id) {
+            return *id;
+        }
+        let mut next = self.next_actor_id.lock();
+        let id = *next;
+        *next += 1;
+        ids.insert(runtime_id, id);
+        id
+    }
+
     fn join_api(&self, _session_id: u64, peer: SocketAddr, snapshot: &PlayerSnapshot) {
         self.manager.clear_java_scoreboard_sent(&snapshot.name);
         let mut player = PlayerContext::new(snapshot.name.clone(), peer);
@@ -368,7 +435,7 @@ impl ServerHooks for CoreHooks {
     }
 
     fn leave_api(&self, name: &str) {
-        self.manager.clear_java_scoreboard_sent(name);
+        self.manager.cleanup_transient_scoreboard(name);
         let player = self.manager.registry().get(name);
         self.manager.registry().remove_if_virtual(name);
         if let Some(player) = player {
@@ -479,15 +546,89 @@ impl ServerHooks for CoreHooks {
         true
     }
 
+    /// `World::useItemOn()` -> `Block::getStateForPlacement()` for a Java
+    /// placement: the block faces the player (`Door::place()`,
+    /// `Trapdoor::place()`, `FenceGate::place()`, `Piston::place()`) and a door
+    /// also fills the cell above, exactly like the Bedrock path.
+    fn place_block_oriented(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        network_id: u32,
+        face: i32,
+        yaw: f32,
+    ) -> bool {
+        use bedrock_world::block_states;
+
+        let world = self.manager.world();
+        let Some(state) = crate::physics::state_for_placement_oriented(
+            network_id,
+            face,
+            yaw,
+            |dx, dy, dz| world.block_at(x + dx, y + dy, z + dz),
+        ) else {
+            return false;
+        };
+        let Some(name) = block_states::state_name(state) else {
+            return false;
+        };
+        if name.ends_with("_door") {
+            // `Door::place()`: only on the top face, with a block underneath
+            // (`canBeSupportedAt`) and a replaceable cell above.
+            let below = block_states::state_name(world.block_at(x, y - 1, z)).unwrap_or("air");
+            let above = block_states::state_name(world.block_at(x, y + 1, z)).unwrap_or("air");
+            if face != 1
+                || crate::physics::is_replaceable(below)
+                || !crate::physics::is_replaceable(above)
+            {
+                return false;
+            }
+            let Some(state) = crate::physics::orient_door(state, yaw, |dx, dy, dz| {
+                world.block_at(x + dx, y + dy, z + dz)
+            }) else {
+                return false;
+            };
+            let Some(upper) = block_states::with_property(state, "upper_block_bit", "true") else {
+                return false;
+            };
+            if !world.set_block(x, y, z, state) {
+                return false;
+            }
+            world.set_block(x, y + 1, z, upper);
+        } else if !world.set_block(x, y, z, state) {
+            return false;
+        }
+        self.manager.broadcast_sound(
+            bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_PLACE,
+            network_id as i32,
+            x,
+            y,
+            z,
+        );
+        true
+    }
+
     /// `World::useItemOn()` for a Java right click: `Block::onInteract()` runs
-    /// before placement, so a lever toggles instead of getting a block placed
-    /// against it. A consumed click returns true and the session stops there.
+    /// before placement, so a lever toggles (and a door or trapdoor swings)
+    /// instead of getting a block placed against it. The state change reaches
+    /// every Java viewer through `drain_block_changes`. A consumed click
+    /// returns true and the session stops there.
     fn interact_block(&self, x: i32, y: i32, z: i32) -> bool {
         let world = self.manager.world();
         let current = world.block_at(x, y, z);
         let Some(interaction) = world.interact_block(x, y, z) else {
             return false;
         };
+        // A container block consumes the click too. The Java bridge has no
+        // container windows yet, so no screen is sent; without this return the
+        // held block would be placed against the chest/anvil/crafting table.
+        if interaction.open_container.is_some() {
+            tracing::debug!(
+                "Java: container block at ({x},{y},{z}) has no modelled window yet"
+            );
+            return true;
+        }
         if interaction.new_state != current {
             if interaction.door_sound {
                 // PM `FenceGate::onInteract` -> `DoorSound` ->
@@ -519,9 +660,61 @@ impl ServerHooks for CoreHooks {
     /// per-version `items.json` table) -> canonical block state -> network id
     /// (`block_states`). Before this, `placeBlock` always sent stone, so every
     /// Java placement reached Bedrock players as stone.
+    /// A Java player dropped a block (`PlayerAction` `DROP_ITEM` /
+    /// `DROP_ALL_ITEMS`): the shared world gets the same `ItemEntity` a
+    /// Bedrock Q drop creates, thrown from the player's eye along the look
+    /// direction, so both editions see and pick up the same block.
+    fn drop_item(
+        &self,
+        protocol: i32,
+        item_id: i32,
+        count: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> bool {
+        use bedrock_world::block_states;
+
+        let Some(name) = block_states::java_item_block_name(protocol, item_id) else {
+            return false;
+        };
+        let Some(name) = block_states::java_to_bedrock_block_name(&name) else {
+            return false;
+        };
+        let Some(block_id) = block_states::network_id(&name) else {
+            return false;
+        };
+        let Some(item) = crate::entity::block_item(block_id) else {
+            return false;
+        };
+        let item = bedrock_protocol::ItemStack {
+            count: count.clamp(1, 64) as u16,
+            ..item
+        };
+        let yaw = yaw.to_radians();
+        let pitch = pitch.to_radians();
+        let motion = Vector3f::new(
+            -yaw.sin() * pitch.cos() * 0.3,
+            -pitch.sin() * 0.3 + 0.1,
+            yaw.cos() * pitch.cos() * 0.3,
+        );
+        self.manager.world().spawn_item(
+            Vector3f::new(x as f32, y as f32 + 1.62, z as f32),
+            item,
+            Some(motion),
+            "",
+        );
+        true
+    }
+
     fn block_network_id_for_item(&self, protocol: i32, item_id: i32) -> Option<u32> {
         let name = bedrock_world::block_states::java_item_block_name(protocol, item_id)?;
-        bedrock_world::java_chunk::ModernChunk::bedrock_network_id_for_name(&name)
+        // Bedrock kept legacy names for several families (`wooden_door` for
+        // `oak_door`, `brick_block` for `bricks`, `web` for `cobweb`, ...).
+        let name = bedrock_world::block_states::java_to_bedrock_block_name(&name)?;
+        bedrock_world::java_chunk::ModernChunk::bedrock_network_id_for_name(name.as_ref())
     }
 
     fn stone_network_id(&self) -> u32 {
@@ -549,13 +742,21 @@ impl ServerHooks for CoreHooks {
         let world = self.manager.world();
         let key = (cx, cz, world.chunk_version(cx, cz));
         if let Some(cached) = self.legacy_cache.lock().get(&key) {
-            return Some(cached);
+            return Some((*cached).clone());
         }
         self.warm_legacy_payload(cx, cz);
-        self.legacy_cache.lock().get(&key)
+        self.legacy_cache
+            .lock()
+            .get(&key)
+            .map(|chunk| (*chunk).clone())
     }
 
     fn try_legacy_chunk(&self, cx: i32, cz: i32) -> Option<LegacyChunk> {
+        self.try_legacy_chunk_shared(cx, cz)
+            .map(|chunk| (*chunk).clone())
+    }
+
+    fn try_legacy_chunk_shared(&self, cx: i32, cz: i32) -> Option<Arc<LegacyChunk>> {
         // Cache-only (tick path): never run the generator here.
         let world = self.manager.world();
         let key = (cx, cz, world.chunk_version(cx, cz));
@@ -614,13 +815,26 @@ impl ServerHooks for CoreHooks {
         let world = self.manager.world();
         let key = (protocol, cx, cz, world.chunk_version(cx, cz));
         if let Some(cached) = self.modern_cache.lock().get(&key) {
-            return Some(cached);
+            return Some((*cached).clone());
         }
         self.warm_modern_payload(protocol, cx, cz);
-        self.modern_cache.lock().get(&key)
+        self.modern_cache
+            .lock()
+            .get(&key)
+            .map(|chunk| (*chunk).clone())
     }
 
     fn try_modern_chunk(&self, protocol: i32, cx: i32, cz: i32) -> Option<ModernChunkData> {
+        self.try_modern_chunk_shared(protocol, cx, cz)
+            .map(|chunk| (*chunk).clone())
+    }
+
+    fn try_modern_chunk_shared(
+        &self,
+        protocol: i32,
+        cx: i32,
+        cz: i32,
+    ) -> Option<Arc<ModernChunkData>> {
         // Cache-only (tick path): never run the generator here.
         let _ = ModernProfile::for_protocol(protocol)?;
         let world = self.manager.world();
@@ -682,7 +896,13 @@ mod tests {
     fn a_java_right_click_toggles_a_lever() {
         let hooks = core_hooks();
         let world = hooks.manager.world().clone();
-        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        let lever = bedrock_world::block_states::with_property(
+            bedrock_world::block_states::network_id("lever").unwrap(),
+            "lever_direction",
+            "up_north_south",
+        )
+        .unwrap();
+        world.set_block(2, 79, 3, bedrock_world::block_states::network_id("stone").unwrap());
         assert!(world.set_block(2, 80, 3, lever));
 
         assert!(hooks.interact_block(2, 80, 3));
@@ -696,6 +916,129 @@ mod tests {
         // Stone has no `onInteract()`: the click falls through to placement.
         assert!(world.set_block(5, 80, 5, block_id::STONE));
         assert!(!hooks.interact_block(5, 80, 5));
+    }
+
+    /// A Java right click swings a door on both halves (`Door::onInteract`)
+    /// and consumes a container click, since the Java bridge still has no
+    /// container windows.
+    #[test]
+    fn a_java_right_click_swings_a_door_and_consumes_a_container() {
+        use bedrock_world::block_states;
+
+        let hooks = core_hooks();
+        let world = hooks.manager.world().clone();
+        let lower = block_states::network_id("spruce_door").unwrap();
+        let upper = block_states::with_property(lower, "upper_block_bit", "true").unwrap();
+        assert!(world.set_block(2, 80, 3, lower));
+        assert!(world.set_block(2, 81, 3, upper));
+
+        assert!(hooks.interact_block(2, 80, 3));
+        assert_eq!(block_states::bool_property(world.block_at(2, 80, 3), "open_bit"), Some(true));
+        assert_eq!(block_states::bool_property(world.block_at(2, 81, 3), "open_bit"), Some(true));
+
+        // A crafting table is interactive even without a Java window: the
+        // click must not place the held block against it.
+        let table = block_states::network_id("crafting_table").unwrap();
+        assert!(world.set_block(5, 80, 5, table));
+        assert!(hooks.interact_block(5, 80, 5));
+        assert_eq!(world.block_at(5, 80, 5), table);
+    }
+
+    /// A Java creative placement carries the player yaw: the door faces it
+    /// (instead of always keeping the default direction) and the upper half
+    /// lands in the cell above.
+    #[test]
+    fn a_java_door_placement_uses_the_player_facing() {
+        use bedrock_world::block_states;
+
+        let hooks = core_hooks();
+        let world = hooks.manager.world().clone();
+        assert!(world.set_block(
+            2,
+            79,
+            3,
+            block_states::network_id("stone").unwrap()
+        ));
+        let door = block_states::network_id("spruce_door").unwrap();
+
+        // Yaw 90 = west (Bedrock yaw grows clockwise from south); the door
+        // state sits a quarter turn clockwise from that facing.
+        assert!(hooks.place_block_oriented(2, 80, 3, door, 1, 90.0));
+        assert_eq!(
+            block_states::string_property(world.block_at(2, 80, 3), "minecraft:cardinal_direction"),
+            Some("north")
+        );
+        assert_eq!(
+            block_states::bool_property(world.block_at(2, 81, 3), "upper_block_bit"),
+            Some(true)
+        );
+        assert_eq!(
+            block_states::string_property(world.block_at(2, 81, 3), "minecraft:cardinal_direction"),
+            Some("north")
+        );
+
+        // `Trapdoor::place()`: `direction` is the opposite of the player facing,
+        // turned a quarter turn counter-clockwise, and reads 0 south, 1 west,
+        // 2 north, 3 east.
+        let trapdoor = block_states::network_id("trapdoor").unwrap();
+        assert!(hooks.place_block_oriented(5, 80, 5, trapdoor, 1, 90.0));
+        assert_eq!(
+            block_states::int_property(world.block_at(5, 80, 5), "direction"),
+            Some(2)
+        );
+
+        // `Stairs::place()`: `weirdo_direction` is the player facing
+        // (0 east, 1 west, 2 south, 3 north).
+        let stairs = block_states::network_id("spruce_stairs").unwrap();
+        assert!(hooks.place_block_oriented(8, 80, 8, stairs, 1, 90.0));
+        assert_eq!(
+            block_states::int_property(world.block_at(8, 80, 8), "weirdo_direction"),
+            Some(1)
+        );
+    }
+
+    /// A Java `oak_door` item resolves through the Bedrock legacy names and
+    /// places a whole door, not only through the hook called directly above.
+    #[test]
+    fn a_java_oak_door_item_places_a_full_door() {
+        use bedrock_world::block_states;
+
+        let hooks = core_hooks();
+        let world = hooks.manager.world().clone();
+        assert!(world.set_block(
+            2,
+            79,
+            3,
+            block_states::network_id("stone").unwrap()
+        ));
+
+        let door = hooks
+            .block_network_id_for_item(775, 781)
+            .expect("oak_door item should resolve to a Bedrock door");
+        assert_eq!(block_states::state_name(door), Some("wooden_door"));
+        assert!(hooks.place_block_oriented(2, 80, 3, door, 1, 90.0));
+        assert_eq!(
+            block_states::state_name(world.block_at(2, 80, 3)),
+            Some("wooden_door")
+        );
+        assert_eq!(
+            block_states::bool_property(world.block_at(2, 81, 3), "upper_block_bit"),
+            Some(true)
+        );
+
+        // Other families whose Bedrock name differs resolve too.
+        for (item_id, name) in [
+            (305, "brick_block"),
+            (284, "normal_stone_slab"),
+            (201, "web"),
+            (989, "standing_sign"),
+            (1087, "bed"),
+        ] {
+            let block = hooks
+                .block_network_id_for_item(775, item_id)
+                .unwrap_or_else(|| panic!("item {item_id} should resolve"));
+            assert_eq!(block_states::state_name(block), Some(name), "item {item_id}");
+        }
     }
 
     /// Converted Java payloads are cached per column + world version:

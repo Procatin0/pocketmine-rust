@@ -66,6 +66,25 @@ impl TreePopulator {
         }
     }
 
+    /// Grows one tree with its trunk base at `(x, y, z)` (`Tree::grow()`).
+    ///
+    /// Used by the random-tick pass when a sapling matures: the caller clears
+    /// the sapling's cell first, so `can_place_tree` accepts it.
+    pub fn grow_at<M: ChunkManager>(
+        &self,
+        world: &mut M,
+        x: i32,
+        y: i32,
+        z: i32,
+        random: &mut Random,
+    ) {
+        match self.tree_type {
+            TreeType::Oak => self.grow_oak(world, x, y, z, random),
+            TreeType::Birch => self.grow_birch(world, x, y, z, random),
+            TreeType::Spruce => self.grow_spruce(world, x, y, z, random),
+        }
+    }
+
     fn get_highest_workable_block<M: ChunkManager>(&self, world: &M, x: i32, z: i32) -> i32 {
         let highest = match world.get_highest_block_at(x, z) {
             Some(h) => h,

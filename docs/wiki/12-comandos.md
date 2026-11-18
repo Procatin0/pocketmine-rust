@@ -72,7 +72,7 @@ Efectos como enum `CommandAction` (un `Vec` por salida): `SetGamemode`,
 
 **`SimpleCommand extends Command`** (la forma moderna de plugin): recibe un
 `?callable $executor`. `execute()`: (1) `testPermission()`; (2) callable si
-existe; (3) `getExecutor()` callable o con `onCommand()`; (4) si nada,
+existe; (3) `getRegisteredExecutor()` callable o con `onCommand()`; (4) si nada,
 `§cUsage: {usage}` y `false`.
 
 **`ClosureCommand extends Command`** (legacy, deprecated en PM5): closure +

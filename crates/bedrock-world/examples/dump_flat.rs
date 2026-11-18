@@ -1,4 +1,3 @@
-use bedrock_world::chunk::Chunk;
 use bedrock_world::generator::flat::FlatGenerator;
 use bedrock_world::WorldGenerator;
 fn main() {

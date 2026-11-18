@@ -26,7 +26,8 @@ pub use host::PluginHost;
 pub use manager::{CommandOutcome, LoadResult, PluginEnableOrder, PluginFailure, PluginManager};
 pub use plugin::Plugin;
 pub use runtime::{
-    DiscoveredPluginManifest, IpcResponse, NativePluginWrapper, PhpPlugin, PhpWorker, PluginSource,
+    DiscoveredPluginManifest, IpcResponse, NativePluginWrapper, PhpCommandInfo, PhpPlugin,
+    PhpWorker, PluginSource,
 };
 
 #[cfg(test)]

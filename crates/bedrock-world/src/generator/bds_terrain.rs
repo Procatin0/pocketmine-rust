@@ -17,11 +17,13 @@
 use crate::block_id;
 use crate::chunk::Chunk;
 use crate::generator::bds_biome_tree;
-use crate::generator::biome::{self, Gaussian};
+use crate::generator::biome;
+use crate::generator::cubiomes::Cubiomes;
 use crate::generator::caves::CavePopulator;
 use crate::generator::manager::{ChunkManager, ChunkManager3x3};
 use crate::generator::populators::{
     GroundCoverPopulator, OrePopulator, TallGrassPopulator, TreePopulator, TreeType,
+    UnderwaterPopulator,
 };
 use crate::generator::random::Random;
 use crate::generator::WorldGenerator;
@@ -29,13 +31,69 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-/// Columns kept for single-block queries.
+/// Full chunks kept for single-block queries.
 const COLUMN_CACHE_CAP: usize = 32;
 
+/// Base chunks kept for the 3x3 windows [`BDSTerrain::generate_chunk_internal`]
+/// assembles; without it every chunk regenerates its eight neighbours from
+/// scratch.
+const BASE_CACHE_CAP: usize = 128;
+
+/// Small FIFO cache of generated chunks. Generation happens outside the lock, so
+/// two threads asking for the same chunk may both build it; the result is pure,
+/// so whichever lands last is the same chunk.
 #[derive(Debug, Default)]
-struct ColumnCache {
+struct ChunkCache {
     entries: HashMap<(i32, i32), Arc<Chunk>>,
     order: VecDeque<(i32, i32)>,
+}
+
+impl ChunkCache {
+    fn get(&self, key: (i32, i32)) -> Option<Arc<Chunk>> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: (i32, i32), chunk: Arc<Chunk>, cap: usize) {
+        if self.entries.insert(key, chunk).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+/// Biome cells kept between chunks. The biome pass reads a window of cells around
+/// each chunk so it can smooth across borders, which means the same cell is
+/// computed by several neighbouring chunks; without this the wide window would
+/// cost a full climate sample per neighbour per chunk.
+const BIOME_CELL_CACHE_CAP: usize = 8192;
+
+/// Biome ids by quart cell, for the smoothing window. Plain values: a cell is one
+/// byte and there are no references to keep alive.
+#[derive(Debug, Default)]
+struct CellCache {
+    entries: HashMap<(i32, i32), u8>,
+    order: VecDeque<(i32, i32)>,
+}
+
+impl CellCache {
+    fn get(&self, key: (i32, i32)) -> Option<u8> {
+        self.entries.get(&key).copied()
+    }
+
+    fn insert(&mut self, key: (i32, i32), value: u8, cap: usize) {
+        if self.entries.insert(key, value).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 /// Bedrock-specific sea level
@@ -386,6 +444,25 @@ fn p(loc: f64, value: Spline, der: f64) -> SplinePoint {
 }
 
 fn eval_spline(vals: &[f64], sp: &Spline) -> f64 {
+    eval_spline_impl(vals, sp, false)
+}
+
+/// The same spline with straight segments, ignoring `der`.
+///
+/// Every point in this file is built with `der = 0.0`, and a cubic Hermite with
+/// zero slopes is a smoothstep: flat at both knots and up to 1.5x steeper in
+/// between. Across the world that reads as a plain, then a two block wall, then
+/// another plain. With no derivative to honour, a straight line spreads the same
+/// rise evenly.
+///
+/// This is for the *shape* of the terrain only. The biome classifier keeps
+/// [`eval_spline`] because the `depth` it hands to the KD-tree has to stay
+/// comparable with the BDS captures (see `niduy_parity_...`).
+fn eval_spline_straight(vals: &[f64], sp: &Spline) -> f64 {
+    eval_spline_impl(vals, sp, true)
+}
+
+fn eval_spline_impl(vals: &[f64], sp: &Spline, straight: bool) -> f64 {
     match sp {
         Spline::Fixed(v) => *v,
         Spline::Curve { ty, points } => {
@@ -401,15 +478,19 @@ fn eval_spline(vals: &[f64], sp: &Spline) -> f64 {
             if i == 0 || i == points.len() {
                 let idx = if i == 0 { 0 } else { i - 1 };
                 let pt = &points[idx];
-                eval_spline(vals, &pt.value) + (pt.der as f64) * (f - (pt.loc as f64))
+                eval_spline_impl(vals, &pt.value, straight)
+                    + (pt.der as f64) * (f - (pt.loc as f64))
             } else {
                 let g = points[i - 1].loc as f64;
                 let h = points[i].loc as f64;
                 let k = (f - g) / (h - g);
                 let l = points[i - 1].der as f64;
                 let m = points[i].der as f64;
-                let n = eval_spline(vals, &points[i - 1].value);
-                let o = eval_spline(vals, &points[i].value);
+                let n = eval_spline_impl(vals, &points[i - 1].value, straight);
+                let o = eval_spline_impl(vals, &points[i].value, straight);
+                if straight && l == 0.0 && m == 0.0 {
+                    return lerp(k, n, o);
+                }
                 let pp = l * (h - g) - (o - n);
                 let q = -m * (h - g) + (o - n);
                 lerp(k, n, o) + k * (1.0 - k) * lerp(k, pp, q)
@@ -559,6 +640,108 @@ const CLIMATE_EROSION: usize = 3;
 const CLIMATE_PEAKS_AND_VALLEYS: usize = 4;
 const CLIMATE_WEIRDNESS: usize = 5;
 
+/// Per-noise coordinate scale for the world's climate sampling, in the order of
+/// the `CLIMATE_*` indices: temperature, humidity, continentalness, erosion,
+/// peaks and valleys, weirdness.
+const CLIMATE_SCALES: [f64; 6] = [1.3, 1.3, 0.6, 0.6, 0.6, 0.6];
+
+/// Domain warp amplitude in blocks applied to the climate sample point. Without
+/// it the climate field is a plain smooth function, so lakes and biome borders
+/// come out as near-perfect ellipses.
+const WARP_BLOCKS: f64 = 60.0;
+
+/// Amplitude in blocks of the high-frequency detail added to the surface. The
+/// density changes by 4/128 per block, so one block is 1/32 of an offset unit.
+const DETAIL_BLOCKS: f64 = 7.0;
+
+/// Half width, in noise units, of the river band: columns whose river noise is
+/// within this of zero are carved down to just below sea level, which turns the
+/// zero crossing of the noise into a winding channel.
+///
+/// One noise unit is worth roughly 30 blocks across the zero crossing, so this
+/// value is about four blocks to each side: a river eight blocks wide, which is
+/// what vanilla rivers measure. The previous 0.035 carved the same channel but
+/// only flooded its innermost block or two, which read as a dry gully with a
+/// string of water in it.
+const RIVER_HALF_WIDTH: f64 = 0.34;
+
+/// How far below sea level the river bed sits at the channel centre, in blocks.
+/// The carve fades to zero at the band edge, so the depth tapers from this to
+/// the surrounding terrain.
+const RIVER_DEPTH: i32 = 2;
+
+/// How far above sea level a column can be and still be carved into a river.
+/// Rivers belong in valleys; capping the carve keeps them off hills and is what
+/// stops the noise from drawing a channel through every part of the map.
+const RIVER_MAX_HEIGHT: i32 = 6;
+
+/// River noise strength below which a column is not a river: only the centre of
+/// the band carves, so the channels stay narrow.
+const RIVER_CENTRE: f64 = 0.35;
+
+/// Blocks below `sea + RIVER_MAX_HEIGHT` over which the river carve fades out, so
+/// the hillside end of a channel is a bank instead of a wall.
+const RIVER_CAP_FADE: f64 = 8.0;
+
+/// Elevation bands for biomes the climate tree picks by climate alone (world
+/// coordinates, sea level is 62). Above the peaks floor only the tops of our
+/// terrain qualify; a stone shore has to sit at the waterline.
+const PEAKS_MIN_HEIGHT: f64 = 92.0;
+const GROVE_MIN_HEIGHT: f64 = 88.0;
+const SHORE_MAX_HEIGHT: f64 = 64.0;
+
+
+
+/// Water this deep gets the ocean's deep variant.
+const DEEP_WATER: f64 = 10.0;
+
+/// Constant the density field has at y=0 besides the offset, so the analytic
+/// height of a column is `(DENSITY_BASE + offset) * 32`.
+const DENSITY_BASE: f64 = 2.5 - 83.0 / 160.0;
+
+/// Offset added to every column before it becomes a height. The spline puts
+/// `offset == 0` at y≈63, which is barely above sea level, so the shoreline fell
+/// where the spline crosses zero and a large slice of the map ended up under
+/// water. Raising the whole field pushes the shoreline a little further out to
+/// sea: land grows, water shrinks, and nothing else about the shape changes.
+/// One unit of offset is 32 blocks, so this is about three blocks.
+const LAND_BIAS: f64 = 0.16;
+
+/// Scale applied to the raw spline offset (one unit is 32 blocks of height).
+/// 2.0 made the slopes steeper than vanilla's; 1.6 keeps the shape with a
+/// gentler gradient.
+const TERRAIN_GAIN: f64 = 1.6;
+
+/// Amplitude in blocks of the 3D density noise: how far the zero crossing can
+/// move from where the 2D offset puts it.
+const DEPTH_NOISE_BLOCKS: f64 = 5.0;
+
+/// Vertical stretch of the 3D density noise. Its octaves run at ~32 blocks in
+/// the horizontal plane, so sampling y at twice the rate keeps the features from
+/// being tall tubes.
+const DEPTH_NOISE_VERTICAL: f64 = 3.0;
+
+/// Share of the submerged relief that is flattened away: 0 would keep the
+/// stairs, 1 would make flat plates.
+const SHORE_BED_GAIN: f64 = 0.35;
+
+/// Blocks of water the spline has to put a column under before the open-sea
+/// deepening reaches full strength. The deepening is proportional to this, so it
+/// is zero at the shoreline: the coast keeps the spline's own height instead of
+/// jumping down into a trench.
+const SEA_FLOOR_RAMP: f64 = 14.0;
+
+/// Extra depth (on top of what the spline already gives) added to the sea floor
+/// of open ocean, in blocks, before the relief-noise modulation.
+const SEA_FLOOR_MAX_DEPTH: f64 = 22.0;
+
+
+/// Amplitude in blocks of the broad relief. Without it the spline offset is the
+/// only shape the terrain has, and because that changes over hundreds of blocks
+/// every plain comes out as a plateau with contour-like steps. This is what tilts
+/// plains and blends one region into the next.
+const RELIEF_BLOCKS: f64 = 16.0;
+
 /// Precomputed climate values for a single column
 ///
 /// `temperature`/`humidity` are kept for structural completeness but the raw
@@ -580,13 +763,129 @@ struct ClimateValues {
     weirdness: f64,
 }
 
+/// Quart-cell window kept for the biome majority vote: the chunk itself plus a
+/// one-cell ring on every side.
+/// Cells each side of the chunk that the biome pass reads. It has to cover the
+/// chunk (0..=3) plus the smoothing radius, so a window at the chunk border sees
+/// the same neighbourhood the neighbouring chunk would.
+const CELL_LO: i32 = -10;
+const CELL_HI: i32 = 12;
+const CELL_GRID: usize = (CELL_HI - CELL_LO + 1) as usize;
+
+/// Minimum size, in cells, that a biome patch has to beat to appear: the window is
+/// `2 * BIOME_SMOOTH_RADIUS + 1` cells, so a patch narrower than about twice the
+/// radius loses the majority everywhere and is replaced by its surroundings.
+///
+/// Six cells is 24 blocks each side, which is what it takes to stop the slivers
+/// the climate tree produces where two thresholds cross: sand strips, badlands
+/// fingers and gravel specks that the player reads as "mini biomes" even though
+/// they are not single-cell specks. Smaller radii only cleaned up single cells.
+const BIOME_SMOOTH_RADIUS: i32 = 8;
+
+/// Pick the biome shared by most of the `2 * BIOME_SMOOTH_RADIUS + 1` cells around
+/// `(qcx, qcz)`, falling back to the cell's own value when nothing has a majority.
+/// A 3x3 window only dissolves isolated specks; a wide window also breaks the
+/// A-B-A-B striping the climate tree produces near a tie and removes any patch
+/// that cannot hold its ground across a few dozen blocks.
+/// Mode of the `(2 * radius + 1)` square around the grid entry `(i, j)`, ties
+/// going to the centre.
+fn majority_at(ids: &[[u8; CELL_GRID]; CELL_GRID], i: usize, j: usize, radius: usize) -> u8 {
+    let own = ids[i][j];
+    let mut seen: [(u8, u16); 64] = [(0, 0); 64];
+    let mut len = 0usize;
+    for di in 0..=2 * radius {
+        for dj in 0..=2 * radius {
+            let (ni, nj) = (i + di, j + dj);
+            if ni < radius || nj < radius {
+                continue;
+            }
+            let (ni, nj) = (ni - radius, nj - radius);
+            if ni >= CELL_GRID || nj >= CELL_GRID {
+                continue;
+            }
+            let id = ids[ni][nj];
+            if let Some(entry) = seen[..len].iter_mut().find(|(other, _)| *other == id) {
+                entry.1 += 1;
+            } else if len < seen.len() {
+                seen[len] = (id, 1);
+                len += 1;
+            }
+        }
+    }
+    let mut best = own;
+    let mut best_count = 0u16;
+    for &(id, count) in &seen[..len] {
+        if count > best_count || (count == best_count && id == own) {
+            best = id;
+            best_count = count;
+        }
+    }
+    best
+}
+
+fn majority_biome(ids: &[[u8; CELL_GRID]; CELL_GRID], qcx: i32, qcz: i32) -> u8 {
+    const RADIUS: i32 = BIOME_SMOOTH_RADIUS;
+    // The window holds (2 * RADIUS + 1)^2 = 289 cells, so the per-biome count
+    // cannot be a u8: one biome filling the whole window overflowed it and
+    // panicked every chunk worker. Real Minecraft biomes are big, so that is the
+    // common case, not an edge case.
+    let mut seen: [(u8, u16); 289] = [(0, 0); 289];
+    let mut len = 0usize;
+    for dx in -RADIUS..=RADIUS {
+        for dz in -RADIUS..=RADIUS {
+            let (i, j) = (qcx + dx - CELL_LO, qcz + dz - CELL_LO);
+            if !(0..CELL_GRID as i32).contains(&i) || !(0..CELL_GRID as i32).contains(&j) {
+                continue;
+            }
+            let id = ids[i as usize][j as usize];
+            if let Some(entry) = seen[..len].iter_mut().find(|(other, _)| *other == id) {
+                entry.1 += 1;
+            } else {
+                seen[len] = (id, 1);
+                len += 1;
+            }
+        }
+    }
+    // The most common id wins outright; on a tie the cell keeps its own. Falling
+    // back to "own" whenever nothing has a strict majority was the bug: in mixed
+    // terrain almost no window has one, so every cell answered with its own noisy
+    // value and the filter made the map more fragmented, not less.
+    let own = ids[(qcx - CELL_LO) as usize][(qcz - CELL_LO) as usize];
+    let mut best = own;
+    let mut best_count = 0u16;
+    for &(id, count) in &seen[..len] {
+        if count > best_count || (count == best_count && id == own) {
+            best = id;
+            best_count = count;
+        }
+    }
+    best
+}
+
 /// BDS Terrain Generator using noise-based generation (1.18+ style)
 #[derive(Debug)]
 pub struct BDSTerrain {
     pub seed: u64,
     pub climate: [DoublePerlinNoise; 6],
+    /// Warp the climate sample point so contours bend instead of closing in
+    /// ellipses (one noise per horizontal axis).
+    warp_x: DoublePerlinNoise,
+    warp_z: DoublePerlinNoise,
+    /// River noise: its zero crossings become river channels.
+    river: DoublePerlinNoise,
+    /// Broad relief, added to the density offset, in blocks (see
+    /// [`RELIEF_BLOCKS`]).
+    relief: DoublePerlinNoise,
+    /// High-frequency height detail, added to the density offset.
+    detail: DoublePerlinNoise,
+    /// 3D noise inside the density function (see `density_at_with_offset`). This
+    /// is what makes the surface irregular: it moves the zero crossing up and
+    /// down by a few blocks with a period of a handful of blocks.
+    depth_noise: DoublePerlinNoise,
     pub spline: Spline,
-    gaussian: Gaussian,
+    /// Minecraft's own biome generator (vendored cubiomes), which decides the
+    /// biome of every surface column.
+    cubiomes: Option<Cubiomes>,
     water_height: i32,
     ground_cover: GroundCoverPopulator,
     ore_populator: OrePopulator,
@@ -601,10 +900,15 @@ pub struct BDSTerrain {
     tall_grass_mountains: TallGrassPopulator,
     tall_grass_river: TallGrassPopulator,
     tall_grass_ocean: TallGrassPopulator,
+    underwater: UnderwaterPopulator,
     tall_grass_ice_plains: TallGrassPopulator,
     cave_populator: CavePopulator,
     spawn_pos: (i32, i32, i32),
-    column_cache: Mutex<ColumnCache>,
+    column_cache: Mutex<ChunkCache>,
+    base_cache: Mutex<ChunkCache>,
+    /// Biome id per quart cell, so the smoothing window does not re-sample the
+    /// climate for cells several chunks already asked for.
+    biome_cells: Mutex<CellCache>,
 }
 
 impl BDSTerrain {
@@ -630,10 +934,56 @@ impl BDSTerrain {
             climate[i] = double_perlin_init(&mut xr, amps, bds_noise::CLIMATE_OMIN[i], amps.len(), -1);
         }
 
-        let _random = Random::new(seed as i64);
-        let gaussian = Gaussian::new(2);
+        let warp_noise = |tag: (u64, u64), amplitudes: &[f64], omin: i32| {
+            let mut xr = Xoroshiro128Plus {
+                low: x_low ^ tag.0,
+                high: x_high ^ tag.1,
+            };
+            double_perlin_init(&mut xr, amplitudes, omin, amplitudes.len(), -1)
+        };
+        let warp_x = warp_noise(
+            (0x9e3779b97f4a7c15, 0xbf58476d1ce4e5b9),
+            &[1.0, 1.0, 1.0],
+            -8,
+        );
+        let warp_z = warp_noise(
+            (0x94d049bb133111eb, 0x2545f4914f6cdd1d),
+            &[1.0, 1.0, 1.0],
+            -8,
+        );
+        let river = warp_noise(
+            (0x510e527fade682d1, 0x9b05688c2b3e6c1f),
+            &[1.0, 1.0],
+            -7,
+        );
+        let relief = warp_noise(
+            (0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1),
+            &[1.0, 1.0, 1.0],
+            -8,
+        );
+        // Two extra octaves of 8 and 4 blocks: on a uniform slope the 2D field
+        // puts a one-block contour every couple of blocks, and those contours
+        // are what read as a staircase. Roughness at the scale of the steps
+        // breaks the runs so no two neighbouring columns step together.
+        let detail = warp_noise(
+            (0x6a09e667f3bcc909, 0xbb67ae8584caa73b),
+            &[1.0, 0.6, 0.45, 0.3],
+            -5,
+        );
+        // Octaves -5 and -4 are 32 and 16 blocks wide, so a 20 block bowl was a
+        // single smooth slope: quantised to whole blocks that is a set of
+        // concentric one-block stairs, which is what the lake shores looked
+        // like. The two extra octaves put 8 and 4 block bumps on the surface and
+        // break those rings into an ordinary rocky bed.
+        let depth_noise = warp_noise(
+            (0x243f6a8885a308d3, 0x13198a2e03707344),
+            &[1.0, 0.6, 0.32, 0.17],
+            -5,
+        );
 
-        let ground_cover = GroundCoverPopulator::new();
+        let _random = Random::new(seed as i64);
+
+        let ground_cover = GroundCoverPopulator::new(seed);
         let ore_populator = OrePopulator::new_overworld();
         let emerald_ore = OrePopulator::new_emerald();
 
@@ -655,8 +1005,14 @@ impl BDSTerrain {
         let mut gen = Self {
             seed,
             climate,
+            warp_x,
+            warp_z,
+            river,
+            relief,
+            detail,
+            depth_noise,
             spline: terrain_spline(),
-            gaussian,
+            cubiomes: Cubiomes::new(seed),
             water_height: BDS_SEA_LEVEL,
             ground_cover,
             ore_populator,
@@ -671,10 +1027,13 @@ impl BDSTerrain {
             tall_grass_mountains,
             tall_grass_river,
             tall_grass_ocean,
+            underwater: UnderwaterPopulator,
             tall_grass_ice_plains,
             cave_populator,
             spawn_pos: (0, BDS_SEA_LEVEL + 2, 0),
-            column_cache: Mutex::new(ColumnCache::default()),
+            column_cache: Mutex::new(ChunkCache::default()),
+            base_cache: Mutex::new(ChunkCache::default()),
+            biome_cells: Mutex::new(CellCache::default()),
         };
 
         // Find safe spawn point
@@ -714,16 +1073,82 @@ impl BDSTerrain {
     /// terrain offset consumes only c/e/p/w, and the biome map resamples
     /// every noise at its peaks-shifted point, so raw t/h samples would be
     /// dead work.
+    /// Climate sample point for a world column: the coordinates are warped by
+    /// two low-frequency noises so the climate contours bend instead of closing
+    /// in ellipses, then pulled in by [`CLIMATE_SCALE`] so biomes and landmasses
+    /// cover more blocks.
     #[inline]
-    fn sample_terrain_climate(&self, x: f64, z: f64) -> ClimateValues {
+    fn climate_point(&self, x: f64, z: f64) -> (f64, f64) {
+        let wx = self.warp_x.sample(x, 0.0, z);
+        let wz = self.warp_z.sample(x, 0.0, z);
+        (x + wx * WARP_BLOCKS, z + wz * WARP_BLOCKS)
+    }
+
+    #[inline]
+    fn climate_sample(&self, index: usize, x: f64, z: f64, world: bool) -> f64 {
+        let scale = if world { CLIMATE_SCALES[index] } else { 1.0 };
+        self.climate[index].sample(x * scale, 0.0, z * scale)
+    }
+
+    /// High-frequency surface detail in density-offset units (1 block = 1/32):
+    /// it removes the "contour rings" a pure low-frequency field leaves behind
+    /// and keeps shorelines from being smooth arcs.
+    /// How strongly the column belongs to a river: 1 on the channel centre, 0
+    /// outside the band.
+    #[inline]
+    fn river_strength(&self, x: f64, z: f64) -> f64 {
+        let distance = self.river.sample(x, 0.0, z).abs();
+        if distance >= RIVER_HALF_WIDTH {
+            0.0
+        } else {
+            1.0 - distance / RIVER_HALF_WIDTH
+        }
+    }
+
+    #[inline]
+    fn detail_offset(&self, x: f64, z: f64) -> f64 {
+        let relief = self.relief.sample(x, 0.0, z) * (RELIEF_BLOCKS / 32.0);
+        let detail = self.detail.sample(x, 0.0, z) * (DETAIL_BLOCKS / 32.0);
+        relief + detail
+    }
+
+    /// Climate values sampled at an already chosen point of the climate domain.
+    #[inline]
+    fn climate_at_point(&self, cx: f64, cz: f64) -> ClimateValues {
         ClimateValues {
             temperature: 0.0,
             humidity: 0.0,
-            continentalness: self.climate[CLIMATE_CONTINENTALNESS].sample(x, 0.0, z),
-            erosion: self.climate[CLIMATE_EROSION].sample(x, 0.0, z),
-            peaks: self.climate[CLIMATE_PEAKS_AND_VALLEYS].sample(x, 0.0, z),
-            weirdness: self.climate[CLIMATE_WEIRDNESS].sample(x, 0.0, z),
+            continentalness: self.climate[CLIMATE_CONTINENTALNESS].sample(cx, 0.0, cz),
+            erosion: self.climate[CLIMATE_EROSION].sample(cx, 0.0, cz),
+            peaks: self.climate[CLIMATE_PEAKS_AND_VALLEYS].sample(cx, 0.0, cz),
+            weirdness: self.climate[CLIMATE_WEIRDNESS].sample(cx, 0.0, cz),
         }
+    }
+
+    #[inline]
+    fn sample_terrain_climate(&self, x: f64, z: f64) -> ClimateValues {
+        // The shape of the land is still ours: the spline is fed by our own noise
+        // fields, which is the terrain the world was tuned and reviewed against.
+        // The biome that goes on top of it comes from cubiomes (see
+        // `biome_from_climate`), and the height is what keeps the two honest with
+        // each other.
+        let (cx, cz) = self.climate_point(x, z);
+        ClimateValues {
+            temperature: self.climate_sample(CLIMATE_TEMPERATURE, cx, cz, true),
+            humidity: self.climate_sample(CLIMATE_HUMIDITY, cx, cz, true),
+            continentalness: self.climate_sample(CLIMATE_CONTINENTALNESS, cx, cz, true),
+            erosion: self.climate_sample(CLIMATE_EROSION, cx, cz, true),
+            peaks: self.climate_sample(CLIMATE_PEAKS_AND_VALLEYS, cx, cz, true),
+            weirdness: self.climate_sample(CLIMATE_WEIRDNESS, cx, cz, true),
+        }
+    }
+
+    /// Climate sampled at the raw world coordinates, with neither warp nor the
+    /// scale change. This is the sampler that matches the BDS captures, and it
+    /// is what [`BDSTerrain::biome_at_bds`] and the parity tests use.
+    #[inline]
+    fn sample_bds_climate(&self, x: f64, z: f64) -> ClimateValues {
+        self.climate_at_point(x, z)
     }
 
     /// Surface biome id at a single block column — the exact per-point niduy
@@ -732,46 +1157,89 @@ impl BDSTerrain {
     /// sampler at quart-cell corners and expands per column, so the value
     /// stored for a column is exactly `biome_at` at the containing 4×4
     /// cell's corner.
-    pub fn biome_at(&self, x: i32, z: i32) -> u8 {
-        let c = self.sample_terrain_climate(x as f64, z as f64);
+    pub fn biome_at_bds(&self, x: i32, z: i32) -> u8 {
+        let c = self.sample_bds_climate(x as f64, z as f64);
         self.climate_to_biome_from_values(x, z, &c)
     }
 
-    /// Raw 1.18 depth-spline offset (spline + 0.015), NOT scaled by the
-    /// legacy ×2 factor. This is the value the Java generator feeds into its
-    /// climate `depth` parameter, so the biome map uses it as-is.
-    #[inline]
-    fn terrain_offset_raw(&self, c: &ClimateValues) -> f64 {
-        let peaks = -3.0 * ((c.weirdness.abs() - 0.6666667).abs() - 0.33333334);
-        eval_spline(&[c.continentalness, c.erosion, peaks, c.weirdness], &self.spline) + 0.015
+    pub fn biome_at(&self, x: i32, z: i32) -> u8 {
+        let c = self.sample_terrain_climate(x as f64, z as f64);
+        self.surface_biome_from_values(x, z, &c)
     }
 
     /// Get terrain offset from precomputed climate values
     ///
-    /// Still scaled ×2 to keep the current terrain shape; the biome map uses
-    /// [`BDSTerrain::terrain_offset_raw`] instead.
+    /// The spline is scaled by [`TERRAIN_GAIN`] to keep the terrain shape.
+    ///
+    /// [`LAND_BIAS`] lifts the whole field, which moves the shoreline out to sea.
+    /// The sea floor itself is not touched here: see
+    /// [`BDSTerrain::sea_floor_height`], which lowers only deep water and does it
+    /// smoothly. Amplifying this offset instead (the previous approach) made the
+    /// spline's own step at continentalness ≈ −0.47 into a 20 block cliff.
     #[inline]
     fn terrain_offset_from_climate(&self, c: &ClimateValues) -> f64 {
-        self.terrain_offset_raw(c) * 2.0
+        let peaks = -3.0 * ((c.weirdness.abs() - 0.6666667).abs() - 0.33333334);
+        let raw = eval_spline_straight(
+            &[c.continentalness, c.erosion, peaks, c.weirdness],
+            &self.spline,
+        ) + 0.015;
+        raw * TERRAIN_GAIN + LAND_BIAS
     }
 
-    /// Density at position using precomputed offset
+/// Extra depth, in blocks, that the open ocean adds under a column whose
+    /// spline height is `height`. Zero at the shoreline (the spline is still at
+    /// sea level there) and full strength a few blocks out, following a
+    /// smoothstep of how deep the column already is, modulated by the smooth
+    /// relief noise so the seabed undulates instead of being a plate.
     #[inline]
-    fn density_at_with_offset(&self, y: i32, offset: f64) -> f64 {
-        2.5 - ((y as f64) * 4.0) / 128.0 - 83.0 / 160.0 + offset
+    fn sea_floor_extra(&self, height: i32, x: f64, z: f64) -> f64 {
+        let below = (self.water_height - 1 - height) as f64;
+        if below <= 0.0 {
+            return 0.0;
+        }
+        let t = (below / SEA_FLOOR_RAMP).min(1.0);
+        let ramp = t * t * (3.0 - 2.0 * t);
+        let roll = (self.relief.sample(x, 0.0, z) * 0.5 + 0.5).clamp(0.0, 1.0);
+        ramp * (6.0 + SEA_FLOOR_MAX_DEPTH * roll)
+    }
+
+    /// Density at one block position, given the column's offset.
+    ///
+    /// The last term is a real 3D noise, not a height decoration: the surface is
+    /// the height where this expression crosses zero, so the terrain is the
+    /// inverse of a smooth 3D function. That is how vanilla gets an irregular
+    /// surface out of a smooth density, and it is what a 2D height field cannot
+    /// do — quantising a 2D field to whole blocks is what produced the terraces.
+    #[inline]
+    fn density_at_with_offset(&self, x: f64, y: i32, z: f64, offset: f64) -> f64 {
+        // Full strength everywhere, including the waterline. Fading the noise
+        // out near sea level kept the coast a clean curve, but a noise-free
+        // monotone height field quantised to blocks is a set of long parallel
+        // bands one block high: that is what the shallow shores looked like,
+        // first as stairs and then, once the bed was lifted, as flat plates.
+        let damp = 1.0;
+        let noise = self.depth_noise.sample(x, y as f64 * DEPTH_NOISE_VERTICAL, z)
+            * (DEPTH_NOISE_BLOCKS / 32.0)
+            * damp;
+        2.5 - ((y as f64) * 4.0) / 128.0 - 83.0 / 160.0 + offset + noise
     }
 
     /// Get height at column using precomputed climate
     #[inline]
-    fn height_at_with_climate(&self, c: &ClimateValues) -> i32 {
-        let off = self.terrain_offset_from_climate(c);
-        let limit = (1.0 - 83.0 / 160.0 + off) * 32.0;
+    fn height_at_with_climate(&self, c: &ClimateValues, detail: f64, x: f64, z: f64) -> i32 {
+        let off = self.terrain_offset_from_climate(c) + detail;
+        let limit = (DENSITY_BASE + off) * 32.0;
         let mut h = limit.floor() as i32;
-        while self.density_at_with_offset(h + 1, off) > 0.0 {
+        // The 3D term moves the crossing by at most `DEPTH_NOISE_BLOCKS`, so the
+        // walk is short; the guards only keep a pathological noise from looping.
+        let mut steps = 0;
+        while self.density_at_with_offset(x, h + 1, z, off) > 0.0 && steps < 96 {
             h += 1;
+            steps += 1;
         }
-        while self.density_at_with_offset(h, off) <= 0.0 {
+        while self.density_at_with_offset(x, h, z, off) <= 0.0 && steps < 192 {
             h -= 1;
+            steps += 1;
         }
         h.clamp(-64, 255)
     }
@@ -786,15 +1254,15 @@ impl BDSTerrain {
     #[inline]
     pub fn terrain_offset(&self, x: i32, z: i32) -> f64 {
         let c = self.sample_terrain_climate(x as f64, z as f64);
-        self.terrain_offset_from_climate(&c)
+        self.terrain_offset_from_climate(&c) + self.detail_offset(x as f64, z as f64)
     }
 
     /// Public API: Density at position (x, y, z)
     #[inline]
     pub fn density_at(&self, x: i32, y: i32, z: i32) -> f64 {
         let c = self.sample_terrain_climate(x as f64, z as f64);
-        let off = self.terrain_offset_from_climate(&c);
-        self.density_at_with_offset(y, off)
+        let off = self.terrain_offset_from_climate(&c) + self.detail_offset(x as f64, z as f64);
+        self.density_at_with_offset(x as f64, y, z as f64, off)
     }
 
     /// Public API: Is position solid
@@ -807,7 +1275,12 @@ impl BDSTerrain {
     #[inline]
     pub fn height_at(&self, x: i32, z: i32) -> i32 {
         let c = self.sample_terrain_climate(x as f64, z as f64);
-        self.height_at_with_climate(&c)
+        self.height_at_with_climate(
+            &c,
+            self.detail_offset(x as f64, z as f64),
+            x as f64,
+            z as f64,
+        )
     }
 
     /// Map climate values to a Bedrock biome id through the Java 1.18+
@@ -822,18 +1295,70 @@ impl BDSTerrain {
     /// c/e/w/t/h samples it may carry are ignored, so five climate noises
     /// plus the swapped-peaks one are sampled here.
     fn climate_to_biome_from_values(&self, x: i32, z: i32, c: &ClimateValues) -> u8 {
+        self.biome_from_climate(x, z, c, false)
+    }
+
+    /// Surface biome for a column: same tree as the capture sampler, but the
+    /// climate `depth` is taken at the column's own surface height.
+    ///
+    /// Sampling it at y=0 puts every column deep underground as far as the tree
+    /// is concerned, so it answers with cave biomes (lush caves was the second
+    /// most common "surface" biome) and those speckles chopped the map into
+    /// confetti.
+    fn surface_biome_from_values(&self, x: i32, z: i32, c: &ClimateValues) -> u8 {
+        self.biome_from_climate(x, z, c, true)
+    }
+
+    fn biome_from_climate(&self, x: i32, z: i32, c: &ClimateValues, surface: bool) -> u8 {
+        if surface {
+            // World path: the climate of this column came from cubiomes, and so
+            // does the biome. The height is only needed because 1.18's generator
+            // puts rivers and caves in their own depth bands, and because the
+            // elevation gates below need it.
+            let xf = x as f64;
+            let zf = z as f64;
+            let detail = self.detail_offset(xf, zf);
+            let y = self.height_at_with_climate(c, detail, xf, zf) as f64;
+            let java = self
+                .cubiomes
+                .as_ref()
+                .and_then(|generator| generator.biome_at(x, y as i32, z));
+            // The ocean variant (and the fallback) must use vanilla's temperature,
+            // not ours: our field runs cold and turned lakes into frozen oceans,
+            // which then grew a sheet of ice in the middle of a desert.
+            let vanilla = self
+                .cubiomes
+                .as_ref()
+                .and_then(|generator| generator.climate_at(x, z));
+            let (temperature, humidity) = match vanilla {
+                Some(np) => (np[0], np[1]),
+                None => (c.temperature, c.humidity),
+            };
+            let id = match java {
+                Some(java) => bds_biome_tree::java_to_bedrock(java),
+                // cubiomes could not be set up: answer from the climate instead of
+                // failing the chunk.
+                None => self.climate_fallback_biome(temperature, humidity),
+            };
+            return self.fix_biome_elevation(id, y, temperature, humidity);
+        }
+
+        // Capture path (1:1 with the BDS screenshots): raw coordinates, our own
+        // noise samples and the BDS biome tree.
         let xf = x as f64;
         let zf = z as f64;
-        let px = xf + c.peaks * 4.0;
-        let pz = zf + self.climate[CLIMATE_PEAKS_AND_VALLEYS].sample(zf, xf, 0.0) * 4.0;
+        let bx = xf;
+        let bz = zf;
+        let px = bx + c.peaks * 4.0;
+        let peaks_shift = self.climate[CLIMATE_PEAKS_AND_VALLEYS].sample(bz, bx, 0.0);
+        let pz = bz + peaks_shift * 4.0;
 
-        let cont = self.climate[CLIMATE_CONTINENTALNESS].sample(px, 0.0, pz);
-        let erosion = self.climate[CLIMATE_EROSION].sample(px, 0.0, pz);
-        let weirdness = self.climate[CLIMATE_WEIRDNESS].sample(px, 0.0, pz);
-        let temperature = self.climate[CLIMATE_TEMPERATURE].sample(px, 0.0, pz);
-        let humidity = self.climate[CLIMATE_HUMIDITY].sample(px, 0.0, pz);
-
-        // Depth at y=0: `1 - y*4/128 - 83/160 + spline(c, e, peaks, w) + 0.015`.
+        let cont = self.climate_sample(CLIMATE_CONTINENTALNESS, px, pz, false);
+        let erosion = self.climate_sample(CLIMATE_EROSION, px, pz, false);
+        let weirdness = self.climate_sample(CLIMATE_WEIRDNESS, px, pz, false);
+        let temperature = self.climate_sample(CLIMATE_TEMPERATURE, px, pz, false);
+        let humidity = self.climate_sample(CLIMATE_HUMIDITY, px, pz, false);
+        // `1 - y*4/128 - 83/160 + spline(c, e, peaks, w) + 0.015`, at y=0.
         let peaks_val = -3.0 * ((weirdness.abs() - 0.6666667).abs() - 0.33333334);
         let raw_off = eval_spline(&[cont, erosion, peaks_val, weirdness], &self.spline) + 0.015;
         let depth = 1.0 - 83.0 / 160.0 + raw_off;
@@ -848,6 +1373,161 @@ impl BDSTerrain {
             (weirdness * 10000.0) as i32,
         ];
         bds_biome_tree::java_to_bedrock(bds_biome_tree::gen_overworld(&np))
+    }
+
+    /// Keeps elevation-specific biomes on the terrain that justifies them.
+    ///
+    /// The climate tree answers "which biome does this climate get", and its
+    /// mountain branches are keyed on climate, not on how tall the ground came
+    /// out. Our spline builds far gentler slopes than 1.18's, so the tree happily
+    /// hands out mountain biomes for a `weirdness` ridge the terrain never built:
+    /// stone shores spread thirty blocks above the waterline and groves sat at
+    /// sea level, which the player sees as grey and snowy "minibiomas" inside a
+    /// forest. This is the world sampler only; the BDS capture path
+    /// ([`BDSTerrain::biome_at_bds`]) still answers exactly what the tree says.
+    fn fix_biome_elevation(
+        &self,
+        id: u8,
+        height: f64,
+        temperature: f64,
+        humidity: f64,
+    ) -> u8 {
+        // cubiomes answers with a cave biome when the column's height puts it
+        // below the surface climate: the world surface must never be one, or the
+        // map fills with specks of lush caves and deep dark.
+        if matches!(
+            id,
+            biome::LUSH_CAVES | biome::DRIPSTONE_CAVES | biome::DEEP_DARK
+        ) {
+            return self.climate_fallback_biome(temperature, humidity);
+        }
+
+        // Ocean biomes are chosen by continentalness, but here the sea is decided
+        // by the ground height, so the two disagree along every shelf: the tree
+        // handed out ocean for ground up to y=86 and land biomes for lake beds.
+        // A dry plain of ocean biome is exactly what reads as a "minibioma" of
+        // gravel in the middle of a forest, so whichever way the column went, the
+        // biome follows the water.
+        let wet = height < self.water_height as f64;
+        let ocean = matches!(
+            id,
+            biome::OCEAN
+                | biome::DEEP_OCEAN
+                | biome::WARM_OCEAN
+                | biome::LUKEWARM_OCEAN
+                | biome::DEEP_LUKEWARM_OCEAN
+                | biome::COLD_OCEAN
+                | biome::DEEP_COLD_OCEAN
+                | biome::FROZEN_OCEAN
+                | biome::DEEP_FROZEN_OCEAN
+        );
+        if wet && !ocean {
+            let depth = self.water_height as f64 - height;
+            return self.ocean_biome(temperature, depth);
+        }
+        if !wet && ocean {
+            return self.climate_fallback_biome(temperature, humidity);
+        }
+
+        // cubiomes' rivers follow vanilla's river noise. Our terrain has its own
+        // river noise, so the two almost never agree and every vanilla river shows
+        // up as a one-block line of dirt across dry ground. Only a column our own
+        // water actually covers keeps the river biome.
+        if !wet
+            && matches!(id, biome::RIVER | biome::FROZEN_RIVER)
+        {
+            return self.climate_fallback_biome(temperature, humidity);
+        }
+
+
+        // Measured over 48x48 chunks (3 km, seed 12345) before this rule: stone
+        // shore y=61..96 (p50 69), grove y=62..125 (p50 87), stony peaks from
+        // y=75. Frozen peaks and snowy slopes were already above their floors.
+        let (floor, ceiling) = match id {
+            // A shore is two blocks above the water at most. The old ceiling of
+            // 66 left vanilla's stone shores as grey one-block contours running
+            // hundreds of blocks inland, because our terrain is much flatter than
+            // the 1.18 one they were drawn for.
+            biome::STONE_SHORE | biome::SNOWY_BEACH => (f64::NEG_INFINITY, SHORE_MAX_HEIGHT),
+            biome::GROVE => (GROVE_MIN_HEIGHT, f64::INFINITY),
+            biome::STONY_PEAKS
+            | biome::JAGGED_PEAKS
+            | biome::FROZEN_PEAKS
+            | biome::GRAVELLY_MOUNTAINS
+            | biome::WOODED_MOUNTAINS => (PEAKS_MIN_HEIGHT, f64::INFINITY),
+            _ => return id,
+        };
+        if height >= floor && height <= ceiling {
+            return id;
+        }
+        self.climate_fallback_biome(temperature, humidity)
+    }
+
+    /// The ocean biome a body of water of this temperature and depth gets, in
+    /// vanilla's terms: frozen, cold, temperate, lukewarm or warm, and deep once
+    /// the bed is far enough down.
+    fn ocean_biome(&self, temperature: f64, depth: f64) -> u8 {
+        let deep = depth >= DEEP_WATER;
+        if temperature < -0.45 {
+            if deep {
+                biome::DEEP_FROZEN_OCEAN
+            } else {
+                biome::FROZEN_OCEAN
+            }
+        } else if temperature < -0.1 {
+            if deep {
+                biome::DEEP_COLD_OCEAN
+            } else {
+                biome::COLD_OCEAN
+            }
+        } else if temperature > 0.55 {
+            biome::WARM_OCEAN
+        } else if temperature > 0.2 {
+            if deep {
+                biome::DEEP_LUKEWARM_OCEAN
+            } else {
+                biome::LUKEWARM_OCEAN
+            }
+        } else if deep {
+            biome::DEEP_OCEAN
+        } else {
+            biome::OCEAN
+        }
+    }
+
+    /// The plain biome the climate asks for, used where an elevation-specific
+    /// biome has no elevation to stand on.
+    fn climate_fallback_biome(&self, temperature: f64, humidity: f64) -> u8 {
+        if temperature < -0.45 {
+            biome::ICE_PLAINS
+        } else if temperature < -0.1 {
+            biome::SNOWY_TAIGA
+        } else if humidity > 0.3 {
+            if temperature < 0.15 {
+                biome::TAIGA
+            } else {
+                biome::FOREST
+            }
+        } else if temperature > 0.55 && humidity < -0.2 {
+            biome::DESERT
+        } else {
+            biome::PLAINS
+        }
+    }
+
+    /// Biome id of the quart cell whose corner is `(x, z)`, cached because the
+    /// smoothing window reads the same cells from every chunk that touches them.
+    fn biome_cell(&self, x: i32, z: i32) -> u8 {
+        let key = (x >> 2, z >> 2);
+        if let Some(id) = self.biome_cells.lock().get(key) {
+            return id;
+        }
+        let c = self.sample_terrain_climate(x as f64, z as f64);
+        let id = self.surface_biome_from_values(x, z, &c);
+        self.biome_cells
+            .lock()
+            .insert(key, id, BIOME_CELL_CACHE_CAP);
+        id
     }
 
     /// Generate base terrain for a chunk (bedrock, stone, water) - OPTIMIZED
@@ -865,55 +1545,50 @@ impl BDSTerrain {
         // the exact per-point niduy sampler (`climate_to_biome_from_values`)
         // evaluated at the cell corner, so a column whose coordinates are
         // multiples of 4 always stores `biome_at(x, z)` exactly.
-        let padding = self.gaussian.smooth_size;
-        let grid_size = (16 + padding * 2) as usize;
-        let start = -padding;
-        let end = 16 + padding;
-
-        // Quart cells covering the padded column range [start, end).
-        let cell_min = start.div_euclid(4);
-        let cell_max = (end - 1).div_euclid(4);
-
-        let mut biome_grid = vec![0u8; grid_size * grid_size];
+        // Quart cells covering the chunk; each cell value comes from the exact
+        // per-point sampler evaluated at the cell corner, so a column on a
+        // multiple of 4 stores `biome_at(x, z)` exactly.
         let mut chunk_biomes = [0u8; 256];
-        let mut uniform_biome: Option<u8> = None;
-        let mut is_uniform = true;
 
-        for qcx in cell_min..=cell_max {
-            for qcz in cell_min..=cell_max {
+        let mut cell_ids = [[0u8; CELL_GRID]; CELL_GRID];
+        for (i, qcx) in (CELL_LO..=CELL_HI).enumerate() {
+            for (j, qcz) in (CELL_LO..=CELL_HI).enumerate() {
+                cell_ids[i][j] = self.biome_cell(base_x + qcx * 4, base_z + qcz * 4);
+            }
+        }
+
+        // Second pass: the wide vote leaves one-cell notches wherever two biomes
+        // meet, because each cell's window resolves on its own. A 3x3 mode over
+        // the voted grid dissolves them without touching the patch sizes the wide
+        // window just established.
+        let mut voted = cell_ids;
+        for _ in 0..2 {
+            let before = voted;
+            for qcx in CELL_LO..=CELL_HI {
+                for qcz in CELL_LO..=CELL_HI {
+                    let (i, j) = ((qcx - CELL_LO) as usize, (qcz - CELL_LO) as usize);
+                    voted[i][j] = majority_at(&before, i, j, 1);
+                }
+            }
+        }
+        let cell_ids = voted;
+
+        for qcx in -1..=3 {
+            for qcz in -1..=3 {
+                // Majority vote over the 3x3 cell neighbourhood: single-cell
+                // specks (cave biomes and near-ties in the climate tree) break
+                // the biome shapes into confetti, so they are dissolved into
+                // whichever biome surrounds them.
+                let b = majority_biome(&cell_ids, qcx, qcz);
                 let cell_x = qcx * 4;
                 let cell_z = qcz * 4;
-
-                // One sample set per cell, at the cell corner (world
-                // coordinates: `cell_x`/`cell_z` are chunk-local columns).
-                let c = self.sample_terrain_climate(
-                    (base_x + cell_x) as f64,
-                    (base_z + cell_z) as f64,
-                );
-                let b = self.climate_to_biome_from_values(base_x + cell_x, base_z + cell_z, &c);
-
                 for x in cell_x..cell_x + 4 {
-                    if x < start || x >= end {
+                    if !(0..16).contains(&x) {
                         continue;
                     }
-                    let gx = (x + padding) as usize;
                     for z in cell_z..cell_z + 4 {
-                        if z < start || z >= end {
-                            continue;
-                        }
-                        let gz = (z + padding) as usize;
-                        biome_grid[gx * grid_size + gz] = b;
-
-                        if x >= 0 && x < 16 && z >= 0 && z < 16 {
+                        if (0..16).contains(&z) {
                             chunk_biomes[(x as usize) * 16 + z as usize] = b;
-                        }
-
-                        if is_uniform {
-                            match uniform_biome {
-                                None => uniform_biome = Some(b),
-                                Some(prev) if prev == b => {}
-                                _ => is_uniform = false,
-                            }
                         }
                     }
                 }
@@ -923,63 +1598,6 @@ impl BDSTerrain {
         let dominant_biome = chunk_biomes[7 * 16 + 7];
         let mut chunk = Chunk::new(dominant_biome);
         chunk.biomes = chunk_biomes;
-
-        // STEP 2: If uniform biome, skip Gaussian blur for elevations
-        let mut min_heights = [0.0f64; 256];
-        let mut max_heights = [0.0f64; 256];
-
-        if is_uniform {
-            let b_info = biome::get_biome_info(uniform_biome.unwrap_or(biome::PLAINS));
-            let min_el = b_info.min_elevation - 1.0;
-            let max_el = b_info.max_elevation;
-            min_heights.fill(min_el);
-            max_heights.fill(max_el);
-        } else {
-            // Blur along X axis - read from biome_grid (with padding)
-            let mut min_heights_x = vec![0.0f64; (16 * grid_size) as usize];
-            let mut max_heights_x = vec![0.0f64; (16 * grid_size) as usize];
-
-            for x in 0..16usize {
-                for z in start..end {
-                    let gz = (z + padding) as usize;
-                    let mut min_sum = 0.0;
-                    let mut max_sum = 0.0;
-
-                    for sx in -self.gaussian.smooth_size..=self.gaussian.smooth_size {
-                        let weight = self.gaussian.kernel_1d[(sx + self.gaussian.smooth_size) as usize];
-                        let adj_gx = (x as i32 + sx + padding) as usize;
-                        let adj_biome = biome_grid[adj_gx * grid_size as usize + gz];
-                        let info = biome::get_biome_info(adj_biome);
-                        min_sum += (info.min_elevation - 1.0) * weight;
-                        max_sum += info.max_elevation * weight;
-                    }
-
-                    let idx = x * grid_size as usize + gz;
-                    min_heights_x[idx] = min_sum / self.gaussian.weight_sum_1d;
-                    max_heights_x[idx] = max_sum / self.gaussian.weight_sum_1d;
-                }
-            }
-
-            // Blur along Z axis
-            for x in 0..16usize {
-                for z in 0..16usize {
-                    let mut min_sum = 0.0;
-                    let mut max_sum = 0.0;
-
-                    for sz in -self.gaussian.smooth_size..=self.gaussian.smooth_size {
-                        let weight = self.gaussian.kernel_1d[(sz + self.gaussian.smooth_size) as usize];
-                        let adj_gz = (z as i32 + sz + padding) as usize;
-                        let idx = x * grid_size as usize + adj_gz;
-                        min_sum += min_heights_x[idx] * weight;
-                        max_sum += max_heights_x[idx] * weight;
-                    }
-
-                    let out_idx = x * 16 + z;
-                    min_heights[out_idx] = min_sum / self.gaussian.weight_sum_1d;
-                    max_heights[out_idx] = max_sum / self.gaussian.weight_sum_1d;
-                }
-            }
-        }
 
         // STEP 3: Generate terrain using precomputed climate for the 16x16 chunk columns
         // This avoids resampling climate noises for each column
@@ -994,18 +1612,98 @@ impl BDSTerrain {
                 // terrain offset; the biome map was sampled per quart cell
                 // in STEP 1).
                 let c = self.sample_terrain_climate(world_x as f64, world_z as f64);
-                
                 // Get height from precomputed climate
-                let highest_solid = self.height_at_with_climate(&c);
+                let mut highest_solid = self.height_at_with_climate(
+                    &c,
+                    self.detail_offset(world_x as f64, world_z as f64),
+                    world_x as f64,
+                    world_z as f64,
+                );
 
-                // Fill from bedrock up to highest solid
-                for y in 1..=highest_solid {
-                    chunk.set_block(x, y, z, block_id::STONE);
+                // Rivers: carve the column down towards just below sea level as
+                // the river noise approaches its zero crossing.
+                let river = self.river_strength(world_x as f64, world_z as f64);
+                // Rivers follow the low ground: only the middle of the noise band
+                // carves, and never through a hill.
+                //
+                // Both limits are ramps, not cuts. Cutting either one gave the map
+                // one block wide walls: where the river got its top block at 0.49
+                // and 0.50, the carve jumped from nothing to eight blocks deep, and
+                // the same happened at the height cap. Ramping them turns those
+                // walls into ordinary banks.
+                let centre = ((river - RIVER_CENTRE) / (1.0 - RIVER_CENTRE)).clamp(0.0, 1.0);
+                let centre = centre * centre * (3.0 - 2.0 * centre);
+                let above = (highest_solid - self.water_height) as f64;
+                let height_fade = ((RIVER_MAX_HEIGHT as f64 - above) / RIVER_CAP_FADE).clamp(0.0, 1.0);
+                let river = centre * height_fade;
+
+                if river > 0.0 {
+                    let bed = self.water_height - RIVER_DEPTH;
+                    if highest_solid > bed {
+                        let carved =
+                            highest_solid as f64 + (bed - highest_solid) as f64 * river;
+                        highest_solid = carved.round() as i32;
+                    }
                 }
 
-                // Fill water above highest solid up to sea level
-                for y in (highest_solid + 1)..=self.water_height {
-                    chunk.set_block(x, y, z, block_id::WATER);
+                // Open sea: lower the bed smoothly towards a real depth. The
+                // spline alone never goes below y≈50 here, so without this every
+                // ocean was a sheet of water a few blocks deep. It is a
+                // subtraction, not a clamp, so the coast keeps its height and
+                // there is no wall where the sea starts.
+                let extra = self.sea_floor_extra(highest_solid, world_x as f64, world_z as f64);
+                if extra > 0.0 {
+                    highest_solid -= extra.round() as i32;
+                }
+
+                // Shallow bed, gently: compress the submerged relief by a third.
+                // A slope of 0.8 blocks per block puts a one-block contour every
+                // block or so, which is the stair look; at 0.5 the contours are
+                // twice as far apart. It is a plain scaling, not the saturating
+                // lift tried before: the depth order is preserved, so it can
+                // never turn a lake into flat plates.
+                let depth = self.water_height - highest_solid;
+                if depth > 2 {
+                    let lift = ((depth - 2) as f64 * SHORE_BED_GAIN).round() as i32;
+                    highest_solid += lift;
+                }
+
+
+                // A dry column exactly at sea level is the same thing from the
+                // other side: a flat plate level with the water, which reads as a
+                // hole with no water in the middle of a lake. Three percent of
+                // the map sat exactly there. The depth noise decides which way
+                // each column leaves the waterline, so the plate becomes a ragged
+                // shore instead of a lid.
+                if highest_solid == self.water_height {
+                    let n = self.depth_noise.sample(world_x as f64, 0.0, world_z as f64);
+                    highest_solid += if n > 0.0 { -1 } else { 1 };
+                }
+
+
+                // Sea is decided on the final bed height, after the shelf,
+                // the one-block rule and the sea-level step below: those move
+                // the bed, and a column dug under the waterline has to be
+                // filled. Computing it before them left dry holes one block
+                // below the surface, which is exactly the missing water the
+                // player found at 632, 61, -84.
+                let wet = highest_solid < self.water_height;
+
+                // Fill from bedrock up to highest solid (`fill_column` resolves
+                // the palette entry once per subchunk instead of per block).
+                chunk.fill_column(x, z, 1, highest_solid, block_id::STONE);
+
+                // Fill water above the solid ground, up to sea level.
+                //
+                if wet {
+                    // `.max(1)` keeps the bedrock layer at y=0.
+                    chunk.fill_column(
+                        x,
+                        z,
+                        (highest_solid + 1).max(1),
+                        self.water_height,
+                        block_id::WATER,
+                    );
                 }
             }
         }
@@ -1022,8 +1720,8 @@ impl BDSTerrain {
 
         for cx in (chunk_x - 1)..=(chunk_x + 1) {
             for cz in (chunk_z - 1)..=(chunk_z + 1) {
-                let base_chunk = self.generate_base_chunk(cx, cz);
-                manager.set_chunk(cx, cz, base_chunk);
+                let base_chunk = self.cached_base_chunk(cx, cz);
+                manager.set_chunk(cx, cz, (*base_chunk).clone());
             }
         }
 
@@ -1031,6 +1729,52 @@ impl BDSTerrain {
         self.populate_chunk(&mut manager, chunk_x, chunk_z, dominant_biome);
 
         manager.take_chunk(chunk_x, chunk_z).unwrap()
+    }
+
+    /// Generates a `width x depth` block of columns, building every base
+    /// chunk in the expanded region only once.
+    ///
+    /// The per-column path ([`Self::generate_chunk_internal`]) rebuilds the
+    /// 3x3 base neighbourhood for every column, so a row-major sweep pays for
+    /// ~3 base chunks per column (up to 9 in random order) even when the base
+    /// cache is warm: moving one chunk east pulls in a fresh `x + 1` column.
+    /// A region needs `(width + 2) x (depth + 2)` base chunks for
+    /// `width x depth` columns, i.e. ~1.1 per column for 16x16 tiles, which is
+    /// where the pregenerator's ~2x comes from.
+    pub fn generate_region(
+        &self,
+        start_x: i32,
+        start_z: i32,
+        width: i32,
+        depth: i32,
+    ) -> Vec<((i32, i32), Chunk)> {
+        let mut bases: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+        for cx in (start_x - 1)..=(start_x + width) {
+            for cz in (start_z - 1)..=(start_z + depth) {
+                bases.insert((cx, cz), self.cached_base_chunk(cx, cz));
+            }
+        }
+
+        let mut out = Vec::with_capacity((width.max(0) * depth.max(0)) as usize);
+        for cx in start_x..(start_x + width) {
+            for cz in start_z..(start_z + depth) {
+                let mut manager = ChunkManager3x3::new(cx, cz);
+                for dx in -1..=1 {
+                    for dz in -1..=1 {
+                        let key = (cx + dx, cz + dz);
+                        let base = bases
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| self.cached_base_chunk(key.0, key.1));
+                        manager.set_chunk(key.0, key.1, (*base).clone());
+                    }
+                }
+                let dominant_biome = manager.get_chunk(cx, cz).unwrap().biomes[7 * 16 + 7];
+                self.populate_chunk(&mut manager, cx, cz, dominant_biome);
+                out.push(((cx, cz), manager.take_chunk(cx, cz).unwrap()));
+            }
+        }
+        out
     }
 
     /// Populate a chunk with ores, trees, tall grass, caves
@@ -1091,6 +1835,12 @@ impl BDSTerrain {
             }
             biome::RIVER | biome::FROZEN_RIVER => {
                 self.tall_grass_river.populate(world, chunk_x, chunk_z, &mut random);
+                self.underwater
+                    .populate(world, chunk_x, chunk_z, &mut random, dominant_biome);
+            }
+            biome::SWAMPLAND | biome::MANGROVE_SWAMP => {
+                self.underwater
+                    .populate(world, chunk_x, chunk_z, &mut random, dominant_biome);
             }
             biome::OCEAN
             | biome::DEEP_OCEAN
@@ -1102,6 +1852,8 @@ impl BDSTerrain {
             | biome::FROZEN_OCEAN
             | biome::DEEP_FROZEN_OCEAN => {
                 self.tall_grass_ocean.populate(world, chunk_x, chunk_z, &mut random);
+                self.underwater
+                    .populate(world, chunk_x, chunk_z, &mut random, dominant_biome);
             }
             biome::ICE_PLAINS | biome::ICE_SPIKES => {
                 self.tall_grass_ice_plains.populate(world, chunk_x, chunk_z, &mut random);
@@ -1137,19 +1889,25 @@ impl BDSTerrain {
 
     fn cached_column(&self, chunk_x: i32, chunk_z: i32) -> Arc<Chunk> {
         let key = (chunk_x, chunk_z);
-        if let Some(chunk) = self.column_cache.lock().entries.get(&key) {
-            return Arc::clone(chunk);
+        if let Some(chunk) = self.column_cache.lock().get(key) {
+            return chunk;
         }
         let chunk = Arc::new(self.generate_chunk_internal(chunk_x, chunk_z));
-        let mut cache = self.column_cache.lock();
-        if cache.entries.insert(key, Arc::clone(&chunk)).is_none() {
-            cache.order.push_back(key);
-            while cache.order.len() > COLUMN_CACHE_CAP {
-                if let Some(oldest) = cache.order.pop_front() {
-                    cache.entries.remove(&oldest);
-                }
-            }
+        self.column_cache
+            .lock()
+            .insert(key, Arc::clone(&chunk), COLUMN_CACHE_CAP);
+        chunk
+    }
+
+    fn cached_base_chunk(&self, chunk_x: i32, chunk_z: i32) -> Arc<Chunk> {
+        let key = (chunk_x, chunk_z);
+        if let Some(chunk) = self.base_cache.lock().get(key) {
+            return chunk;
         }
+        let chunk = Arc::new(self.generate_base_chunk(chunk_x, chunk_z));
+        self.base_cache
+            .lock()
+            .insert(key, Arc::clone(&chunk), BASE_CACHE_CAP);
         chunk
     }
 }
@@ -1180,6 +1938,18 @@ impl WorldGenerator for BDSTerrain {
 
     fn generate_chunk_object(&self, chunk_x: i32, chunk_z: i32) -> Chunk {
         self.generate_chunk_internal(chunk_x, chunk_z)
+    }
+
+    /// Batched path: one build per base chunk for the whole region (see
+    /// [`BDSTerrain::generate_region`]).
+    fn generate_region(
+        &self,
+        start_x: i32,
+        start_z: i32,
+        width: i32,
+        depth: i32,
+    ) -> Vec<((i32, i32), Chunk)> {
+        BDSTerrain::generate_region(self, start_x, start_z, width, depth)
     }
 
     fn block_at(&self, x: i32, y: i32, z: i32) -> u32 {
@@ -1217,6 +1987,31 @@ mod tests {
     #[allow(dead_code)]
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// A region must produce exactly the columns the per-column path builds
+    /// (same base terrain and population), only generating each base chunk
+    /// once instead of once per neighbour.
+    #[test]
+    fn region_generation_matches_per_column() {
+        let terrain = BDSTerrain::new(12345);
+        let region = terrain.generate_region(7, 9, 2, 2);
+        assert_eq!(region.len(), 4);
+        for ((cx, cz), chunk) in region {
+            let expected = terrain.generate_chunk_internal(cx, cz);
+            assert_eq!(chunk.biomes, expected.biomes, "biomes in ({cx},{cz})");
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    for y in 0..128 {
+                        assert_eq!(
+                            chunk.get_block(x, y, z),
+                            expected.get_block(x, y, z),
+                            "block at ({x},{y},{z}) in ({cx},{cz})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1340,7 +2135,7 @@ mod tests {
             (-100000, 50000, biome::DEEP_OCEAN),
         ];
         for (x, z, want) in biome_points {
-            let got = terrain.biome_at(x, z);
+            let got = terrain.biome_at_bds(x, z);
             assert_eq!(got, want, "per-point biome at ({x},{z})");
         }
 
@@ -1359,12 +2154,11 @@ mod tests {
         ];
         for (i, want) in STRIP.iter().enumerate() {
             let x = -2048 + 64 * i as i32;
-            assert_eq!(terrain.biome_at(x, 0), *want, "strip biome at x={x}");
+            assert_eq!(terrain.biome_at_bds(x, 0), *want, "strip biome at x={x}");
         }
 
-        // The chunk fill runs the same sampler at quart-cell corners and
-        // expands per column, so a column on the quart grid must equal
-        // `biome_at` exactly (all coordinates below are multiples of 4).
+        // The same points through the capture sampler: it samples the climate at
+        // y=0, which is what the BDS captures hold.
         let corner_points = [
             (0, 0, biome::LUSH_CAVES),
             (100, 0, biome::DEEP_DARK),
@@ -1375,18 +2169,37 @@ mod tests {
             (-100000, 50000, biome::DEEP_OCEAN),
         ];
         for (x, z, want) in corner_points {
-            let chunk = terrain.generate_base_chunk(x >> 4, z >> 4);
-            let got = chunk.biomes[((x & 15) as usize) * 16 + ((z & 15) as usize)];
-            assert_eq!(got, want, "quart-corner chunk biome at ({x},{z})");
+            assert_eq!(terrain.biome_at_bds(x, z), want, "capture biome at ({x},{z})");
         }
 
-        // And every column of a chunk carries its quart cell's corner value
-        // (checked on the two off-grid points of the list above).
-        for (x, z) in [(-4520, 8350), (12345, -6789)] {
-            let chunk = terrain.generate_base_chunk(x >> 4, z >> 4);
-            let got = chunk.biomes[((x & 15) as usize) * 16 + ((z & 15) as usize)];
-            let cell = terrain.biome_at(x.div_euclid(4) * 4, z.div_euclid(4) * 4);
-            assert_eq!(got, cell, "chunk column ({x},{z}) carries its quart cell's value");
+        // The world sampler classifies at the column's own surface height, so it
+        // never answers with a cave biome; those were the specks that turned the
+        // surface map into confetti.
+        for x in (-2048..2048).step_by(37) {
+            for z in (-2048..2048).step_by(53) {
+                let id = terrain.biome_at(x, z);
+                assert!(
+                    !matches!(
+                        id,
+                        biome::LUSH_CAVES | biome::DRIPSTONE_CAVES | biome::DEEP_DARK
+                    ),
+                    "surface biome at ({x},{z}) was a cave biome: {id}"
+                );
+            }
+        }
+
+        // The chunk fill expands one value per quart cell, so the sixteen columns
+        // of a cell always agree.
+        for (cx, cz) in [(0, 0), (-31, 7), (250, -250)] {
+            let chunk = terrain.generate_base_chunk(cx, cz);
+            let mut cells = std::collections::HashMap::new();
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    let id = chunk.biomes[x * 16 + z];
+                    let cell = cells.entry((x / 4, z / 4)).or_insert(id);
+                    assert_eq!(*cell, id, "chunk ({cx},{cz}) cell ({},{}) differs", x / 4, z / 4);
+                }
+            }
         }
     }
 }

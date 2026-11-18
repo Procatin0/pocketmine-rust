@@ -20,6 +20,7 @@
 //! listener: the hook decides, the session only sends/teleports.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// One online player as the Java listener sees it. Positions, yaw and pitch
 /// are canonical Bedrock (the `PlayerContext` / registry convention); the
@@ -64,6 +65,34 @@ impl PlayerSnapshot {
             is_virtual: false,
         }
     }
+}
+
+/// One live non-player entity (falling block, mob, item, projectile, ...) as
+/// the Java listener sees it, Bedrock-canonical (`WorldState::entities_snapshot`).
+///
+/// Players keep their own [`PlayerSnapshot`] path: they carry a display name,
+/// TAB entry and gamemode, while these are plain actors that a Java client
+/// only has to spawn, move and destroy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorSnapshot {
+    /// Bedrock runtime id, the key every actor packet uses.
+    pub runtime_id: u64,
+    /// `Entity::getNetworkTypeId()`, e.g. `minecraft:falling_block`.
+    pub type_id: &'static str,
+    /// Feet position (`Entity::$location`).
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    /// Bedrock yaw/pitch/head yaw.
+    pub yaw: f64,
+    pub pitch: f64,
+    pub head_yaw: f64,
+    /// `Entity::getNameTag()`; empty means no custom name.
+    pub name_tag: String,
+    /// Bedrock network id of the block a `FallingBlock` imitates, so the Java
+    /// spawn packet can carry the matching block state. `None` for any other
+    /// type.
+    pub block_network_id: Option<u32>,
 }
 
 /// Saved position/gamemode/health (`player.load`), Bedrock-canonical.
@@ -174,6 +203,13 @@ pub trait ServerHooks: Send + Sync {
     fn world_time(&self) -> i64 {
         6000
     }
+    /// World age in ticks (`World::getTick()`), **not** the time of day:
+    /// Java's `set_time` sends it as the world age and the client animates the
+    /// clouds from it. A constant value here made the cloud layer snap back
+    /// every time the clock was broadcast.
+    fn world_age(&self) -> i64 {
+        0
+    }
     fn world_time_running(&self) -> bool {
         true
     }
@@ -248,6 +284,20 @@ pub trait ServerHooks: Send + Sync {
         Vec::new()
     }
 
+    /// Every live non-player entity (`WorldState::entities_snapshot`), for
+    /// `JavaSession::sync_actors`. Default (in-memory test hooks) is empty.
+    fn actor_snapshots(&self) -> Vec<ActorSnapshot> {
+        Vec::new()
+    }
+
+    /// Java entity id for a Bedrock runtime id. Java ids are distinct from
+    /// [`Self::entity_id_for`]'s player range (1_000_000+); the default is a
+    /// deterministic hash for in-memory tests, production allocates from
+    /// 2_000_000 in `CoreHooks`.
+    fn actor_entity_id(&self, runtime_id: u64) -> i32 {
+        2_000_000 + (runtime_id % 900_000) as i32
+    }
+
     fn handle_chat(&self, _session_id: u64, _name: &str, _message: &str) -> ChatOutcome {
         ChatOutcome::default()
     }
@@ -262,6 +312,21 @@ pub trait ServerHooks: Send + Sync {
     /// re-sends the real state on failure to undo client prediction.
     fn place_block(&self, _x: i32, _y: i32, _z: i32, _network_id: u32) -> bool {
         false
+    }
+    /// [`ServerHooks::place_block`] with the placement context PocketMine's
+    /// `Block::place()` needs: the clicked face and the player's yaw
+    /// (`Door::place()`, `Trapdoor::place()`, `FenceGate::place()`,
+    /// `Piston::place()`). Defaults to the plain placement.
+    fn place_block_oriented(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        network_id: u32,
+        _face: i32,
+        _yaw: f32,
+    ) -> bool {
+        self.place_block(x, y, z, network_id)
     }
     /// `Block::onInteract()` for the block a Java player right-clicked
     /// (`World::useItemOn`): buttons, levers and fence gates. Returning true
@@ -278,9 +343,27 @@ pub trait ServerHooks: Send + Sync {
     /// The Java client never sends the item it places, so the session
     /// remembers the creative hotbar slots (`set_creative_slot`) and asks
     /// this hook to translate the held item id into a Bedrock block.
-    /// `None` falls back to `stone_network_id`.
+    /// `None` (no held item, or an item that is not a block) places nothing.
     fn block_network_id_for_item(&self, _protocol: i32, _item_id: i32) -> Option<u32> {
         None
+    }
+    /// A Java player threw the held stack (`PlayerAction` `DROP_ITEM` /
+    /// `DROP_ALL_ITEMS`, Q key). Implementations spawn the `ItemEntity` in
+    /// front of the player (`Player::dropItem()`), translating the Java item
+    /// id into the shared world; the default (in-memory test hooks) ignores
+    /// it. Returns true when the item left the hand.
+    fn drop_item(
+        &self,
+        _protocol: i32,
+        _item_id: i32,
+        _count: i32,
+        _x: f64,
+        _y: f64,
+        _z: f64,
+        _yaw: f32,
+        _pitch: f32,
+    ) -> bool {
+        false
     }
     /// Bedrock network id of stone (default creative placement).
     fn stone_network_id(&self) -> u32 {
@@ -326,6 +409,25 @@ pub trait ServerHooks: Send + Sync {
     }
     fn try_legacy_chunk(&self, cx: i32, cz: i32) -> Option<LegacyChunk> {
         self.legacy_chunk(cx, cz)
+    }
+    /// Shared-cache variant of [`Self::try_modern_chunk`].
+    ///
+    /// The chunk streaming path fans one converted column out to every Java
+    /// observer; returning owned `ModernChunkData` made each observer pay a
+    /// full ~80 KB copy of `data`/`heightmaps`/`light`. Implementations that
+    /// keep converted payloads behind an `Arc` return the handle here; the
+    /// default keeps the owned behaviour (one copy) for simple test hooks.
+    fn try_modern_chunk_shared(
+        &self,
+        protocol: i32,
+        cx: i32,
+        cz: i32,
+    ) -> Option<Arc<ModernChunkData>> {
+        self.try_modern_chunk(protocol, cx, cz).map(Arc::new)
+    }
+    /// Shared-cache variant of [`Self::try_legacy_chunk`].
+    fn try_legacy_chunk_shared(&self, cx: i32, cz: i32) -> Option<Arc<LegacyChunk>> {
+        self.try_legacy_chunk(cx, cz).map(Arc::new)
     }
     /// `registry_data` payloads for configuration, one per registry.
     fn registry_payloads(&self, _protocol: i32) -> Vec<Vec<u8>> {

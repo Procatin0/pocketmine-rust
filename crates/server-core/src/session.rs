@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bedrock_protocol::binary::{CodecError, Reader, Writer};
 use bedrock_protocol::{
     AddActorPacket, AddItemActorPacket, AddPlayerPacket, AvailableCommandsPacket, BlockPos,
-    BossEventPacket, ChunkRadiusUpdatedPacket, TakeItemActorPacket,
+    BossBarColor, BossBarOverlay, BossEventPacket, ChunkRadiusUpdatedPacket, TakeItemActorPacket,
     CommandRequestPacket, CommandSpec, DisconnectPacket, LevelChunkPacket, LoginPacket,
     MetadataEntry, MetadataValue, MoveActorAbsolutePacket, MoveActorDeltaPacket, MovePlayerPacket,
     NetworkChunkPublisherUpdatePacket,
@@ -18,6 +18,7 @@ use bedrock_protocol::{
     StartGamePacket, ActorEventPacket, InventoryContentPacket, InventorySlotPacket,
     InventoryTransactionPacket, ItemStack, RemoveObjectivePacket, RespawnPacket,
     SetDifficultyPacket, SetDisplayObjectivePacket, SetHealthPacket,
+    ModalFormRequestPacket, ModalFormResponsePacket,
     SetScorePacket, SetScoreboardIdentityPacket, SetTitlePacket, TextPacket, TransactionData, TransferPacket, UpdateAbilitiesPacket,
     UpdatePlayerGameTypePacket, Vector3f,
 };
@@ -49,14 +50,15 @@ use bedrock_protocol::packets::level_sound_event::{
 };
 use bedrock_protocol::packets::player_list::uuid_from_str;
 use bedrock_world::{block_id::AIR, FlatGenerator, WorldGenerator};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use php_plugin_bridge::{
-    BlockBreakEvent, BlockPlaceEvent, BossBarData, CommandSender, Event, MoveLocation,
-    PlayerChatEvent, PlayerCommandPreprocessEvent, PlayerContext, PlayerDeathEvent,
-    PlayerInteractEvent, PlayerJoinEvent, PlayerMoveEvent, PlayerQuitEvent, PlayerRespawnEvent,
-    PluginAction, PluginManager,
+    BlockBreakEvent, BlockPlaceEvent, BossBarData, CommandSender, EntityDamageByChildEntityEvent,
+    EntityDamageByEntityEvent, EntityDamageEvent, Event, MoveLocation, PlayerChatEvent,
+    PlayerCommandPreprocessEvent, PlayerContext, PlayerDeathEvent, PlayerInteractEvent,
+    PlayerJoinEvent, PlayerMoveEvent, PlayerQuitEvent, PlayerRespawnEvent, PhpCommandInfo,
+    PluginAction, PluginManager, CAUSE_BLOCK_EXPLOSION, CAUSE_CUSTOM, CAUSE_ENTITY_ATTACK,
+    CAUSE_ENTITY_EXPLOSION, CAUSE_FALL, CAUSE_PROJECTILE,
 };
-use rayon::prelude::*;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -115,6 +117,27 @@ pub const PRESPAWN_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// `YmlServerProperties::CHUNK_SENDING_PER_TICK` (default 4): how many
 /// `LevelChunk` packets one `Player::doChunkRequests()` pass sends.
 pub const CHUNK_SENDING_PER_TICK: usize = 4;
+
+/// Columns requested from the generation pipeline per session per tick, ahead
+/// of the [`CHUNK_SENDING_PER_TICK`] that can be sent. Keeps the pipeline ahead
+/// of the stream without flooding it after a teleport.
+pub const CHUNK_PREFETCH_PER_TICK: usize = 24;
+
+/// One `Player::doChunkRequests()` pass, split so the tick can build packets
+/// outside the sessions lock and never generate terrain on its thread.
+#[derive(Default)]
+pub struct ChunkRequestPlan {
+    /// `NetworkChunkPublisherUpdate` for an ordering pass that changed the
+    /// loaded window.
+    pub publisher_update: Option<OutgoingPacket>,
+    /// Columns this pass would stream (at most [`CHUNK_SENDING_PER_TICK`]).
+    pub columns: Vec<(i32, i32)>,
+    /// Columns to hand to the generation pipeline: `columns` plus lookahead.
+    pub prefetch: Vec<(i32, i32)>,
+    /// Packets built from already-generated columns (filled by the manager,
+    /// or synchronously by [`PlayerSession::do_chunk_requests`]).
+    pub ready: Vec<(i32, i32, LevelChunkPacket)>,
+}
 
 /// `YmlServerProperties::CHUNK_SENDING_SPAWN_RADIUS` (default 4): the
 /// chunk radius feeding the terrain-ready spawn threshold
@@ -197,34 +220,8 @@ pub const TIME_BROADCAST_INTERVAL_TICKS: i32 = 20;
 /// TODO(parity): extend to the full vanilla break-info table; hashed ids
 /// outside the generator's output default to stone (1.5, incompatible).
 fn block_break_time_secs(block_id: u32) -> Option<f32> {
-    use bedrock_world::block_id as bid;
-    if block_id == bid::AIR {
-        return None;
-    }
-    let (hardness, bare_hand_compatible) = match block_id {
-        bid::STONE => (1.5, false),
-        bid::DIRT => (0.5, true),
-        bid::GRASS_BLOCK => (0.6, true),
-        bid::SAND => (0.5, true),
-        bid::SANDSTONE => (0.8, false),
-        bid::GRAVEL => (0.6, true),
-        bid::COAL_ORE | bid::IRON_ORE | bid::GOLD_ORE | bid::REDSTONE_ORE
-        | bid::LAPIS_ORE | bid::DIAMOND_ORE | bid::EMERALD_ORE => (3.0, false),
-        bid::OAK_LOG | bid::SPRUCE_LOG | bid::BIRCH_LOG => (2.0, true),
-        bid::OAK_LEAVES | bid::SPRUCE_LEAVES | bid::BIRCH_LEAVES => (0.2, true),
-        bid::SHORT_GRASS | bid::TALL_GRASS | bid::DANDELION | bid::POPPY
-        | bid::SNOW_LAYER => (0.0, true),
-        // Unbreakable (hardness < 0 / not breakable): bedrock, water.
-        bid::BEDROCK | bid::WATER => return None,
-        // Unknown hashed id: conservative stone default.
-        _ => (1.5, false),
-    };
-    let secs = if bare_hand_compatible {
-        hardness * 1.5
-    } else {
-        hardness * 5.0
-    };
-    Some(secs)
+    // Single table, shared with the `block.break_info` host call.
+    crate::block_info::break_info(block_id).map(|info| info.seconds)
 }
 
 pub fn update_block_wire(x: i32, y: i32, z: i32, block_id: u32) -> Vec<u8> {
@@ -283,6 +280,8 @@ pub enum OutgoingPacket {
     SetScoreboardIdentity(SetScoreboardIdentityPacket),
     /// `BossEventPacket` (0x4A): Bedrock boss bars (apiBossBar).
     BossEvent(BossEventPacket),
+    /// `ModalFormRequestPacket` (0x64): `Player::sendForm()`.
+    ModalFormRequest(ModalFormRequestPacket),
     RawWire(Vec<u8>),
 }
 
@@ -319,6 +318,7 @@ impl OutgoingPacket {
             Self::SetScore(p) => p.packet_id(),
             Self::SetScoreboardIdentity(p) => p.packet_id(),
             Self::BossEvent(p) => p.packet_id(),
+            Self::ModalFormRequest(p) => p.packet_id(),
             Self::RawWire(bytes) => {
                 let mut reader = Reader::new(bytes);
                 reader.read_var_u32().unwrap_or(0) & 0x3FF
@@ -358,6 +358,7 @@ impl OutgoingPacket {
             Self::SetScore(p) => p.encode(writer),
             Self::SetScoreboardIdentity(p) => p.encode(writer),
             Self::BossEvent(p) => p.encode(writer),
+            Self::ModalFormRequest(p) => p.encode(writer),
             Self::RawWire(bytes) => {
                 writer.write_bytes(bytes);
                 Ok(())
@@ -531,6 +532,10 @@ pub struct PlayerSession {
     /// Incoming `BossEventPacket`s (0x4A) for the manager to answer
     /// (apiBossBar `PacketListener`: register/unregister/query).
     pub pending_boss_events: Vec<BossEventPacket>,
+    /// Incoming `ModalFormResponsePacket`s (0x65): `(form id, response)`.
+    /// `SessionManager` routes them to the PHP form after dropping the
+    /// session lock, because the round trip calls back into the runtime.
+    pub pending_form_responses: Vec<(u32, Option<String>)>,
     /// Packets queued asynchronously (broadcasts, plugin actions).
     pub pending_outgoing: Vec<OutgoingPacket>,
     /// Chat/system lines to broadcast on the next session dispatch.
@@ -679,6 +684,7 @@ impl PlayerSession {
             last_block_attacked: None,
             break_handler: None,
             pending_boss_events: Vec::new(),
+            pending_form_responses: Vec::new(),
             pending_outgoing: Vec::new(),
             pending_broadcasts: Vec::new(),
             joined: false,
@@ -1082,6 +1088,8 @@ impl PlayerSession {
             return Vec::new();
         };
         let ipc_started = std::time::Instant::now();
+        // One hotspot per event name: a slow plugin names itself in the report.
+        let _event_scope = crate::profiler::scope_dyn(|| format!("plugin.{}", event.name()));
         let result = plugins.dispatch_event_sync(event);
         // Plugin events cross the process boundary synchronously, so their
         // round-trip is charged to the caller (the packet or tick thread).
@@ -1096,6 +1104,49 @@ impl PlayerSession {
                 Vec::new()
             }
         }
+    }
+
+    /// The player as an entity snapshot (`entity_json()` shape), so damage
+    /// events can hand `getEntity()` a real `Player`.
+    fn player_entity_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "unique_id": self.entity_unique_id,
+            "runtime_id": self.entity_runtime_id,
+            "type": "minecraft:player",
+            "x": self.position.x,
+            "y": self.position.y,
+            "z": self.position.z,
+            "yaw": self.yaw,
+            "pitch": self.pitch,
+            "name_tag": self.username,
+            "health": self.health,
+            "max_health": self.max_health,
+            "alive": !self.is_dead,
+        })
+    }
+
+    /// Fires the `EntityDamageEvent` chain for one hit and returns the damage
+    /// to apply (`None` when a plugin cancelled it).
+    ///
+    /// PocketMine fires one instance of the most specific class and its parent
+    /// listeners receive it through `instanceof`; the bridge dispatches by
+    /// exact name, so the chain is explicit: `EntityDamageEvent` first, then
+    /// `EntityDamageByEntityEvent` / `EntityDamageByChildEntityEvent`.
+    fn fire_damage_event(
+        &mut self,
+        entity: serde_json::Value,
+        cause: i32,
+        damage: f32,
+        damager: Option<serde_json::Value>,
+        child: Option<serde_json::Value>,
+    ) -> Option<f32> {
+        let Some(plugins) = self.plugins.clone() else {
+            return Some(damage);
+        };
+        let started = std::time::Instant::now();
+        let result = SessionManager::damage_chain(&plugins, entity, cause, damage, damager, child);
+        crate::metrics::ipc().record(started.elapsed());
+        result
     }
 
     pub fn is_in_game(&self) -> bool {
@@ -1130,6 +1181,27 @@ impl PlayerSession {
 
     pub fn eye_position(&self) -> Vector3f {
         Vector3f::new(self.position.x, self.position.y + EYE_HEIGHT, self.position.z)
+    }
+
+    /// `Player::dropItem()` (Q key): spawns the thrown `ItemEntity` at the eye
+    /// position with `getDirectionVector()->multiply(0.3)`, so any item —
+    /// blocks included — leaves the hand the same way on Bedrock and Java.
+    fn drop_item_entity(&mut self, item: ItemStack) {
+        let yaw = self.yaw.to_radians();
+        let pitch = self.pitch.to_radians();
+        let direction = Vector3f::new(
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        );
+        let motion = Vector3f::new(
+            direction.x * 0.3,
+            direction.y * 0.3 + 0.1,
+            direction.z * 0.3,
+        );
+        let owner = self.username.clone();
+        self.world
+            .spawn_item(self.eye_position(), item, Some(motion), &owner);
     }
 
     pub fn can_see(&self, other_session_id: u64) -> bool {
@@ -1404,6 +1476,26 @@ impl PlayerSession {
                     Err(error) => {
                         warn!(
                             "Failed to decode CommandRequestPacket from session {}: {}",
+                            self.session_id, error
+                        );
+                        Ok(Vec::new())
+                    }
+                }
+            }
+            // `ModalFormResponsePacket` (0x65): the player answered (or
+            // closed) a form. Queued for the manager, which calls
+            // `Form::handleResponse()` in the PHP runtime.
+            0x65 => {
+                let mut reader = Reader::new(payload);
+                match ModalFormResponsePacket::decode_payload(&mut reader) {
+                    Ok(packet) => {
+                        self.pending_form_responses
+                            .push((packet.form_id, packet.data));
+                        Ok(Vec::new())
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failed to decode ModalFormResponsePacket from session {}: {}",
                             self.session_id, error
                         );
                         Ok(Vec::new())
@@ -1702,9 +1794,17 @@ impl PlayerSession {
 
                 // 8. AvailableCommandsPacket (0x4C / 76) -
                 // `syncAvailableCommands()`: registers the native commands
-                // so the client lists and autocompletes them. Before
-                // abilities, like the reference.
-                out.push(OutgoingPacket::RawWire(available_commands_wire()));
+                // plus the PHP plugin commands (registered at `onEnable`,
+                // e.g. EasyEdit's `/set` -> `//set`) so the client lists and
+                // autocompletes them. Before abilities, like the reference.
+                let plugin_commands = self
+                    .plugins
+                    .as_ref()
+                    .map(|plugins| plugins.php_commands())
+                    .unwrap_or_default();
+                out.push(OutgoingPacket::RawWire(available_commands_wire(
+                    &plugin_commands,
+                )));
 
                 // 9. UpdateAbilitiesPacket (0xBB / 187) + AdventureSettings
                 // (0xBC / 188) - `syncAbilities()` then
@@ -2099,7 +2199,7 @@ impl PlayerSession {
     ///
     /// No-op until `RequestChunkRadius` set the view distance.
     /// True when [`Self::do_chunk_requests`] would stream terrain to this
-    /// session (the manager uses it to warm payloads outside its lock).
+    /// session (the manager uses it to plan and request columns).
     pub fn wants_chunk_streaming(&self) -> bool {
         self.view_distance_received
             && (self.state == SessionState::PreSpawn || self.state == SessionState::InGame)
@@ -2107,40 +2207,21 @@ impl PlayerSession {
 
     /// Columns the next [`Self::do_chunk_requests`] pass will stream.
     ///
-    /// Generating a cold column costs ~18 ms, so the manager warms this list
-    /// in parallel *before* taking the sessions lock (see
-    /// [`SessionManager::drive_chunk_requests`]): while the payload tables were
-    /// built under the lock, every packet handler — a block break's particles
-    /// and sound included — waited behind them for 60-160 ms, which the client
-    /// also felt as lag and, under fast breaking, as a dropped connection.
+    /// Generation never runs on the tick thread: the manager requests this
+    /// list (plus lookahead) from `crate::chunk_pipeline` and streams only the
+    /// columns whose payload is already cached.
     pub fn next_chunk_columns(&self) -> Vec<(i32, i32)> {
-        if !self.chunk_load_queue.is_empty() {
-            return self
-                .chunk_load_queue
-                .iter()
-                .take(CHUNK_SENDING_PER_TICK)
-                .copied()
-                .collect();
-        }
-        let allowed_radius = self.chunk_radius.clamp(2, self.max_view_distance.max(2));
-        let curr_cx = (self.position.x.floor() as i32) >> 4;
-        let curr_cz = (self.position.z.floor() as i32) >> 4;
-        Self::select_chunks(allowed_radius, curr_cx, curr_cz)
-            .into_iter()
-            .filter(|chunk| !self.sent_chunks.contains(chunk))
-            .take(CHUNK_SENDING_PER_TICK)
-            .collect()
+        self.upcoming_chunk_columns(CHUNK_SENDING_PER_TICK)
     }
 
-    pub fn do_chunk_requests(&mut self) -> Vec<OutgoingPacket> {
+    pub fn plan_chunk_requests(&mut self) -> ChunkRequestPlan {
+        let mut plan = ChunkRequestPlan::default();
         if !self.view_distance_received {
-            return Vec::new();
+            return plan;
         }
         if !(self.state == SessionState::PreSpawn || self.state == SessionState::InGame) {
-            return Vec::new();
+            return plan;
         }
-
-        let mut out = Vec::new();
 
         // `Player::doChunkRequests()`: `if (next !== PHP_INT_MAX &&
         // next-- <= 0) { next = PHP_INT_MAX; orderChunks(); }` — trigger
@@ -2186,7 +2267,7 @@ impl PlayerSession {
                     self.position.y.floor() as i32,
                     self.position.z.floor() as i32,
                 );
-                out.push(OutgoingPacket::NetworkChunkPublisherUpdate(
+                plan.publisher_update = Some(OutgoingPacket::NetworkChunkPublisherUpdate(
                     NetworkChunkPublisherUpdatePacket::new(
                         center,
                         Self::publisher_radius_blocks(stored_view_distance),
@@ -2198,7 +2279,7 @@ impl PlayerSession {
         if self.chunk_load_queue.is_empty() {
             // Deadlock instrumentation: `do_chunk_requests` ran (client sent
             // *something* after the radius) but there was nothing to stream.
-            if ordered || !out.is_empty() {
+            if ordered || plan.publisher_update.is_some() {
                 debug!(
                     "Session {} do_chunk_requests: view_distance_received={} chunk_radius={} spawn_threshold={} spawn_chunk_load_count={} sent_chunks={} missing=0 out={} ordered={} state={:?}",
                     self.session_id,
@@ -2207,43 +2288,58 @@ impl PlayerSession {
                     self.spawn_threshold,
                     self.spawn_chunk_load_count,
                     self.sent_chunks.len(),
-                    out.len(),
+                    usize::from(plan.publisher_update.is_some()),
                     ordered,
                     self.state
                 );
             }
-            return out;
+            plan.prefetch = self.upcoming_chunk_columns(CHUNK_PREFETCH_PER_TICK);
+            return plan;
         }
 
         let take_count = self.chunk_load_queue.len().min(CHUNK_SENDING_PER_TICK);
-        let to_send: Vec<(i32, i32)> = self.chunk_load_queue.drain(..take_count).collect();
-        let to_send_len = to_send.len();
-        for chunk in &to_send {
-            self.sent_chunks.insert(*chunk);
+        plan.columns = self
+            .chunk_load_queue
+            .iter()
+            .take(take_count)
+            .copied()
+            .collect();
+        plan.prefetch = self.upcoming_chunk_columns(CHUNK_PREFETCH_PER_TICK);
+        plan
+    }
+
+    /// Streams the columns of a plan, generating any missing payload
+    /// synchronously.
+    ///
+    /// This is PocketMine's `Player::doChunkRequests()` shape and what tests
+    /// and block resends use. The tick loop does **not** call it: it uses
+    /// [`Self::plan_chunk_requests`] plus cache-only packets, so terrain
+    /// generation never runs on the tick thread.
+    pub fn do_chunk_requests(&mut self) -> Vec<OutgoingPacket> {
+        let mut plan = self.plan_chunk_requests();
+        plan.ready = plan
+            .columns
+            .iter()
+            .map(|&(cx, cz)| (cx, cz, self.create_chunk_packet(cx, cz)))
+            .collect();
+        self.commit_chunk_requests(plan)
+    }
+
+    /// Commits a plan: queues the publisher update, then every ready
+    /// `LevelChunk`, and advances the terrain-ready counter. Columns whose
+    /// payload was not ready stay in `chunk_load_queue` for a later pass.
+    pub fn commit_chunk_requests(&mut self, plan: ChunkRequestPlan) -> Vec<OutgoingPacket> {
+        let mut out = Vec::with_capacity(plan.ready.len() + 1);
+        if let Some(update) = plan.publisher_update {
+            out.push(update);
         }
 
-        // Generate chunk payloads in parallel across all CPU cores using
-        // rayon (same pattern as the old packet-handler streaming).
-        let world = Arc::clone(&self.world);
-        let packets: Vec<LevelChunkPacket> = to_send
-            .into_par_iter()
-            .map(|(cx, cz)| {
-                let (sub_chunk_count, payload) = world.chunk_payload(cx, cz);
-                LevelChunkPacket::new(
-                    cx,
-                    cz,
-                    0, // DimensionIds::OVERWORLD
-                    sub_chunk_count,
-                    None, // sub_chunk_request_limit
-                    false, // cache_enabled
-                    Vec::new(), // used_blob_hashes
-                    payload,
-                    false, // client_biome_update
-                )
-            })
-            .collect();
-
-        for packet in packets {
+        let sent = plan.ready.len();
+        for (cx, cz, packet) in plan.ready {
+            self.sent_chunks.insert((cx, cz));
+            if !self.chunk_load_queue.is_empty() {
+                self.chunk_load_queue.retain(|queued| *queued != (cx, cz));
+            }
             out.push(OutgoingPacket::LevelChunk(packet));
             // `Player::requestChunks()` completion callback: count toward the
             // terrain-ready threshold.
@@ -2269,7 +2365,7 @@ impl PlayerSession {
         debug!(
             "Session {} do_chunk_requests: sent {} chunks (spawn_chunk_load_count={}/{} terrain_ready={} sent_chunks={} out={})",
             self.session_id,
-            to_send_len,
+            sent,
             self.spawn_chunk_load_count,
             self.spawn_threshold,
             self.terrain_ready,
@@ -2278,6 +2374,32 @@ impl PlayerSession {
         );
 
         out
+    }
+
+    /// Columns this session will need soon, nearest-first, for the generation
+    /// pipeline. Never mutates the session.
+    pub fn upcoming_chunk_columns(&self, limit: usize) -> Vec<(i32, i32)> {
+        let mut columns: Vec<(i32, i32)> = self
+            .chunk_load_queue
+            .iter()
+            .take(limit)
+            .copied()
+            .collect();
+        if columns.len() >= limit || !self.wants_chunk_streaming() {
+            return columns;
+        }
+        let allowed_radius = self.chunk_radius.clamp(2, self.max_view_distance.max(2));
+        let curr_cx = (self.position.x.floor() as i32) >> 4;
+        let curr_cz = (self.position.z.floor() as i32) >> 4;
+        for chunk in Self::select_chunks(allowed_radius, curr_cx, curr_cz) {
+            if columns.len() >= limit {
+                break;
+            }
+            if !self.sent_chunks.contains(&chunk) && !columns.contains(&chunk) {
+                columns.push(chunk);
+            }
+        }
+        columns
     }
 
     /// Handles serverbound `MovePlayerPacket` (0x13).
@@ -2562,7 +2684,8 @@ impl PlayerSession {
     /// item payloads in this packet. Reference order
     /// (`target/axolotl-pm` `InGamePacketHandler::handlePlayerAuthInput`):
     /// `handleUseItemTransaction` (the embedded interaction) runs FIRST,
-    /// then `itemStackRequest` (skipped), then `blockActions` LAST — so the
+    /// then `itemStackRequest` (the Q drop when no window is open), then
+    /// `blockActions` LAST — so the
     /// embedded `UseItem` CLICK_BLOCK is applied through
     /// [`Self::handle_use_item_place`] before the actions below run. The
     /// standalone `InventoryTransactionPacket` path still works for clients
@@ -2613,7 +2736,7 @@ impl PlayerSession {
     /// - `CREATIVE_PLAYER_DESTROY_BLOCK` is intentionally ignored here too:
     ///   PM notes the client sends `PREDICT_DESTROY_BLOCK` anyway.
     fn handle_block_actions(&mut self, input_data: &[u8]) {
-        let (actions, interaction) = parse_block_actions_result(input_data);
+        let (actions, interaction, request) = parse_block_actions_result(input_data);
 
         // Reference order: the embedded item interaction (the same
         // `UseItemTransactionData` the legacy packet carries) is handled
@@ -2621,6 +2744,19 @@ impl PlayerSession {
         // standalone-packet path, including the cancellable BlockPlaceEvent.
         if let Some(interaction) = interaction {
             self.handle_use_item_place(&interaction.transaction);
+        }
+
+        // `handlePlayerAuthInput` -> `handleItemStackRequest` for the embedded
+        // request: with no window open a modern client drops with Q through
+        // `PlayerAuthInput` (`PERFORM_ITEM_STACK_REQUEST`), not the standalone
+        // 0x93 packet, so it must run before the empty-actions return below.
+        if let Some(request) = request {
+            let out = self.handle_item_stack_request(
+                bedrock_protocol::packets::item_stack_request::ItemStackRequestPacket::with_requests(
+                    vec![request],
+                ),
+            );
+            self.pending_outgoing.extend(out);
         }
 
         if actions.is_empty() {
@@ -3026,6 +3162,10 @@ impl PlayerSession {
             return self.resync_inventory();
         }
 
+        for item in applied.dropped {
+            self.drop_item_entity(item);
+        }
+
         let mut out = Vec::new();
         for (window_id, slot) in &applied.changed {
             if let Some(item) = self.inventory.window_slot(*window_id, *slot) {
@@ -3059,8 +3199,120 @@ impl PlayerSession {
         if let TransactionData::UseItem(use_item) = &packet.data {
             self.handle_use_item_place(use_item);
         }
+        if let TransactionData::UseItemOnEntity(data) = &packet.data {
+            self.handle_use_item_on_entity(data);
+        }
+        if let TransactionData::ReleaseItem(data) = &packet.data {
+            // `ReleaseItemTransactionData` with a bow/throwable in hand: the
+            // server spawns the projectile (`Player::handleReleaseItem`).
+            self.handle_release_item(data);
+        }
+        // Legacy container actions may have touched the open block window.
+        self.persist_block_container();
 
         out
+    }
+
+    /// `InGamePacketHandler::handleUseItemOnEntityTransaction` with
+    /// `ACTION_ATTACK`: `Player::attack()` on the target actor
+    /// (`EntityDamageByEntityEvent` with the bare-hand damage). The resulting
+    /// hurt/death animation is queued by [`WorldState::damage_entity`].
+    fn handle_use_item_on_entity(
+        &mut self,
+        data: &bedrock_protocol::packets::inventory_transaction::UseItemOnEntityData,
+    ) {
+        if data.action_type
+            != bedrock_protocol::packets::inventory_transaction::ACTION_ATTACK
+        {
+            return;
+        }
+        if self.is_dead {
+            return;
+        }
+        // `Player::attack()`: the damage event chain runs before the hit, so a
+        // protection plugin that cancels (or changes `final_damage`) wins.
+        let Some(target) = self.world.entity_by_runtime(data.actor_runtime_id) else {
+            return;
+        };
+        let attacker = self.player_entity_json();
+        let Some(damage) = self.fire_damage_event(
+            crate::plugin_host::entity_json(&target),
+            CAUSE_ENTITY_ATTACK,
+            1.0,
+            Some(attacker),
+            None,
+        ) else {
+            return;
+        };
+        if damage <= 0.0 {
+            return;
+        }
+        let Some((_unique_id, outcome)) = self.world.damage_entity(data.actor_runtime_id, damage)
+        else {
+            return;
+        };
+        if outcome == crate::entity::DamageOutcome::Ignored {
+            return;
+        }
+        // `Living::knockBack()` away from the attacker.
+        if let Some(target) = self.world.entity_by_runtime(data.actor_runtime_id) {
+            let dx = target.position.x - self.position.x;
+            let dz = target.position.z - self.position.z;
+            self.world
+                .knock_back_entity(data.actor_runtime_id, dx, dz, 0.4);
+        }
+    }
+
+    /// `ReleaseItemTransactionData`: throwing a snowball/egg/pearl and firing
+    /// a bow. PocketMine gets the charge from `PlayerAuthInput`; this port uses
+    /// the full-charge speed so an arrow always flies the same distance.
+    fn handle_release_item(
+        &mut self,
+        data: &bedrock_protocol::packets::inventory_transaction::ReleaseItemData,
+    ) {
+        use crate::entity::ProjectileKind;
+        let network_id = data.item_in_hand.network_id;
+        let (kind, damage, speed) = if Some(network_id) == crate::inventory::item_network_id("minecraft:bow")
+        {
+            (ProjectileKind::Arrow, 2.0, 3.0)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:snowball") {
+            (ProjectileKind::Snowball, 0.0, 1.5)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:egg") {
+            (ProjectileKind::Egg, 0.0, 1.5)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:ender_pearl") {
+            (ProjectileKind::EnderPearl, 0.0, 1.5)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:experience_bottle") {
+            (ProjectileKind::ExperienceBottle, 0.0, 1.5)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:splash_potion") {
+            (ProjectileKind::SplashPotion, 0.0, 1.5)
+        } else if Some(network_id) == crate::inventory::item_network_id("minecraft:trident") {
+            (ProjectileKind::Trident, 8.0, 2.5)
+        } else {
+            return;
+        };
+        // `Entity::getDirectionVector()`: Bedrock yaw grows clockwise from +Z.
+        let yaw = self.yaw.to_radians();
+        let pitch = self.pitch.to_radians();
+        let direction = Vector3f::new(
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        );
+        let origin = Vector3f::new(self.position.x, self.position.y + 1.62, self.position.z);
+        let motion = Vector3f::new(
+            direction.x * speed,
+            direction.y * speed,
+            direction.z * speed,
+        );
+        self.world.spawn_projectile(
+            kind,
+            origin,
+            motion,
+            &self.username,
+            self.entity_runtime_id,
+            damage,
+            kind == ProjectileKind::Arrow,
+        );
     }
 
     /// Authoritative Bedrock block placement from a `UseItem` transaction.
@@ -3095,6 +3347,11 @@ impl PlayerSession {
         if self.handle_bucket_use(use_item) {
             return;
         }
+        // Bedrock `SpawnEgg` use: the item summons its mob on the clicked face
+        // and never places a block.
+        if self.handle_spawn_egg_use(use_item) {
+            return;
+        }
         let block_id = if use_item.item_in_hand.block_runtime_id != 0 {
             use_item.item_in_hand.block_runtime_id
         } else {
@@ -3103,17 +3360,11 @@ impl PlayerSession {
                 None => return,
             }
         };
-        let (bx, by, bz) = use_item.block_position;
-        let offset: (i32, i32, i32) = match use_item.face {
-            0 => (0, -1, 0),
-            1 => (0, 1, 0),
-            2 => (0, 0, -1),
-            3 => (0, 0, 1),
-            4 => (-1, 0, 0),
-            5 => (1, 0, 0),
-            _ => return,
+        let Some((ox, oy, oz)) = Self::face_offset(use_item.face) else {
+            return;
         };
-        let (x, y, z) = (bx + offset.0, by + offset.1, bz + offset.2);
+        let (bx, by, bz) = use_item.block_position;
+        let (x, y, z) = (bx + ox, by + oy, bz + oz);
         if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
             return;
         }
@@ -3139,7 +3390,7 @@ impl PlayerSession {
         // for a torch is the fixed `unknown` variant. The placed state depends
         // on the clicked face and the support around the target cell.
         let Some(block_id) =
-            physics::state_for_placement(block_id, use_item.face as i32, |dx, dy, dz| {
+            physics::state_for_placement_oriented(block_id, use_item.face as i32, self.yaw, |dx, dy, dz| {
                 self.world.block_at(x + dx, y + dy, z + dz)
             })
         else {
@@ -3154,6 +3405,54 @@ impl PlayerSession {
         }) {
             self.revert_predicted_placement(x, z);
             return;
+        }
+        // `Trapdoor::place()`: the upper half comes from the click height
+        // (`$clickVector->y > 0.5 && $face !== Facing::UP`), which the state
+        // resolver cannot see.
+        let mut block_id = block_id;
+        if bedrock_world::block_states::state_name(block_id).is_some_and(|name| {
+            name == "trapdoor" || name.ends_with("_trapdoor") || name.ends_with("_stairs")
+        }) {
+            let relative_y = use_item.click_position.1 - y as f32;
+            if relative_y > 0.5 && use_item.face != 1 {
+                block_id = bedrock_world::block_states::with_property(
+                    block_id,
+                    "upside_down_bit",
+                    "true",
+                )
+                .unwrap_or(block_id);
+            }
+        }
+        // `Door::place()`: a door is two cells sharing facing/hinge. The lower
+        // one needs a block underneath (`canBeSupportedAt`) and the upper cell
+        // must be replaceable (`!$blockUp->canBeReplaced()`).
+        let mut upper_half = None;
+        if bedrock_world::block_states::state_name(block_id)
+            .is_some_and(|name| name.ends_with("_door"))
+        {
+            let below_name = bedrock_world::block_states::state_name(self.world.block_at(x, y - 1, z))
+                .unwrap_or("air");
+            let above_name = bedrock_world::block_states::state_name(self.world.block_at(x, y + 1, z))
+                .unwrap_or("air");
+            if physics::is_replaceable(below_name)
+                || !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&(y + 1))
+                || !physics::is_replaceable(above_name)
+            {
+                self.revert_predicted_placement(x, z);
+                return;
+            }
+            let Some(hinged) = physics::orient_door(block_id, self.yaw, |dx, dy, dz| {
+                self.world.block_at(x + dx, y + dy, z + dz)
+            }) else {
+                self.revert_predicted_placement(x, z);
+                return;
+            };
+            block_id = hinged;
+            upper_half = bedrock_world::block_states::with_property(
+                block_id,
+                "upper_block_bit",
+                "true",
+            );
         }
 
         // Cancellable plugin hook when a listener exists. `fire_event` is a
@@ -3187,6 +3486,15 @@ impl PlayerSession {
             z,
             block_id,
         });
+        if let Some(upper_half) = upper_half {
+            self.pending_actions.push(PluginAction::SetBlock {
+                world: self.world.name.clone(),
+                x,
+                y: y + 1,
+                z,
+                block_id: upper_half,
+            });
+        }
         // PM `World::addSound(new BlockPlaceSound($placed))`: the client only
         // plays the block's place sound when the server broadcasts
         // `LevelSoundEventPacket(PLACE, blockId)`. Without it the block appeared
@@ -3212,6 +3520,50 @@ impl PlayerSession {
                 }
             }
         }
+    }
+
+    /// `SpawnEgg` use: summons the mob in the cell adjacent to the clicked
+    /// face, centred in the block and with the player's yaw. The inventory
+    /// action of the same transaction removes one egg in survival; this never
+    /// touches the inventory itself, so the egg cannot be consumed twice.
+    fn handle_spawn_egg_use(&mut self, use_item: &UseItemData) -> bool {
+        let Some(entity_type) =
+            crate::entity_types::spawn_egg_type(use_item.item_in_hand.network_id)
+        else {
+            return false;
+        };
+        let Some((ox, oy, oz)) = Self::face_offset(use_item.face) else {
+            return true;
+        };
+        let (bx, by, bz) = use_item.block_position;
+        let (x, y, z) = (bx + ox, by + oy, bz + oz);
+        if !(WORLD_MIN_Y..WORLD_MAX_Y).contains(&y) {
+            return true;
+        }
+        // BDS spawns the actor in the centre of the target cell with its feet
+        // on the cell floor.
+        self.world.spawn_mob_configured(
+            entity_type,
+            Vector3f::new(x as f32 + 0.5, y as f32, z as f32 + 0.5),
+            self.yaw,
+            0.0,
+            None,
+        );
+        true
+    }
+
+    /// Cell adjacent to `face` of a clicked block (0 down, 1 up, 2 north,
+    /// 3 south, 4 west, 5 east), shared by block placement and spawn eggs.
+    fn face_offset(face: u8) -> Option<(i32, i32, i32)> {
+        Some(match face {
+            0 => (0, -1, 0),
+            1 => (0, 1, 0),
+            2 => (0, 0, -1),
+            3 => (0, 0, 1),
+            4 => (-1, 0, 0),
+            5 => (1, 0, 0),
+            _ => return None,
+        })
     }
 
     /// PM `Bucket::onInteractBlock()` (fill) and
@@ -3358,14 +3710,17 @@ impl PlayerSession {
 
     /// PM `Block::onInteract()` for the blocks the reference gives one: buttons
     /// (`Button::onInteract`: press, then a scheduled update releases it),
-    /// levers (`Lever::onInteract`: toggle) and fence gates
-    /// (`FenceGate::onInteract`: open/close).
+    /// levers (`Lever::onInteract`: toggle), fence gates, doors and trapdoors
+    /// (`open_bit` plus the door sound) and the container blocks
+    /// (`CraftingTable`, `Anvil`, `Chest`, `BrewingStand`, `Dispenser`, ...:
+    /// open the matching window).
     ///
     /// Returns true when the click was consumed — either because the block
-    /// changed, because it was already in the requested state, or because the
-    /// client's prediction was refused. Sneaking only skips the interaction
-    /// when the hand holds an item (`PlayerInteractEvent::setUseBlock($item->isNull())`
-    /// in `World::useItemOn`), so a gate can still be opened empty-handed.
+    /// changed, because it was already in the requested state, because a
+    /// container window opened, or because the client's prediction was refused.
+    /// Sneaking only skips the interaction when the hand holds an item
+    /// (`PlayerInteractEvent::setUseBlock($item->isNull())` in
+    /// `World::useItemOn`), so a door can still be opened empty-handed.
     fn handle_block_interact(&mut self, use_item: &UseItemData) -> bool {
         let (x, y, z) = use_item.block_position;
         let current = self.world.block_at(x, y, z);
@@ -3403,6 +3758,12 @@ impl PlayerSession {
         let Some(interaction) = self.world.interact_block(x, y, z) else {
             return false;
         };
+        // `CraftingTable::onInteract`, `Anvil::onInteract`, `Chest::onInteract`:
+        // the block opens a container window instead of changing state.
+        if let Some(kind) = interaction.open_container {
+            self.open_block_container(kind, (x, y, z));
+            return true;
+        }
         if interaction.new_state == current {
             // Already pressed/activated: PM's `Button::onInteract` still
             // returns true, so the click never reaches the item.
@@ -3434,6 +3795,121 @@ impl PlayerSession {
             });
         }
         true
+    }
+
+    /// Opens the window a clicked block owns (`Player::setCurrentWindow`).
+    ///
+    /// Crafting tables and anvils use the inventories modelled for them
+    /// (`crafting_table`, `anvil_inventory`); chests, barrels, shulkers,
+    /// dispensers, droppers, hoppers, brewing stands and the furnace family
+    /// load their slots from the world into a [`BlockContainer`], whose window
+    /// id then resolves through [`crate::inventory::PlayerInventory::window`]
+    /// so `ItemStackRequest` can move items in and out. The remaining kinds
+    /// (enchanting table, grindstone, loom, ...) only consume the click.
+    fn open_block_container(
+        &mut self,
+        kind: bedrock_world::block_states::ContainerKind,
+        position: (i32, i32, i32),
+    ) {
+        use bedrock_world::block_states::ContainerKind;
+        use crate::block_container::BlockContainer;
+
+        // `Player::removeCurrentWindow()`: switching screens returns the
+        // previous container's inputs to the main inventory (crafting table,
+        // anvil) or leaves them in the block (chests and the like).
+        let mut out = Vec::new();
+        if self.open_container.is_some() {
+            self.close_container_window();
+            out.extend(self.resync_inventory());
+        }
+
+        if kind == ContainerKind::CraftingTable {
+            out.extend(self.open_crafting_table(position));
+            self.pending_outgoing.extend(out);
+            return;
+        }
+        if kind == ContainerKind::Anvil {
+            out.extend(self.open_anvil(position));
+            self.pending_outgoing.extend(out);
+            return;
+        }
+
+        let Some(slot_count) = BlockContainer::slot_count(kind) else {
+            debug!(
+                "Session {}: {} at {:?} has no modelled inventory yet",
+                self.session_id,
+                kind.name(),
+                position
+            );
+            self.pending_outgoing.extend(out);
+            return;
+        };
+        let slots = self.world.container_slots(position, slot_count);
+        let Some(container) = BlockContainer::open(kind, position, slots) else {
+            self.pending_outgoing.extend(out);
+            return;
+        };
+        out.push(OutgoingPacket::RawWire(crate::packets_wire::container_open_wire(
+            container.window_id,
+            container.container_type,
+            position,
+            crate::packets_wire::BLOCK_CONTAINER_ACTOR_ID,
+        )));
+        // `InventoryManager::syncContents`: the window contents follow the
+        // open packet, addressed with the same window id the client will use
+        // for its `ItemStackRequest` slots.
+        out.push(OutgoingPacket::RawWire(crate::packets_wire::inventory_content_wire(
+            container.window_id as u32,
+            &container.slots,
+        )));
+        self.open_container = Some(OpenContainer {
+            window_id: container.window_id,
+            container_type: container.container_type,
+            position,
+            kind: kind.name().to_string(),
+        });
+        self.inventory.set_block_container(container);
+        self.pending_outgoing.extend(out);
+    }
+
+    /// `Player::removeCurrentWindow()`: forgets the open window without sending
+    /// a close packet (the caller is switching screens).
+    ///
+    /// A block container keeps its slots in the world; the crafting table and
+    /// anvil grids return their inputs to the main inventory (their result
+    /// slot is a preview and is not dropped).
+    fn close_container_window(&mut self) {
+        let Some(previous) = self.open_container.take() else {
+            return;
+        };
+        if let Some(block) = self.inventory.take_block_container() {
+            self.world.set_container_slots(block.position, block.slots);
+        }
+        let drops = match previous.kind.as_str() {
+            "crafting_table" => self.crafting_table.close_drops(),
+            "anvil" => self.anvil_inventory.close_drops(),
+            _ => Vec::new(),
+        };
+        for drop in drops {
+            let leftover = self.inventory.add_item(&drop);
+            debug!(
+                "Session {}: {} items of the closed {} container did not fit",
+                self.session_id, leftover, previous.kind
+            );
+        }
+    }
+
+    /// Stores the open container's slots back into the block.
+    ///
+    /// `Chest::onClose` keeps the contents in the container, and a dispenser
+    /// must fire what its own window shows, so every slot change is persisted
+    /// immediately instead of waiting for the window to close.
+    fn persist_block_container(&self) {
+        let Some(container) = self.inventory.block_container() else {
+            return;
+        };
+        self.world
+            .set_container_slots(container.position, container.slots.clone());
     }
 
     /// Undoes the block this client has already predicted (a refused placement):
@@ -3495,14 +3971,28 @@ impl PlayerSession {
         })
     }
 
-/// Resolves a Bedrock block runtime id from a numeric item network id.
+/// Resolves the block a held item places, from its numeric item id.
+///
+/// The client normally sends the block's runtime id in
+/// `ItemStack::block_runtime_id`; this is the fallback for the stacks that only
+/// carry the item id (BDS sends `blockRuntimeId = 0` for several items,
+/// redstone dust among them). The item registry answers by name, so redstone
+/// dust no longer turns into stone; items that are not blocks answer `None` and
+/// the placement is refused instead of substituting a wrong block.
 pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
+    if let Some(name) = crate::inventory::item_canonical_name(network_id) {
+        if let Some(id) = Self::block_state_for_item(name) {
+            return Some(id);
+        }
+    }
+    // Legacy numeric ids the registry does not know, kept from the original
+    // small table (`4` is cobblestone, whose block id is not in `block_id`).
     use bedrock_world::block_id::*;
     match network_id {
         1 => Some(STONE),
         2 => Some(GRASS_BLOCK),
         3 => Some(DIRT),
-        4 => Some(STONE), // Cobblestone fallback
+        4 => Some(STONE),
         7 => Some(BEDROCK),
         12 => Some(SAND),
         13 => Some(GRAVEL),
@@ -3515,9 +4005,24 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
         56 => Some(DIAMOND_ORE),
         73 => Some(REDSTONE_ORE),
         129 => Some(EMERALD_ORE),
-        id if id > 0 => Some(STONE),
         _ => None,
     }
+}
+
+/// Item identifier -> the block it places.
+///
+/// Three items are named differently from the block they place: redstone dust
+/// (`redstone` -> `redstone_wire`), repeaters and comparators (whose unpowered
+/// block is `unpowered_*`). Everything else shares the name.
+fn block_state_for_item(name: &str) -> Option<u32> {
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    let block = match bare {
+        "redstone" => "redstone_wire",
+        "repeater" => "unpowered_repeater",
+        "comparator" => "unpowered_comparator",
+        other => other,
+    };
+    bedrock_world::block_states::network_id(block)
 }
 
     /// Sends every modelled window so client and server agree again.
@@ -3541,6 +4046,13 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
             }
             .encode_payload(&mut writer);
             out.push(OutgoingPacket::RawWire(writer.into_bytes().to_vec()));
+        }
+        // The open block container is a window like any other: resend it too.
+        if let Some(container) = self.inventory.block_container() {
+            out.push(OutgoingPacket::RawWire(crate::packets_wire::inventory_content_wire(
+                container.window_id as u32,
+                &container.slots,
+            )));
         }
         out
     }
@@ -3605,6 +4117,11 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
             }
             return Vec::new();
         };
+        // `Chest::onClose` / `Dispenser::onClose`: the contents stay in the
+        // block, so the next opener (or the dispenser itself) finds them.
+        if let Some(block) = self.inventory.take_block_container() {
+            self.world.set_container_slots(block.position, block.slots);
+        }
         let drops = match container.kind.as_str() {
             "crafting_table" => self.crafting_table.close_drops(),
             "anvil" => self.anvil_inventory.close_drops(),
@@ -3644,6 +4161,10 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
         if packet.action != bedrock_protocol::packets::interact::ACTION_OPEN_INVENTORY {
             return Vec::new();
         }
+        // The inventory button closes whatever block window is open
+        // (`Player::removeCurrentWindow()`); its contents are persisted by the
+        // helper.
+        self.close_container_window();
         let mut out = vec![OutgoingPacket::RawWire(crate::packets_wire::container_open_wire(
             WINDOW_ID_INVENTORY as u8,
             crate::packets_wire::CONTAINER_TYPE_INVENTORY,
@@ -3682,18 +4203,27 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
             // Tell the client the final state of every slot we touched (the
             // request names slots with container UI ids, not window ids).
             for (slot, item) in &outcome.changed {
-                let Some((window, index)) =
-                    crate::crafting::ui_container_window(slot.container, slot.slot)
-                else {
+                let Some((window, index)) = crate::crafting::ui_container_window(
+                    slot.container,
+                    slot.slot,
+                    self.inventory.block_container_window(),
+                ) else {
                     continue;
                 };
                 out.push(OutgoingPacket::RawWire(inventory_slot_wire(window, index, item)));
             }
-            // Dropped items (Q key) become entities for plugin visibility; the
-            // packet contract only requires the inventory delta here.
-            let _ = outcome.dropped;
+            // `Player::dropItem()`: the Q key throws the stack out through the
+            // eye along the look direction, so the block leaves the inventory
+            // as a real `ItemEntity` (visible and pickable on both editions)
+            // instead of vanishing.
+            for item in outcome.dropped {
+                self.drop_item_entity(item);
+            }
         }
-        // Held-item changes must reach viewers.
+        // A container window edit is stored in the block right away (see
+        // `persist_block_container`), then the held-item change reaches
+        // viewers.
+        self.persist_block_container();
         out.push(OutgoingPacket::RawWire(self.mob_equipment_wire()));
         out
     }
@@ -4071,7 +4601,7 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
 
         let damage = physics::calculate_fall_damage(distance, self.is_flying, 0);
         if damage > 0.0 {
-            self.damage_player(damage);
+            self.damage_player_caused(damage, CAUSE_FALL, None);
         }
 
         // `Living::onHitGround()`: `EntityLongFallSound` for damage > 4,
@@ -4111,7 +4641,27 @@ pub fn resolve_block_id_from_item(network_id: i16) -> Option<u32> {
     /// reuses [`PlayerSession::kill_player`] so `PlayerDeathEvent` and the
     /// respawn flow stay in one place.
     pub fn damage_player(&mut self, damage: f32) {
+        self.damage_player_caused(damage, CAUSE_CUSTOM, None);
+    }
+
+    /// `Living::attack(new EntityDamageEvent($this, $cause, $damage))` for the
+    /// player: fires the damage chain first, so `EntityDamageEvent` listeners
+    /// see fall/void/explosion damage, and applies what the plugins left.
+    pub fn damage_player_caused(
+        &mut self,
+        damage: f32,
+        cause: i32,
+        damager: Option<serde_json::Value>,
+    ) {
         if damage <= 0.0 || self.is_dead || self.gamemode == 1 || self.gamemode == 3 {
+            return;
+        }
+        let Some(damage) =
+            self.fire_damage_event(self.player_entity_json(), cause, damage, damager, None)
+        else {
+            return;
+        };
+        if damage <= 0.0 {
             return;
         }
         self.health = (self.health - damage).clamp(0.0, self.max_health);
@@ -4716,8 +5266,16 @@ pub struct SessionManager {
     next_session_id: AtomicU64,
     generator: Arc<dyn WorldGenerator>,
     world: Arc<WorldState>,
+    /// Background generation queue: the tick only requests columns and streams
+    /// what this pipeline already produced (see `chunk_pipeline`).
+    chunk_pipeline: Arc<crate::chunk_pipeline::ChunkPipeline>,
     registry: Arc<PlayerRegistry>,
-    plugins: RwLock<Option<Arc<PluginManager>>>,
+    /// Plugin runtime. Shared (`Arc`) with [`SessionBlockEvents`] so the world
+    /// tick can dispatch block events through the same slot.
+    plugins: Arc<RwLock<Option<Arc<PluginManager>>>>,
+    /// Chunks already announced through `ChunkLoadEvent` (PM fires it once per
+    /// chunk load, not per viewer).
+    loaded_chunks: Mutex<HashSet<(i32, i32)>>,
     ops: Arc<RwLock<HashSet<String>>>,
     default_gamemode: std::sync::atomic::AtomicI32,
     default_view_distance: i32,
@@ -4752,6 +5310,10 @@ pub struct SessionManager {
     /// Global/default scoreboard applied to players without a personal
     /// copy (persisted in `scoreboard.json`).
     global_scoreboard: RwLock<Option<Scoreboard>>,
+    /// Players whose scoreboards were set via administrative commands
+    /// (`/scoreboard`) and must be saved to `scoreboard.json`. Transient
+    /// plugin scoreboards are excluded.
+    persisted_players: RwLock<HashSet<String>>,
     /// Last scoreboard state framed for each Java client, so
     /// `take_scoreboard_java_frames` only emits the diff. Keyed by
     /// (lowercase name, wire protocol): a 340 client and a 775 client
@@ -4766,13 +5328,63 @@ pub struct SessionManager {
     /// which sessions already received the spawn packet and the last
     /// position sent, so `sync_entities_locked` only emits the diff.
     entity_views: RwLock<HashMap<i64, EntityView>>,
+    /// Active `/tpsbar` bars: lowercase player name -> boss bar actor id.
+    /// Purpur keeps one bar per player (`BossBarTask::$bossbars`); the toggle
+    /// state lives here because the command layer is pure.
+    tps_bars: RwLock<HashMap<String, i64>>,
 }
 
-/// `Entity::$viewers` plus the last broadcast position.
+/// `/tpsbar` boss-bar overlay: Purpur's `NOTCHED_20`.
+const TPS_BAR_OVERLAY: u8 = BossBarOverlay::Twenty as u8;
+
+/// Purpur's `text-color` bands: green, yellow, red.
+fn tps_bar_text_color(good: bool, medium: bool) -> &'static str {
+    if good {
+        "§a"
+    } else if medium {
+        "§e"
+    } else {
+        "§c"
+    }
+}
+
+/// Purpur's default `settings.command.tpsbar.title`:
+/// `TPS: <tps> MSPT: <mspt> Ping: <ping>ms`, each value coloured by its own
+/// thresholds (TPS good >= 19 / medium >= 15, MSPT good < 40 / medium < 50,
+/// ping good < 100 / medium < 200).
+fn tps_bar_title(tps: f64, mspt: f64, ping: u32) -> String {
+    format!(
+        "§7TPS§e: {}{:.2}§r §7MSPT§e: {}{:.2}§r §7Ping§e: {}{}ms§r",
+        tps_bar_text_color(tps >= 19.0, tps >= 15.0),
+        tps,
+        tps_bar_text_color(mspt < 40.0, mspt < 50.0),
+        mspt,
+        tps_bar_text_color(ping < 100, ping < 200),
+        ping
+    )
+}
+
+/// Bar colour for `fill-mode: MSPT` (`progress-color`): green below 40 ms,
+/// yellow below the 50 ms tick budget, red past it.
+fn tps_bar_bar_color(mspt: f64) -> u8 {
+    if mspt < 40.0 {
+        BossBarColor::Green as u8
+    } else if mspt < 50.0 {
+        BossBarColor::Yellow as u8
+    } else {
+        BossBarColor::Red as u8
+    }
+}
+
+/// `Entity::$viewers` plus the last broadcast position and rotation.
 #[derive(Debug, Clone, Default)]
 struct EntityView {
     viewers: HashSet<u64>,
     sent: Option<Vector3f>,
+    /// Last `(pitch, yaw, head_yaw)` sent: a mob that turns on the spot
+    /// (blocked against a wall) or only moves its head must still rotate for
+    /// its viewers.
+    sent_rotation: Option<(f32, f32, f32)>,
 }
 
 impl Default for SessionManager {
@@ -4800,13 +5412,16 @@ impl SessionManager {
         default_view_distance: i32,
     ) -> Self {
         let world = Arc::new(WorldState::new("world", Arc::clone(&generator)));
+        let chunk_pipeline = crate::chunk_pipeline::ChunkPipeline::new(Arc::clone(&world));
         Self {
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             generator,
             world,
+            chunk_pipeline,
             registry: Arc::new(PlayerRegistry::new()),
-            plugins: RwLock::new(None),
+            plugins: Arc::new(RwLock::new(None)),
+            loaded_chunks: Mutex::new(HashSet::new()),
             ops: Arc::new(RwLock::new(HashSet::new())),
             default_gamemode: std::sync::atomic::AtomicI32::new(default_gamemode),
             default_view_distance,
@@ -4828,15 +5443,26 @@ impl SessionManager {
             last_time_broadcast: std::sync::atomic::AtomicI32::new(-1),
             scoreboards: RwLock::new(HashMap::new()),
             global_scoreboard: RwLock::new(None),
+            persisted_players: RwLock::new(HashSet::new()),
             java_scoreboard_sent: RwLock::new(HashMap::new()),
             bossbars: BossBarManager::new(),
+            tps_bars: RwLock::new(HashMap::new()),
             entity_views: RwLock::new(HashMap::new()),
         }
     }
 
     /// Installs the plugin runtime used for events, commands and the tick loop.
+    ///
+    /// Also installs the world's block-event hook: `BlockSpreadEvent` and
+    /// `BlockFormEvent` are fired from inside the world tick (fluid and
+    /// random-tick passes), which has no plugin manager of its own.
     pub fn set_plugin_manager(&self, plugins: Arc<PluginManager>) {
         *self.plugins.write() = Some(plugins);
+        self.world
+            .set_block_event_hook(Some(Arc::new(SessionBlockEvents {
+                plugins: Arc::clone(&self.plugins),
+                world_name: self.world.name.clone(),
+            })));
     }
 
     /// Enables or disables administrative commands for non-operators
@@ -4871,13 +5497,17 @@ impl SessionManager {
         self.plugins.read().clone()
     }
 
-    /// `Player::setScoreboard()`: stores the player's scoreboard and
-    /// queues the Bedrock diff (removed objectives + full new state)
-    /// when a live Bedrock session exists. Virtual (Java) players have
-    /// no Bedrock session; the Java bridge polls the same store through
-    /// the `take_scoreboard` hook.
-    pub fn set_scoreboard(&self, name: &str, scoreboard: Option<Scoreboard>) {
+    fn set_scoreboard_internal(&self, name: &str, scoreboard: Option<Scoreboard>, persist: bool) {
         let key = name.to_lowercase();
+        if persist {
+            if scoreboard.as_ref().map_or(true, |b| b.is_empty()) {
+                self.persisted_players.write().remove(&key);
+            } else {
+                self.persisted_players.write().insert(key.clone());
+            }
+        } else {
+            self.persisted_players.write().remove(&key);
+        }
         match &scoreboard {
             Some(board) => {
                 self.scoreboards.write().insert(key.clone(), board.clone());
@@ -4902,6 +5532,37 @@ impl SessionManager {
                 session.scoreboard = scoreboard;
             }
         }
+    }
+
+    /// `Player::setScoreboard()`: stores the player's scoreboard and
+    /// queues the Bedrock diff (removed objectives + full new state)
+    /// when a live Bedrock session exists. Virtual (Java) players have
+    /// no Bedrock session; the Java bridge polls the same store through
+    /// the `take_scoreboard` hook. Persists across restarts in `scoreboard.json`.
+    pub fn set_scoreboard(&self, name: &str, scoreboard: Option<Scoreboard>) {
+        self.set_scoreboard_internal(name, scoreboard, true);
+    }
+
+    /// Sets a runtime plugin scoreboard. Plugin scoreboards are transient:
+    /// they are kept in memory while the player is connected and will not
+    /// be saved to `scoreboard.json`.
+    pub fn set_plugin_scoreboard(&self, name: &str, scoreboard: Option<Scoreboard>) {
+        self.set_scoreboard_internal(name, scoreboard, false);
+    }
+
+    /// Whether this player's scoreboard was explicitly set via administrative
+    /// commands (`/scoreboard`) and should be persisted to disk.
+    pub fn is_scoreboard_persisted(&self, name: &str) -> bool {
+        self.persisted_players.write().contains(&name.to_lowercase())
+    }
+
+    /// Cleans up transient (plugin) scoreboards and diff caches on player leave.
+    pub fn cleanup_transient_scoreboard(&self, name: &str) {
+        let key = name.to_lowercase();
+        if !self.persisted_players.read().contains(&key) {
+            self.scoreboards.write().remove(&key);
+        }
+        self.clear_java_scoreboard_sent(name);
     }
 
     /// The player's effective scoreboard: personal copy first, then the
@@ -4999,6 +5660,9 @@ impl SessionManager {
         else {
             return;
         };
+        if personal.is_empty() && session.scoreboard.as_ref().map_or(true, |b| b.is_empty()) {
+            return;
+        }
         if session.scoreboard.as_ref() == Some(&personal) {
             return;
         }
@@ -5230,6 +5894,93 @@ impl SessionManager {
             .write()
             .insert(key, current);
         frames
+    }
+
+    // -- `/tpsbar` (Purpur TPSBar) ---------------------------------------
+
+    /// Toggles the Purpur-style TPS bar for `target` and tells `notify` the
+    /// resulting state (`Tpsbar toggled on/off for <target>`).
+    fn toggle_tps_bar(&self, target: &str, notify: &str) {
+        let key = crate::bossbar::viewer_key(target);
+        if let Some(boss_id) = self.tps_bars.write().remove(&key) {
+            self.bossbars.remove(boss_id);
+            self.tps_bar_feedback(notify, false, target);
+            return;
+        }
+
+        let boss_id = self.bossbars.create();
+        self.bossbars.with_bar(boss_id, |bar| {
+            bar.set_style(tps_bar_bar_color(0.0), TPS_BAR_OVERLAY);
+            bar.add_player(target);
+        });
+        self.tps_bars.write().insert(key, boss_id);
+        // Fill the bar before the first `show`, so the client opens it with
+        // this second's numbers instead of an empty title.
+        self.refresh_tps_bar(boss_id, target);
+        if let Some(packet) = self.bossbars.get(boss_id).map(|bar| bar.show_packet()) {
+            self.bossbar_queue(target, packet);
+        }
+        self.tps_bar_feedback(notify, true, target);
+    }
+
+    /// `Tpsbar toggled <onoff> for <target>` to the sender and the console.
+    fn tps_bar_feedback(&self, notify: &str, enabled: bool, target: &str) {
+        let onoff = if enabled { "§aon" } else { "§coff" };
+        let message = format!("§aTpsbar toggled {onoff}§a for §f{target}");
+        self.queue_packet(notify, OutgoingPacket::Text(TextPacket::raw(&message)));
+        crate::logging::console_message(&message);
+    }
+
+    /// Refreshes one bar: title (TPS/MSPT/ping), colour and fill. The fill is
+    /// MSPT as a fraction of the 50 ms budget — Purpur's default
+    /// `fill-mode: MSPT` — so a healthy tick leaves the bar nearly empty.
+    fn refresh_tps_bar(&self, boss_id: i64, target: &str) {
+        let now = std::time::Instant::now();
+        let tps = self.metrics.tps(60, now);
+        let mspt = self.metrics.average_tick_time();
+        let ping = self.player_ping(target);
+        let title = tps_bar_title(tps, mspt, ping);
+        let percentage = (mspt / 50.0).clamp(0.0, 1.0) as f32;
+        let color = tps_bar_bar_color(mspt);
+        if let Some((title_packet, health_packet, properties_packet)) =
+            self.bossbars.with_bar(boss_id, |bar| {
+                bar.set_title(title);
+                bar.set_percentage(percentage);
+                bar.set_style(color, TPS_BAR_OVERLAY);
+                (
+                    bar.title_packet(),
+                    bar.health_packet(),
+                    bar.properties_packet(),
+                )
+            })
+        {
+            for packet in [title_packet, health_packet, properties_packet] {
+                self.bossbar_queue(target, packet);
+            }
+        }
+    }
+
+    /// One-second refresh of every active `/tpsbar` bar.
+    fn update_tps_bars(&self) {
+        if self.tps_bars.read().is_empty() {
+            return;
+        }
+        let bars: Vec<(String, i64)> = self
+            .tps_bars
+            .read()
+            .iter()
+            .map(|(name, boss_id)| (name.clone(), *boss_id))
+            .collect();
+        for (name, boss_id) in bars {
+            self.refresh_tps_bar(boss_id, &name);
+        }
+    }
+
+    /// `Player::getPing()`: the Java bridge tracks RTT in the player registry;
+    /// Bedrock sessions do not measure it yet, so they report 0 like a client
+    /// that has not answered a keep-alive.
+    fn player_ping(&self, name: &str) -> u32 {
+        self.registry.get(name).map(|player| player.ping).unwrap_or(0)
     }
 
     // -- Boss bars (apiBossBar `BossBar` / `DiverseBossBar`) -------------
@@ -6181,9 +6932,16 @@ impl SessionManager {
         let Some(dir) = self.data_dir.read().clone() else {
             return Ok(());
         };
+        let persisted_names = self.persisted_players.read();
+        let all_scoreboards = self.scoreboards.read();
+        let persisted_players: HashMap<String, Scoreboard> = all_scoreboards
+            .iter()
+            .filter(|(name, board)| persisted_names.contains(*name) && !board.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let file = crate::scoreboard::ScoreboardFile::new(
             self.global_scoreboard.read().clone(),
-            self.scoreboards.read().clone(),
+            persisted_players,
         );
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
@@ -6207,6 +6965,11 @@ impl SessionManager {
             return 0;
         };
         let count = file.players.len();
+        let mut persisted = self.persisted_players.write();
+        persisted.clear();
+        for key in file.players.keys() {
+            persisted.insert(key.clone());
+        }
         *self.global_scoreboard.write() = file.global;
         *self.scoreboards.write() = file.players;
         count
@@ -6317,6 +7080,15 @@ impl SessionManager {
             // name must survive a Bedrock disconnect.
             registry.remove_if_bedrock(&session.username);
         }
+        // Purpur persists the toggle in player data; this port keeps it for
+        // the session only, so the bar goes away with the player.
+        if let Some(boss_id) = self
+            .tps_bars
+            .write()
+            .remove(&crate::bossbar::viewer_key(&session.username))
+        {
+            self.bossbars.remove(boss_id);
+        }
 
         if !session.joined && !session.spawned {
             session.joined = false;
@@ -6349,6 +7121,7 @@ impl SessionManager {
         // apiBossBar: the quitter unsubscribes from every bar it
         // watched so stale bars never linger on rejoin.
         self.bossbar_remove_viewer(&session.username);
+        self.cleanup_transient_scoreboard(&session.username);
 
         let mut event = PlayerQuitEvent::new(
             session.player_context(),
@@ -7174,6 +7947,22 @@ impl SessionManager {
         if let Some(session) = map.get_mut(&session_id) {
             out.append(&mut session.pending_outgoing);
         }
+        let form_responses: Vec<(String, u32, Option<String>)> = map
+            .get_mut(&session_id)
+            .map(|session| {
+                session
+                    .pending_form_responses
+                    .drain(..)
+                    .map(|(form_id, data)| (session.username.clone(), form_id, data))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The form callback is a PHP round trip: the session lock must be
+        // released first (the handler can emit actions for any player).
+        drop(map);
+        if !form_responses.is_empty() {
+            out.extend(self.apply_form_responses(form_responses));
+        }
         Ok(out)
     }
 
@@ -7344,6 +8133,7 @@ impl SessionManager {
     /// Dispatches a raw Bedrock network message received over NetherNet WebRtc DataChannels
     pub fn dispatch_webrtc_packet(&self, peer: SocketAddr, raw: &[u8]) -> Vec<bytes::Bytes> {
         let started = std::time::Instant::now();
+        let _dispatch_scope = crate::profiler::scope("net.dispatch");
         let out = self.dispatch_webrtc_packet_inner(peer, raw);
         self.lag.dispatch.record(started.elapsed());
         out
@@ -7597,6 +8387,50 @@ impl SessionManager {
     ///
     /// `depth` prevents unbounded recursion when a plugin dispatches a command
     /// that itself emits actions.
+    /// `Player::sendForm()` responses: hands each one to the PHP runtime,
+    /// which calls `Form::handleResponse($player, $data)` and returns the
+    /// actions it emitted, then applies those actions and returns the packets
+    /// they queued for the responding player.
+    fn apply_form_responses(
+        &self,
+        responses: Vec<(String, u32, Option<String>)>,
+    ) -> Vec<OutgoingPacket> {
+        let Some(plugins) = self.plugins.read().clone() else {
+            return Vec::new();
+        };
+        let mut emitted = Vec::new();
+        let mut answered_by = None;
+        for (player, form_id, data) in responses {
+            answered_by = Some(player.clone());
+            match plugins.dispatch_form_response_sync(&player, form_id, data) {
+                Ok(mut actions) => emitted.append(&mut actions),
+                Err(error) => {
+                    warn!(
+                        "Form {} response from '{}' failed: {}",
+                        form_id, player, error
+                    );
+                }
+            }
+        }
+        if emitted.is_empty() {
+            return Vec::new();
+        }
+        self.apply_actions(&emitted, 0);
+        // Actions queue packets on their target sessions; hand the answering
+        // player theirs so they leave in this same dispatch.
+        let Some(name) = answered_by else {
+            return Vec::new();
+        };
+        let Some(id) = self.session_id_for(&name) else {
+            return Vec::new();
+        };
+        self.sessions
+            .write()
+            .get_mut(&id)
+            .map(|session| std::mem::take(&mut session.pending_outgoing))
+            .unwrap_or_default()
+    }
+
     pub fn apply_actions(&self, actions: &[PluginAction], depth: usize) -> Vec<PluginAction> {
         if depth > 4 {
             warn!("Plugin action recursion limit reached");
@@ -7643,6 +8477,19 @@ impl SessionManager {
                     self.queue_targeted(
                         target_player,
                         OutgoingPacket::Text(TextPacket::raw(message.clone())),
+                    );
+                }
+                PluginAction::SendForm {
+                    target_player,
+                    form_id,
+                    data,
+                } => {
+                    self.queue_targeted(
+                        target_player,
+                        OutgoingPacket::ModalFormRequest(ModalFormRequestPacket::new(
+                            *form_id,
+                            data.clone(),
+                        )),
                     );
                 }
                 PluginAction::BroadcastMessage { message } => {
@@ -7991,12 +8838,12 @@ impl SessionManager {
                     scoreboard,
                 } => {
                     let board = Scoreboard::from_data(scoreboard);
-                    self.set_scoreboard(target_player, Some(board));
+                    self.set_plugin_scoreboard(target_player, Some(board));
                 }
                 PluginAction::RemoveScoreboard { target_player } => {
                     // An explicit empty board masks the global default:
                     // removing must not resurrect it on the next poll.
-                    self.set_scoreboard(target_player, Some(Scoreboard::default()));
+                    self.set_plugin_scoreboard(target_player, Some(Scoreboard::default()));
                 }
                 // apiBossBar: PHP owns the full `BossBar`/
                 // `DiverseBossBar` object; Rust diffs it against the
@@ -8185,6 +9032,7 @@ impl SessionManager {
                     );
                 }
                 CommandAction::Broadcast { message } => self.broadcast_text(message),
+                CommandAction::TpsBar { target, notify } => self.toggle_tps_bar(target, notify),
                 CommandAction::Message { target, message } => self.queue_packet(
                     target,
                     OutgoingPacket::Text(TextPacket::raw(message.clone())),
@@ -8260,6 +9108,22 @@ impl SessionManager {
                             *duration_ticks,
                         )));
                     }
+                }
+                CommandAction::Summon {
+                    entity,
+                    position,
+                    yaw,
+                    pitch,
+                    name_tag,
+                } => {
+                    // `/summon`: `World::addEntity()` of the requested type.
+                    self.world.spawn_mob_configured(
+                        entity,
+                        Vector3f::new(position.0, position.1, position.2),
+                        *yaw,
+                        *pitch,
+                        Some(name_tag.as_str()),
+                    );
                 }
                 CommandAction::SetWorldSpawn { x, y, z } => {
                     self.world.set_spawn(*x, *y, *z);
@@ -8815,6 +9679,20 @@ impl SessionManager {
     /// so both platforms share this single clock and stay synced:
     /// `/time set 6000` on Bedrock reaches Java within one Java tick
     /// (jump detection there) and vice versa.
+    /// Hands the world the feet positions of every joined player so pressure
+    /// plates can see who is standing on them (`World::$players` in the
+    /// reference; a plate rechecks its own bounding box against them).
+    fn publish_player_positions(&self) {
+        let positions: Vec<(f32, f32, f32)> = {
+            let map = self.sessions.read();
+            map.values()
+                .filter(|session| session.joined)
+                .map(|session| (session.position.x, session.position.y, session.position.z))
+                .collect()
+        };
+        self.world.set_player_positions(positions);
+    }
+
     pub fn tick_world_time(&self) -> i32 {
         let time = self.world.tick();
         let elapsed = self
@@ -8829,6 +9707,42 @@ impl SessionManager {
             self.broadcast_time(time);
         }
         time
+    }
+
+    /// Random-tick pass over the simulation area of every in-game player
+    /// (`World::actuallyDoTick()` -> `LevelChunk::randomTick()`).
+    ///
+    /// Bedrock's `simulation-distance` ([`crate::random_tick::SIMULATION_DISTANCE`]
+    /// chunks) bounds the ticking set; columns nobody streamed are skipped by
+    /// [`WorldState::random_tick`], so this never generates a column on the
+    /// tick path and a server with no players ticks nothing. Returns how many
+    /// blocks reacted.
+    fn tick_random_blocks(&self) -> usize {
+        let radius = crate::random_tick::SIMULATION_DISTANCE;
+        let mut chunks: Vec<(i32, i32)> = Vec::new();
+        let mut seen: HashSet<(i32, i32)> = HashSet::new();
+        {
+            let sessions = self.sessions.read();
+            for session in sessions.values() {
+                if session.state != SessionState::InGame || !session.terrain_ready {
+                    continue;
+                }
+                let center_x = (session.position.x / 16.0).floor() as i32;
+                let center_z = (session.position.z / 16.0).floor() as i32;
+                for dx in -radius..=radius {
+                    for dz in -radius..=radius {
+                        let chunk = (center_x + dx, center_z + dz);
+                        if seen.insert(chunk) {
+                            chunks.push(chunk);
+                        }
+                    }
+                }
+            }
+        }
+        if chunks.is_empty() {
+            return 0;
+        }
+        self.world.random_tick(&chunks)
     }
 
     /// Current central tick number (0 before the first [`SessionManager::tick`]).
@@ -8895,25 +9809,59 @@ impl SessionManager {
         y: i32,
         z: i32,
     ) -> usize {
-        let chunk = (x >> 4, z >> 4);
+        // PM plays the core's block sounds at the block centre.
+        self.broadcast_sound_at(
+            sound,
+            extra_data,
+            x as f32 + 0.5,
+            y as f32 + 0.5,
+            z as f32 + 0.5,
+        )
+    }
+
+    /// `World::addSound()` at the exact `Vector3` a plugin passed
+    /// (`LevelSoundEventPacket` at `x`/`y`/`z`, no block-centre offset).
+    pub(crate) fn broadcast_sound_at(
+        &self,
+        sound: &str,
+        extra_data: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+    ) -> usize {
+        self.broadcast_sound_at_to(sound, extra_data, x, y, z, &[])
+    }
+
+    /// [`Self::broadcast_sound_at`] restricted to `player_names` (empty =
+    /// every viewer of the block's chunk, PM's `getViewersForPosition()`).
+    pub(crate) fn broadcast_sound_at_to(
+        &self,
+        sound: &str,
+        extra_data: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        player_names: &[String],
+    ) -> usize {
+        let chunk = ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4);
         let mut wire = Vec::with_capacity(32);
         {
             let mut writer = Writer::new();
             writer.write_var_u32(LEVEL_SOUND_EVENT_PACKET_ID);
             wire.extend_from_slice(&writer.into_bytes());
         }
-        // PM plays the sound at the block centre.
-        wire.extend_from_slice(&level_sound_event_wire(
-            sound,
-            x as f32 + 0.5,
-            y as f32 + 0.5,
-            z as f32 + 0.5,
-            extra_data,
-        ));
+        wire.extend_from_slice(&level_sound_event_wire(sound, x, y, z, extra_data));
         let mut map = self.sessions.write();
         let mut recipients = 0usize;
         for session in map.values_mut() {
             if !session.joined || !session.sent_chunks.contains(&chunk) {
+                continue;
+            }
+            if !player_names.is_empty()
+                && !player_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&session.username))
+            {
                 continue;
             }
             session
@@ -8945,6 +9893,20 @@ impl SessionManager {
         y: f32,
         z: f32,
     ) -> usize {
+        self.broadcast_level_event_at_to(event_id, event_data, x, y, z, &[])
+    }
+
+    /// [`Self::broadcast_level_event_at`] restricted to `player_names`
+    /// (empty = every viewer of the block's chunk).
+    pub(crate) fn broadcast_level_event_at_to(
+        &self,
+        event_id: i32,
+        event_data: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        player_names: &[String],
+    ) -> usize {
         let chunk = ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4);
         // `RawWire` carries the packet id inside the buffer (same convention
         // as [`update_block_wire`]); the crate helper emits the payload only.
@@ -8959,6 +9921,13 @@ impl SessionManager {
         let mut recipients = 0usize;
         for session in map.values_mut() {
             if !session.joined || !session.sent_chunks.contains(&chunk) {
+                continue;
+            }
+            if !player_names.is_empty()
+                && !player_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&session.username))
+            {
                 continue;
             }
             session
@@ -9054,43 +10023,152 @@ impl SessionManager {
     }
 
     pub fn tick(&self) -> TickReport {
+        // Mark this synchronous body as tick work: `/profiler` keeps tick time
+        // apart from packet-dispatch and async work, so percentages and the
+        // unattributed share only ever refer to the tick.
+        let _tick_thread = crate::profiler::tick_thread();
+        // Root of the per-tick section tree `/profiler` reports on. Every phase
+        // below opens a child scope; a phase without one is charged to the root.
+        let _tick_scope = crate::profiler::scope("tick");
         let tick = self
             .tick_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let world_time = self.tick_world_time();
+        // Pressure plates read the players of this world; the snapshot must be
+        // in place before the world ticks redstone.
+        {
+            let _scope = crate::profiler::scope("tick.players");
+            self.publish_player_positions();
+        }
+        let world_time = {
+            let _scope = crate::profiler::scope("tick.world_time");
+            self.tick_world_time()
+        };
         // Sounds produced by scheduled block updates, e.g. a button releasing
         // itself (`onScheduledUpdate` -> `World::addSound`).
-        for (sound, extra_data, x, y, z) in self.world.take_pending_sounds() {
-            self.broadcast_sound(&sound, extra_data, x, y, z);
+        {
+            let _scope = crate::profiler::scope("tick.sounds");
+            for (sound, extra_data, x, y, z) in self.world.take_pending_sounds() {
+                self.broadcast_sound(&sound, extra_data, x, y, z);
+            }
+            // `World::addSound()` from PHP (`world.add_sound`): exact position.
+            for (sound, extra_data, x, y, z) in self.world.take_pending_sounds_at() {
+                self.broadcast_sound_at(&sound, extra_data, x, y, z);
+            }
         }
         // Dig handlers first: a completed dig edits the world, and the
         // broadcast poll below must ship that edit in this same tick.
-        self.update_break_handlers();
+        {
+            let _scope = crate::profiler::scope("tick.break_handlers");
+            self.update_break_handlers();
+        }
+        // `Projectile::onHitEntity()` on mobs: the world only queues the hit,
+        // so the event is decided here, before `tick_entities()` applies
+        // damage, death and loot.
+        {
+            let _scope = crate::profiler::scope("tick.projectile_damage");
+            self.apply_pending_projectile_damage();
+        }
+        // `PlayerInventory` de los plugins: aplica lo que encolaron en el tick
+        // anterior y republica los snapshots una vez por segundo para que PHP
+        // vea también los cambios del cliente.
+        {
+            let _scope = crate::profiler::scope("tick.plugin_inventory");
+            self.apply_pending_inventory_edits();
+            if tick % 20 == 0 {
+                self.publish_inventories();
+            }
+        }
         // `World::actuallyDoTick()` -> entity ticks: falling blocks move a cell
         // per tick and turn back into blocks on landing, so run them before
-        // the broadcast poll ships this tick's edits.
-        let landed = self.world.tick_entities();
+        // the broadcast poll ships this tick's edits. Each entity opens its own
+        // `entity.<type>` scope inside `tick_entities`.
+        let landed = {
+            let _scope = crate::profiler::scope("tick.entities");
+            self.world.tick_entities()
+        };
+        // `minecraft:behavior.look_at_player`: after the entity tick (so the
+        // body yaw is already this tick's) and before `sync_entities`, so the
+        // new head yaw ships in this tick's move packet.
+        {
+            let _scope = crate::profiler::scope("tick.entity_ai");
+            self.world.look_at_nearest_players();
+        }
+        // `Living::onDeath()`/`attack()` actor events (death and hurt
+        // animations) produced by the entity tick.
+        {
+            let _scope = crate::profiler::scope("tick.entity_events");
+            self.apply_entity_events();
+            // `Projectile::onHitEntity()` against players (mobs are resolved by
+            // the world tick) and `Explosion::explodeB()` player damage.
+            self.apply_projectile_hits();
+            self.apply_explosions();
+        }
+        // `WorldSaveEvent`/`SpawnChangeEvent`/`WorldDifficultyChangeEvent`
+        // queued by host calls and commands (see `dispatch_world_events`).
+        {
+            let _scope = crate::profiler::scope("tick.world_events");
+            self.dispatch_world_events();
+        }
+        // `WorldSoundEvent`/`WorldParticleEvent` for the effects PHP queued in
+        // `world.add_sound`/`world.add_particle`; the survivors are broadcast
+        // in this same tick.
+        {
+            let _scope = crate::profiler::scope("tick.world_effects");
+            self.dispatch_world_effects();
+        }
         // `World::addSound()` / `addParticle()` level events queued by the
         // world itself (e.g. `AnvilFallSound` when an anvil lands).
         // `World::addSound()`/`addParticle()` take a `Vector3`: the block
         // centre, not the cell corner.
-        for (event_id, event_data, x, y, z) in self.world.take_pending_level_events() {
-            self.broadcast_level_event_at(
-                event_id,
-                event_data,
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                z as f32 + 0.5,
-            );
+        {
+            let _scope = crate::profiler::scope("tick.level_events");
+            for (event_id, event_data, x, y, z) in self.world.take_pending_level_events() {
+                self.broadcast_level_event_at(
+                    event_id,
+                    event_data,
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                    z as f32 + 0.5,
+                );
+            }
+            // `World::addParticle()` from PHP (`world.add_particle`).
+            for (event_id, event_data, x, y, z) in self.world.take_pending_level_events_at() {
+                self.broadcast_level_event_at(event_id, event_data, x, y, z);
+            }
         }
-        self.apply_falling_block_damage(&landed);
-        self.flush_actor_sounds();
+        {
+            let _scope = crate::profiler::scope("tick.block_damage");
+            self.apply_falling_block_damage(&landed);
+            self.flush_actor_sounds();
+        }
+        // `World::actuallyDoTick()` -> `LevelChunk::randomTick()`: grass
+        // spread and decay, leaf decay, crop growth, saplings, sugar cane,
+        // cactus and vines inside the simulation area. Runs before the
+        // broadcast poll below so this tick's edits ship in the same tick.
+        {
+            let _scope = crate::profiler::scope("tick.random_blocks");
+            self.tick_random_blocks();
+        }
         // `World::actuallyDoTick()` -> `Entity::onUpdate()` for items/actors:
         // spawn, move and despawn them for every viewer.
-        self.sync_entities();
-        let block_changes = self.poll_block_changes();
-        let virtual_queued = self.poll_virtual_players();
+        {
+            let _scope = crate::profiler::scope("tick.sync_entities");
+            self.sync_entities();
+        }
+        let block_changes = {
+            let _scope = crate::profiler::scope("tick.block_changes");
+            self.poll_block_changes()
+        };
+        let virtual_queued = {
+            let _scope = crate::profiler::scope("tick.virtual_players");
+            self.poll_virtual_players()
+        };
+        // `/tpsbar` refreshes once per second (`tick-interval: 20`).
+        if tick % 20 == 0 {
+            let _scope = crate::profiler::scope("tick.tpsbar");
+            self.update_tps_bars();
+        }
         let chunk_packets_queued = self.drive_chunk_requests();
         TickReport {
             tick,
@@ -9106,12 +10184,17 @@ impl SessionManager {
     /// `NetworkSession::tick()` -> `Player::doChunkRequests()` for every
     /// session the reference would tick: `PreSpawn`/`InGame` with a view
     /// distance already received (`RequestChunkRadius` set it). Each
-    /// [`PlayerSession::do_chunk_requests`] pass queues its
+    /// [`PlayerSession::plan_chunk_requests`] pass queues its
     /// `NetworkChunkPublisherUpdate` (when an ordering pass runs) plus up
     /// to `CHUNK_SENDING_PER_TICK` `LevelChunk`s — and the terrain-ready
     /// `PLAYER_SPAWN` right after the threshold chunk — into that
     /// session's `pending_outgoing`, in queue order behind anything the
     /// tick already queued (`SetTime`, block forwards, virtual sync).
+    ///
+    /// Terrain generation never happens here: missing columns are requested
+    /// from the shared `chunk_pipeline` and streamed on the tick after their
+    /// payload lands in `WorldState`'s cache, so the tick thread never pays a
+    /// generation cost and never holds `sessions.write()` while one runs.
     ///
     /// This runs on the central 50 ms clock (and in tests via
     /// [`SessionManager::tick`]), independently of inbound packets, so
@@ -9119,50 +10202,92 @@ impl SessionManager {
     /// "Locating/Generating the world" and sends nothing. Returns the
     /// total number of packets queued across all sessions. Sessions not
     /// eligible are skipped without touching `next_chunk_order_run`
-    /// (`do_chunk_requests` itself is a no-op for them, this guard just
+    /// (`plan_chunk_requests` itself is a no-op for them, this guard just
     /// keeps the driver explicit).
     pub fn drive_chunk_requests(&self) -> usize {
         let started = std::time::Instant::now();
+        let _scope = crate::profiler::scope("tick.chunk_stream");
         let queued = self.drive_chunk_requests_inner();
         self.lag.chunk_stream.record(started.elapsed());
         queued
     }
 
     fn drive_chunk_requests_inner(&self) -> usize {
-        // Warm the columns each session is about to stream *before* locking
-        // the sessions map. `do_chunk_requests` generates payloads with rayon
-        // (~18 ms per cold column) and `drain_pending_outgoing_bytes` compresses
-        // them; doing either under `sessions.write()` blocked every packet
-        // handler in between — a break's particles/sound waited 60-160 ms, the
-        // tick drifted and fast breaking dropped the peer.
-        let pending: Vec<(i32, i32)> = {
-            let map = self.sessions.read();
-            let mut columns: Vec<(i32, i32)> = Vec::new();
-            for session in map.values() {
-                if !session.wants_chunk_streaming() {
-                    continue;
-                }
-                columns.extend(session.next_chunk_columns());
-            }
-            columns
+        // 1) Ordering and selection under a short write lock. Bookkeeping only:
+        //    no terrain work and no payload builds happen while this lock is
+        //    held, so packet handlers (a break's particles/sound) are not
+        //    delayed behind chunk streaming.
+        let mut plans: Vec<(u64, ChunkRequestPlan)> = {
+            let _scope = crate::profiler::scope("chunk.plan");
+            let mut map = self.sessions.write();
+            map.iter_mut()
+                .filter(|(_, session)| session.wants_chunk_streaming())
+                .map(|(id, session)| (*id, session.plan_chunk_requests()))
+                .collect()
         };
-        if !pending.is_empty() {
-            pending.par_iter().for_each(|(cx, cz)| {
-                self.world.chunk_payload(*cx, *cz);
-            });
-        }
 
-        let mut map = self.sessions.write();
-        let mut queued = 0usize;
-        for session in map.values_mut() {
-            if !session.wants_chunk_streaming() {
-                continue;
+        // 2) Build `LevelChunk`s outside every session lock, from payloads the
+        //    pipeline already generated. Cold columns are requested for the
+        //    shared queue and skipped this pass: they stream on a later tick.
+        let mut requests: Vec<(i32, i32)> = Vec::new();
+        {
+            let _scope = crate::profiler::scope("chunk.packet");
+            for (_, plan) in plans.iter_mut() {
+                requests.extend(plan.prefetch.iter().copied());
+                for &(cx, cz) in &plan.columns {
+                    match self.world.cached_chunk_payload(cx, cz) {
+                        Some((sub_chunk_count, payload)) => {
+                            self.announce_chunk_load(cx, cz);
+                            plan.ready.push((
+                                cx,
+                                cz,
+                                LevelChunkPacket::new(
+                                    cx,
+                                    cz,
+                                    0, // DimensionIds::OVERWORLD
+                                    sub_chunk_count,
+                                    None, // sub_chunk_request_limit
+                                    false, // cache_enabled
+                                    Vec::new(), // used_blob_hashes
+                                    payload,
+                                    false, // client_biome_update
+                                ),
+                            ));
+                        }
+                        None => requests.push((cx, cz)),
+                    }
+                }
             }
-            let out = session.do_chunk_requests();
-            queued += out.len();
-            session.pending_outgoing.extend(out);
+        }
+        // One queue shared by warming and sending: the payload cache above is
+        // its output, so the next pass finds exactly what the workers built.
+        self.chunk_pipeline.request(&requests);
+
+        // 3) Commit under a short write lock: queue the packets and advance
+        //    the per-session streaming state.
+        let mut queued = 0usize;
+        {
+            let _scope = crate::profiler::scope("chunk.commit");
+            let mut map = self.sessions.write();
+            for (id, plan) in plans {
+                if let Some(session) = map.get_mut(&id) {
+                    let out = session.commit_chunk_requests(plan);
+                    queued += out.len();
+                    session.pending_outgoing.extend(out);
+                }
+            }
         }
         queued
+    }
+
+    /// Generates `columns` synchronously into the payload cache.
+    ///
+    /// Test/bootstrap helper only: the tick path never generates, it requests
+    /// columns from the shared pipeline and streams them once ready.
+    pub fn warm_chunks(&self, columns: &[(i32, i32)]) {
+        for &(cx, cz) in columns {
+            self.world.chunk_payload(cx, cz);
+        }
     }
 
     /// `NetworkSession::flushGamePacketQueue()` for every session:
@@ -9179,6 +10304,9 @@ impl SessionManager {
     /// one of the two paths, never both. Sessions with an empty queue
     /// produce no entry.
     pub fn drain_pending_outgoing_bytes(&self) -> Vec<(SocketAddr, Vec<bytes::Bytes>)> {
+        // Called from the tick loop (before and after `SessionManager::tick`),
+        // so its encode cost is tick time even though it runs outside `tick`.
+        let _tick_thread = crate::profiler::tick_thread();
         let started = std::time::Instant::now();
         let drained = self.drain_pending_outgoing_bytes_inner();
         self.lag.drain.record(started.elapsed());
@@ -9203,6 +10331,7 @@ impl SessionManager {
                 })
                 .collect()
         };
+        let _encode_scope = crate::profiler::scope("net.encode");
         let mut drained = Vec::with_capacity(taken.len());
         for (peer, outgoing, compression_enabled) in taken {
             let bytes = self.encode_outgoing(outgoing, compression_enabled);
@@ -9387,6 +10516,651 @@ impl SessionManager {
         }
     }
 
+    /// `EntityDamageByEntityEvent` for the projectile hits queued by
+    /// [`WorldState::tick_entities`].
+    ///
+    /// The shooter (if it is a player) is the damager, with
+    /// `EntityDamageEvent::CAUSE_PROJECTILE`, like `Projectile::onHitEntity()`.
+    fn apply_pending_projectile_damage(&self) {
+        let pending = self.world.take_projectile_damage();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(plugins) = self.plugins.read().clone() else {
+            for hit in pending {
+                self.world.damage_entity(hit.runtime_id, hit.damage);
+            }
+            return;
+        };
+        // Snapshot before dispatching: a PHP round-trip must not run while the
+        // session map is locked.
+        let shooters: std::collections::HashMap<u64, serde_json::Value> = {
+            let sessions = self.sessions.read();
+            sessions
+                .values()
+                .map(|session| {
+                    (
+                        session.entity_runtime_id,
+                        serde_json::json!({
+                            "unique_id": session.entity_unique_id,
+                            "runtime_id": session.entity_runtime_id,
+                            "type": "minecraft:player",
+                            "x": session.position.x,
+                            "y": session.position.y,
+                            "z": session.position.z,
+                            "name_tag": session.username,
+                            "alive": !session.is_dead,
+                        }),
+                    )
+                })
+                .collect()
+        };
+        for hit in pending {
+            let Some(target) = self.world.entity_by_id(hit.unique_id) else {
+                continue;
+            };
+            // `Projectile::onHitEntity()`: the shooter is the damager and the
+            // projectile is the child entity.
+            let damager = shooters.get(&hit.owner_runtime_id).cloned();
+            let child = hit
+                .child
+                .as_ref()
+                .map(crate::plugin_host::entity_json);
+            let Some(damage) = Self::damage_chain(
+                &plugins,
+                crate::plugin_host::entity_json(&target),
+                CAUSE_PROJECTILE,
+                hit.damage,
+                damager,
+                child,
+            ) else {
+                continue;
+            };
+            if damage <= 0.0 {
+                continue;
+            }
+            self.world.damage_entity(hit.runtime_id, damage);
+        }
+    }
+
+    /// Applies the inventory edits plugins queued through
+    /// `inventory.set_slot` / `inventory.clear`, then resends every affected
+    /// window (`InventoryContentPacket`) and republishes the snapshot.
+    fn apply_pending_inventory_edits(&self) {
+        let edits = self.registry.take_inventory_edits();
+        if edits.is_empty() {
+            return;
+        }
+        let mut sessions = self.sessions.write();
+        let mut touched: Vec<u64> = Vec::new();
+        for edit in edits {
+            match edit {
+                crate::plugin_host::InventoryEdit::SetSlot {
+                    player,
+                    window,
+                    slot,
+                    item,
+                } => {
+                    for session in sessions.values_mut() {
+                        if !session.username.eq_ignore_ascii_case(&player) {
+                            continue;
+                        }
+                        if session.inventory.set_window_slot(window, slot, item) {
+                            touched.push(session.session_id);
+                        }
+                        break;
+                    }
+                }
+                crate::plugin_host::InventoryEdit::Clear { player } => {
+                    for session in sessions.values_mut() {
+                        if !session.username.eq_ignore_ascii_case(&player) {
+                            continue;
+                        }
+                        let _ = session.inventory.clear();
+                        touched.push(session.session_id);
+                        break;
+                    }
+                }
+            }
+        }
+        if touched.is_empty() {
+            return;
+        }
+        let mut snapshots = Vec::new();
+        for session in sessions.values_mut() {
+            if touched.contains(&session.session_id) {
+                session.sync_inventory();
+                snapshots.push((
+                    session.username.clone(),
+                    Self::inventory_snapshot(&session.inventory),
+                ));
+            }
+        }
+        drop(sessions);
+        for (name, windows) in snapshots {
+            self.registry.publish_inventory(&name, windows);
+        }
+    }
+
+    /// Republishes every online player's inventory.
+    fn publish_inventories(&self) {
+        let sessions = self.sessions.read();
+        let snapshots: Vec<(String, serde_json::Value)> = sessions
+            .values()
+            .map(|session| {
+                (
+                    session.username.clone(),
+                    Self::inventory_snapshot(&session.inventory),
+                )
+            })
+            .collect();
+        drop(sessions);
+        for (name, windows) in snapshots {
+            self.registry.publish_inventory(&name, windows);
+        }
+    }
+
+    /// `inventory.get` payload: one entry per modelled player window.
+    fn inventory_snapshot(inventory: &crate::inventory::PlayerInventory) -> serde_json::Value {
+        let windows: Vec<serde_json::Value> = inventory
+            .windows()
+            .into_iter()
+            .map(|(window, items)| {
+                serde_json::json!({
+                    "window": window,
+                    "slots": items
+                        .iter()
+                        .map(crate::plugin_host::item_json)
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(windows)
+    }
+
+    /// Broadcasts the `ActorEventPacket`s the entity tick produced (hurt and
+    /// death animations) to the entity's viewers, like
+    /// `NetworkBroadcastUtils::broadcastEntityEvent()`.
+    fn apply_entity_events(&self) -> usize {
+        let events = self.world.take_entity_events();
+        if events.is_empty() {
+            return 0;
+        }
+        let mut map = self.sessions.write();
+        let mut queued = 0usize;
+        for event in events {
+            let viewers = self
+                .entity_views
+                .read()
+                .get(&event.unique_id)
+                .map(|view| view.viewers.clone())
+                .unwrap_or_default();
+            let wire = actor_event_wire(event.runtime_id, event.event_id);
+            for viewer_id in viewers {
+                if let Some(viewer) = map.get_mut(&viewer_id) {
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::RawWire(wire.clone()));
+                    queued += 1;
+                }
+            }
+        }
+        queued += self.dispatch_entity_lifecycle_events();
+        queued
+    }
+
+    /// `EntitySpawnEvent` / `EntityDeathEvent` for the entities the world tick
+    /// created or killed.
+    ///
+    /// PocketMine fires them from `World::addEntity()` and `Living::onDeath()`;
+    /// here they are batched once per tick, after `tick_entities()` and before
+    /// the network sync, because the world has no plugin manager.
+    fn dispatch_entity_lifecycle_events(&self) -> usize {
+        let Some(plugins) = self.plugins.read().clone() else {
+            self.world.take_entity_spawns();
+            self.world.take_entity_deaths();
+            self.world.take_entity_despawns();
+            return 0;
+        };
+        let mut dispatched = 0;
+        for unique_id in self.world.take_entity_spawns() {
+            if !plugins.has_listeners("EntitySpawnEvent") {
+                continue;
+            }
+            let Some(entity) = self.world.entity_by_id(unique_id) else {
+                continue;
+            };
+            let mut event = php_plugin_bridge::events::EntitySpawnEvent::new(
+                crate::plugin_host::entity_json(&entity),
+            );
+            if let Err(error) = plugins.dispatch_event_sync(&mut event) {
+                tracing::warn!("EntitySpawnEvent failed: {}", error);
+                continue;
+            }
+            dispatched += 1;
+        }
+        for unique_id in self.world.take_entity_deaths() {
+            if !plugins.has_listeners("EntityDeathEvent") {
+                continue;
+            }
+            let Some(entity) = self.world.entity_by_id(unique_id) else {
+                continue;
+            };
+            let drops: Vec<serde_json::Value> = entity
+                .mob_loot()
+                .into_iter()
+                .map(|(name, min, max)| {
+                    serde_json::json!({ "name": name, "min": min, "max": max })
+                })
+                .collect();
+            let mut event = php_plugin_bridge::events::EntityDeathEvent::new(
+                crate::plugin_host::entity_json(&entity),
+                drops,
+                entity.mob_xp(),
+            );
+            if let Err(error) = plugins.dispatch_event_sync(&mut event) {
+                tracing::warn!("EntityDeathEvent failed: {}", error);
+                continue;
+            }
+            dispatched += 1;
+        }
+        for entity in self.world.take_entity_despawns() {
+            if !plugins.has_listeners("EntityDespawnEvent") {
+                continue;
+            }
+            let mut event = php_plugin_bridge::events::EntityDespawnEvent::new(
+                crate::plugin_host::entity_json(&entity),
+            );
+            if let Err(error) = plugins.dispatch_event_sync(&mut event) {
+                tracing::warn!("EntityDespawnEvent failed: {}", error);
+                continue;
+            }
+            dispatched += 1;
+        }
+        dispatched
+    }
+
+    /// `WorldSaveEvent`, `SpawnChangeEvent` and `WorldDifficultyChangeEvent`
+    /// queued by the world (`WorldState::queue_world_event()`).
+    ///
+    /// PocketMine fires them from `World::save()`/`setSpawnLocation()`/
+    /// `setDifficulty()`, but the world has no plugin manager here: host calls
+    /// (PHP is blocked inside the call) and console commands run outside the
+    /// dispatch, so the world queues them and the tick delivers them. All three
+    /// are non-cancellable, so the deferral cannot change the outcome.
+    fn dispatch_world_events(&self) -> usize {
+        let queued = self.world.take_world_events();
+        if queued.is_empty() {
+            return 0;
+        }
+        let Some(plugins) = self.plugins.read().clone() else {
+            return 0;
+        };
+        let mut dispatched = 0;
+        for pending in queued {
+            let name = match pending {
+                crate::world_state::PendingWorldEvent::Saved => "WorldSaveEvent",
+                crate::world_state::PendingWorldEvent::SpawnChanged { .. } => "SpawnChangeEvent",
+                crate::world_state::PendingWorldEvent::DifficultyChanged { .. } => {
+                    "WorldDifficultyChangeEvent"
+                }
+            };
+            if !plugins.has_listeners(name) {
+                continue;
+            }
+            let mut event: Box<dyn Event> = match pending {
+                crate::world_state::PendingWorldEvent::Saved => {
+                    Box::new(php_plugin_bridge::WorldSaveEvent::new(self.world.name.clone()))
+                }
+                crate::world_state::PendingWorldEvent::SpawnChanged { previous } => {
+                    Box::new(php_plugin_bridge::SpawnChangeEvent::new(
+                        self.world.name.clone(),
+                        previous.0 as f64,
+                        previous.1 as f64,
+                        previous.2 as f64,
+                    ))
+                }
+                crate::world_state::PendingWorldEvent::DifficultyChanged { old, new } => Box::new(
+                    php_plugin_bridge::WorldDifficultyChangeEvent::new(
+                        self.world.name.clone(),
+                        old,
+                        new,
+                    ),
+                ),
+            };
+            if let Err(error) = plugins.dispatch_event_sync(event.as_mut()) {
+                warn!("{name} failed: {}", error);
+                continue;
+            }
+            dispatched += 1;
+        }
+        dispatched
+    }
+
+    /// Dispatches the `WorldSoundEvent`/`WorldParticleEvent` queued by the PHP
+    /// `World::addSound()`/`addParticle()` host calls and broadcasts the
+    /// survivors.
+    ///
+    /// A host call cannot fire an event (the PHP runtime is already inside the
+    /// call), so the effect waits for this tick; PM fires the event and sends
+    /// the packet synchronously, one tick earlier. Cancelling drops the packet;
+    /// `setSound()`/`setParticle()`/`setRecipients()` change what is sent.
+    fn dispatch_world_effects(&self) -> usize {
+        let queued = self.world.take_world_effects();
+        if queued.is_empty() {
+            return 0;
+        }
+        let plugins = self.plugins.read().clone();
+        let mut dispatched = 0;
+        for effect in queued {
+            match effect {
+                crate::world_state::PendingWorldEffect::Sound {
+                    sound,
+                    event_id,
+                    extra_data,
+                    x,
+                    y,
+                    z,
+                    recipients,
+                } => {
+                    let mut event = php_plugin_bridge::WorldSoundEvent::new(
+                        self.world.name.clone(),
+                        sound,
+                        event_id,
+                        extra_data,
+                        x as f64,
+                        y as f64,
+                        z as f64,
+                        recipients,
+                    );
+                    if let Some(plugins) = &plugins {
+                        if plugins.has_listeners("WorldSoundEvent") {
+                            if let Err(error) = plugins.dispatch_event_sync(&mut event) {
+                                warn!("WorldSoundEvent failed: {}", error);
+                            }
+                            dispatched += 1;
+                        }
+                    }
+                    if event.is_cancelled() {
+                        continue;
+                    }
+                    if let Some(sound) = &event.sound {
+                        self.broadcast_sound_at_to(
+                            sound,
+                            event.extra_data,
+                            event.x as f32,
+                            event.y as f32,
+                            event.z as f32,
+                            &event.recipients,
+                        );
+                    } else if let Some(event_id) = event.event_id {
+                        self.broadcast_level_event_at_to(
+                            event_id,
+                            event.extra_data,
+                            event.x as f32,
+                            event.y as f32,
+                            event.z as f32,
+                            &event.recipients,
+                        );
+                    }
+                }
+                crate::world_state::PendingWorldEffect::Particle {
+                    event_id,
+                    event_data,
+                    x,
+                    y,
+                    z,
+                    recipients,
+                } => {
+                    let mut event = php_plugin_bridge::WorldParticleEvent::new(
+                        self.world.name.clone(),
+                        event_id,
+                        event_data,
+                        x as f64,
+                        y as f64,
+                        z as f64,
+                        recipients,
+                    );
+                    if let Some(plugins) = &plugins {
+                        if plugins.has_listeners("WorldParticleEvent") {
+                            if let Err(error) = plugins.dispatch_event_sync(&mut event) {
+                                warn!("WorldParticleEvent failed: {}", error);
+                            }
+                            dispatched += 1;
+                        }
+                    }
+                    if event.is_cancelled() || event.event_id == 0 {
+                        continue;
+                    }
+                    self.broadcast_level_event_at_to(
+                        event.event_id,
+                        event.event_data,
+                        event.x as f32,
+                        event.y as f32,
+                        event.z as f32,
+                        &event.recipients,
+                    );
+                }
+            }
+        }
+        dispatched
+    }
+
+    /// `Living::attack()`'s event chain, shared by the packet path (which owns
+    /// a `&mut PlayerSession`) and the tick path (which only has the plugin
+    /// manager). Returns the damage to apply, `None` when cancelled.
+    fn damage_chain(
+        plugins: &PluginManager,
+        entity: serde_json::Value,
+        cause: i32,
+        damage: f32,
+        damager: Option<serde_json::Value>,
+        child: Option<serde_json::Value>,
+    ) -> Option<f32> {
+        let mut damage = damage;
+        // Parent-class listeners (`EntityDamageEvent`) see every hit first,
+        // like `instanceof` does in PocketMine.
+        if plugins.has_listeners("EntityDamageEvent") {
+            let mut event = EntityDamageEvent::new(entity.clone(), cause, damage);
+            match plugins.dispatch_event_sync(&mut event) {
+                Ok(_) => {
+                    if event.cancelled {
+                        return None;
+                    }
+                    damage = event.base_damage;
+                }
+                Err(error) => warn!("EntityDamageEvent failed: {}", error),
+            }
+        }
+        let Some(damager) = damager else {
+            return Some(damage);
+        };
+        if let Some(child) = child {
+            if !plugins.has_listeners("EntityDamageByChildEntityEvent") {
+                return Some(damage);
+            }
+            let mut event =
+                EntityDamageByChildEntityEvent::new(entity, damager, child, cause, damage);
+            return match plugins.dispatch_event_sync(&mut event) {
+                Ok(_) if event.cancelled => None,
+                Ok(_) => Some(event.base_damage),
+                Err(error) => {
+                    warn!("EntityDamageByChildEntityEvent failed: {}", error);
+                    Some(damage)
+                }
+            };
+        }
+        if !plugins.has_listeners("EntityDamageByEntityEvent") {
+            return Some(damage);
+        }
+        let mut event = EntityDamageByEntityEvent::new(entity, damager, cause, damage);
+        match plugins.dispatch_event_sync(&mut event) {
+            Ok(_) if event.cancelled => None,
+            Ok(_) => Some(event.base_damage),
+            Err(error) => {
+                warn!("EntityDamageByEntityEvent failed: {}", error);
+                Some(damage)
+            }
+        }
+    }
+
+    /// `Projectile::onHitEntity()` for players: every projectile segment traced
+    /// this tick is checked against the players' bounding boxes. The first hit
+    /// takes `Projectile::getResultDamage()` and the projectile is removed.
+    fn apply_projectile_hits(&self) -> usize {
+        let hits = self.world.take_projectile_hits();
+        if hits.is_empty() {
+            return 0;
+        }
+        let mut map = self.sessions.write();
+        let mut queued = 0usize;
+        for hit in hits {
+            let mut struck = false;
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead {
+                    continue;
+                }
+                // `Projectile::move()`: the shooter cannot hit itself during
+                // the first 5 ticks.
+                if hit.ticks_lived < 5 && session.entity_runtime_id == hit.owner_runtime_id {
+                    continue;
+                }
+                // `Player::getBoundingBox()`: 0.6 wide, 1.8 tall, feet at
+                // `session.position`.
+                if (session.position.x - hit.to.x).abs() > 0.8
+                    || (session.position.z - hit.to.z).abs() > 0.8
+                    || hit.to.y < session.position.y - 0.2
+                    || hit.to.y > session.position.y + 1.8
+                {
+                    continue;
+                }
+                // `Projectile::onHitEntity()` on a player: the shooter is not
+                // resolved here (the session map is write-locked), so the
+                // event carries only the cause.
+                session.damage_player_caused(hit.damage, CAUSE_PROJECTILE, None);
+                struck = true;
+                break;
+            }
+            if struck && self.world.remove_entity(hit.unique_id) {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    /// `Explosion::explodeB()`: falloff damage to every player inside the TNT
+    /// blast radius. The blocks were already destroyed by the world tick.
+    fn apply_explosions(&self) -> usize {
+        let explosions = self.world.take_explosions();
+        if explosions.is_empty() {
+            return 0;
+        }
+        let plugins = self.plugins.read().clone();
+        let mut queued = 0usize;
+        for explosion in explosions {
+            let radius = explosion.radius;
+            let mut yield_pct = if radius > 0.0 { 100.0 / radius } else { 0.0 };
+            let mut blocks = explosion.blocks;
+            if let Some(plugins) = plugins.as_ref() {
+                // PM fires `EntityExplodeEvent` only when the blast has an
+                // entity source (`$what instanceof Entity`); a sourceless
+                // `Explosion` (or one with a `Block`) fires `BlockExplodeEvent`,
+                // which is not ported yet.
+                if explosion.entity.is_some() && plugins.has_listeners("EntityExplodeEvent") {
+                    let mut event = php_plugin_bridge::EntityExplodeEvent::new(
+                        explosion.entity.clone().unwrap_or(serde_json::Value::Null),
+                        self.world.name.clone(),
+                        explosion.x as f64,
+                        explosion.y as f64,
+                        explosion.z as f64,
+                        yield_pct as f64,
+                        blocks
+                            .iter()
+                            .map(|&(x, y, z, block_id)| php_plugin_bridge::AffectedBlock {
+                                x,
+                                y,
+                                z,
+                                block_id,
+                            })
+                            .collect(),
+                    );
+                    match plugins.dispatch_event_sync(&mut event) {
+                        // `Explosion::explodeB()`: a cancelled event means no
+                        // blocks and no damage at all.
+                        Ok(_) if event.cancelled => continue,
+                        Ok(_) => {
+                            yield_pct = event.yield_pct as f32;
+                            blocks = event
+                                .blocks
+                                .iter()
+                                .map(|block| (block.x, block.y, block.z, block.block_id))
+                                .collect();
+                        }
+                        Err(error) => warn!("EntityExplodeEvent failed: {}", error),
+                    }
+                }
+            }
+            // `Explosion::explodeA()` after the event: destroy the blocks that
+            // survived it and drop `yield`% of them.
+            self.world.apply_explosion_blocks(&blocks, yield_pct);
+            let mut map = self.sessions.write();
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead {
+                    continue;
+                }
+                let dx = session.position.x - explosion.x;
+                let dy = session.position.y + 0.9 - explosion.y;
+                let dz = session.position.z - explosion.z;
+                let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                if distance > radius {
+                    continue;
+                }
+                // PM `Explosion`: damage falls off linearly with distance.
+                let damage = (1.0 - distance / radius) * 14.0;
+                if damage > 0.0 {
+                    // PM: `EntityDamageByEntityEvent` when an entity caused the
+                    // blast, `EntityDamageEvent(CAUSE_BLOCK_EXPLOSION)` otherwise.
+                    let cause = if explosion.entity.is_some() {
+                        CAUSE_ENTITY_EXPLOSION
+                    } else {
+                        CAUSE_BLOCK_EXPLOSION
+                    };
+                    session.damage_player_caused(damage, cause, None);
+                    queued += 1;
+                }
+            }
+        }
+        queued
+    }
+
+    /// `ChunkLoadEvent`: PM fires it once when the chunk enters memory, not per
+    /// viewer. This port generates every column on demand (there is no chunk
+    /// storage), so the first stream to a player is the load event.
+    fn announce_chunk_load(&self, chunk_x: i32, chunk_z: i32) -> usize {
+        if !self.loaded_chunks.lock().insert((chunk_x, chunk_z)) {
+            return 0;
+        }
+        let Some(plugins) = self.plugins.read().clone() else {
+            return 0;
+        };
+        if !plugins.has_listeners("ChunkLoadEvent") {
+            return 0;
+        }
+        let mut event = php_plugin_bridge::ChunkLoadEvent::new(
+            self.world.name.clone(),
+            chunk_x,
+            chunk_z,
+            true,
+        );
+        match plugins.dispatch_event_sync(&mut event) {
+            Ok(_) => 1,
+            Err(error) => {
+                warn!("ChunkLoadEvent failed: {}", error);
+                0
+            }
+        }
+    }
+
     /// `World::actuallyDoTick()` entity pass: spawns the entities a viewer can
     /// now see (`Entity::spawnTo`), despawns the ones that left its loaded
     /// chunks (`Entity::despawnFrom`) and forwards movement
@@ -9396,6 +11170,7 @@ impl SessionManager {
         let mut map = self.sessions.write();
         let mut queued = self.sync_entities_locked(&mut map);
         queued += self.collect_item_pickups_locked(&mut map);
+        queued += self.collect_arrow_pickups_locked(&mut map);
         queued
     }
 
@@ -9477,19 +11252,35 @@ impl SessionManager {
                             ),
                         ));
                     }
-                    crate::entity::EntityKind::FallingBlock { .. } => {
-                        session.pending_outgoing.push(OutgoingPacket::AddActor(
-                            AddActorPacket::new(
-                                entity.unique_id,
-                                entity.runtime_id,
-                                entity.network_type_id(),
-                                position,
-                                Some(entity.motion),
-                                entity.pitch,
-                                entity.yaw,
-                                entity.metadata(),
-                            ),
-                        ));
+                    _ => {
+                        // `Entity::sendSpawnPacket()` for every other actor:
+                        // falling blocks, mobs, projectiles, TNT and XP orbs.
+                        let mut packet = AddActorPacket::new(
+                            entity.unique_id,
+                            entity.runtime_id,
+                            entity.network_type_id(),
+                            position,
+                            Some(entity.motion),
+                            entity.pitch,
+                            entity.yaw,
+                            entity.metadata(),
+                        );
+                        // `Living::sendSpawnPacket()` -> the health attribute
+                        // (`AttributeFactory::HEALTH`); mobs have no health
+                        // metadata in Bedrock.
+                        if let (Some(health), Some(max)) = (entity.health(), entity.max_health()) {
+                            packet.attributes.push(
+                                bedrock_protocol::packets::add_actor::ActorAttribute::new(
+                                    "minecraft:health",
+                                    0.0,
+                                    health,
+                                    max,
+                                ),
+                            );
+                        }
+                        session
+                            .pending_outgoing
+                            .push(OutgoingPacket::AddActor(packet));
                     }
                 }
                 view.viewers.insert(session.session_id);
@@ -9497,16 +11288,25 @@ impl SessionManager {
             }
 
             // `Entity::broadcastMovement()`: interpolated delta packets, like
-            // the virtual-player path.
-            if view.sent != Some(position) {
+            // the virtual-player path. Rotation alone also needs a packet:
+            // a mob whose heading changed is already walking, but one blocked
+            // by a wall changes its body yaw without moving, and looking at a
+            // player only turns `head_yaw`.
+            let rotation = (entity.pitch, entity.yaw, entity.head_yaw);
+            if view.sent != Some(position) || view.sent_rotation != Some(rotation) {
                 view.sent = Some(position);
-                let packet = MoveActorDeltaPacket::full_move(
+                view.sent_rotation = Some(rotation);
+                let mut packet = MoveActorDeltaPacket::full_move(
                     entity.runtime_id,
                     position,
                     entity.pitch,
                     entity.yaw,
-                    entity.yaw,
+                    entity.head_yaw,
                 );
+                // `Entity::broadcastMovement()` carries `onGround`. Without it
+                // the client considers every actor airborne: chickens flap
+                // their wings forever even standing on solid ground.
+                packet.on_ground = entity.on_ground;
                 for viewer_id in view.viewers.iter().copied() {
                     if let Some(viewer) = map.get_mut(&viewer_id) {
                         viewer
@@ -9569,11 +11369,12 @@ impl SessionManager {
                 continue;
             }
             let packet = TakeItemActorPacket::new(entity.runtime_id, taker_runtime_id);
+            let remove_packet = RemoveActorPacket::new(entity.unique_id);
             let mut recipients: HashSet<u64> = self
                 .entity_views
-                .read()
-                .get(&entity.unique_id)
-                .map(|view| view.viewers.clone())
+                .write()
+                .remove(&entity.unique_id)
+                .map(|view| view.viewers)
                 .unwrap_or_default();
             recipients.insert(taker_id);
             for viewer_id in recipients {
@@ -9581,7 +11382,81 @@ impl SessionManager {
                     viewer
                         .pending_outgoing
                         .push(OutgoingPacket::TakeItemActor(packet));
-                    queued += 1;
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::RemoveActor(remove_packet.clone()));
+                    queued += 2;
+                }
+            }
+        }
+        queued
+    }
+
+    /// `Arrow::onCollideWithPlayer()`: a stuck arrow is picked up by the first
+    /// survival player whose box touches it (`PICKUP_ANY`); creative players
+    /// keep `hasFiniteResources == false` and never pick arrows up.
+    fn collect_arrow_pickups_locked(&self, map: &mut HashMap<u64, PlayerSession>) -> usize {
+        let arrows: Vec<crate::entity::Entity> = self
+            .world
+            .entities_snapshot()
+            .into_iter()
+            .filter(|entity| entity.projectile_stuck() && entity.projectile_pickup_mode() == 1)
+            .collect();
+        if arrows.is_empty() {
+            return 0;
+        }
+        let Some(arrow_item) = crate::inventory::item_network_id("minecraft:arrow") else {
+            return 0;
+        };
+        let item = ItemStack {
+            network_id: arrow_item,
+            count: 1,
+            ..ItemStack::empty()
+        };
+        let mut queued = 0usize;
+        for entity in arrows {
+            let mut taker: Option<(u64, u64)> = None;
+            for session in map.values_mut() {
+                if !session.joined || session.is_dead || session.gamemode == 1 {
+                    continue;
+                }
+                if (session.position.x - entity.position.x).abs() > 0.9
+                    || (session.position.z - entity.position.z).abs() > 0.9
+                    || (session.position.y - entity.position.y).abs() > 1.0
+                {
+                    continue;
+                }
+                if session.inventory.add_item(&item) != 0 {
+                    continue;
+                }
+                session.sync_inventory();
+                taker = Some((session.session_id, session.entity_runtime_id));
+                break;
+            }
+            let Some((taker_id, taker_runtime_id)) = taker else {
+                continue;
+            };
+            if !self.world.remove_entity(entity.unique_id) {
+                continue;
+            }
+            let packet = TakeItemActorPacket::new(entity.runtime_id, taker_runtime_id);
+            let remove_packet = RemoveActorPacket::new(entity.unique_id);
+            let mut recipients: HashSet<u64> = self
+                .entity_views
+                .write()
+                .remove(&entity.unique_id)
+                .map(|view| view.viewers)
+                .unwrap_or_default();
+            recipients.insert(taker_id);
+            for viewer_id in recipients {
+                if let Some(viewer) = map.get_mut(&viewer_id) {
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::TakeItemActor(packet));
+                    viewer
+                        .pending_outgoing
+                        .push(OutgoingPacket::RemoveActor(remove_packet.clone()));
+                    queued += 2;
                 }
             }
         }
@@ -9710,9 +11585,10 @@ fn respawn_wire(position: (f32, f32, f32), state: u8, runtime_id: u64) -> Vec<u8
     writer.into_bytes().to_vec()
 }
 
-/// AvailableCommandsPacket (0x4C) carrying the native command table.
-fn available_commands_wire() -> Vec<u8> {
-    let commands: Vec<CommandSpec> = crate::command::COMMANDS
+/// AvailableCommandsPacket (0x4C) carrying the native command table plus the
+/// commands the PHP plugins registered at `onEnable`.
+fn available_commands_wire(plugin_commands: &[PhpCommandInfo]) -> Vec<u8> {
+    let mut commands: Vec<CommandSpec> = crate::command::COMMANDS
         .iter()
         // The client ships its own /help, exactly like Axolotl skips it.
         .filter(|info| info.name != "help")
@@ -9722,6 +11598,26 @@ fn available_commands_wire() -> Vec<u8> {
             aliases: info.aliases.iter().map(|alias| alias.to_string()).collect(),
         })
         .collect();
+
+    // Plugin command names and aliases must not carry a leading slash in
+    // AvailableCommandsPacket: the Bedrock client UI prepends '/' in chat and
+    // autocompletion, so a leading slash produces duplicate slashes (e.g. ///pos2).
+    for command in plugin_commands {
+        let name = command.name.trim().trim_start_matches('/');
+        if name.is_empty() || commands.iter().any(|known| known.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        commands.push(CommandSpec {
+            name: name.to_string(),
+            description: command.description.clone(),
+            aliases: command
+                .aliases
+                .iter()
+                .map(|alias| alias.trim().trim_start_matches('/').to_string())
+                .filter(|alias| !alias.is_empty() && !alias.eq_ignore_ascii_case(name))
+                .collect(),
+        });
+    }
 
     let packet = AvailableCommandsPacket { commands };
     let mut writer = Writer::with_capacity(4096);
@@ -9783,6 +11679,90 @@ mod block_sync_tests {
         session
     }
 
+    /// `/tpsbar` (`TPSBarCommand` + `TPSBarTask`): one bar per player, created
+    /// on the first run and destroyed on the second, with Purpur's
+    /// `NOTCHED_20` overlay and the TPS/MSPT/ping title.
+    #[test]
+    fn tpsbar_toggles_a_bossbar_for_the_player() {
+        let manager = SessionManager::new();
+        let mut session = joined_session(1, &[(0, 0)]);
+        session.username = "Steve".to_string();
+        manager.add_session(session);
+
+        let action = CommandAction::TpsBar {
+            target: "Steve".to_string(),
+            notify: "Steve".to_string(),
+        };
+        manager.apply_command_actions(&[action.clone()]);
+
+        let boss_id = *manager
+            .tps_bars
+            .read()
+            .get("steve")
+            .expect("bar tracked for the player");
+        let bar = manager.bossbar_get(boss_id).expect("bar created");
+        assert!(bar.is_viewer("Steve"));
+        assert_eq!(bar.overlay(), TPS_BAR_OVERLAY);
+        assert!(bar.title().contains("TPS"));
+        assert!(bar.title().contains("MSPT"));
+        assert!(bar.title().contains("Ping"));
+        // No tick body sampled yet: the bar starts empty and green.
+        assert_eq!(bar.percentage(), 0.0);
+        assert_eq!(bar.color(), BossBarColor::Green as u8);
+
+        // The bar is queued for the client that turned it on.
+        let queued = manager
+            .sessions
+            .read()
+            .get(&1)
+            .expect("session")
+            .pending_outgoing
+            .iter()
+            .filter(|packet| matches!(packet, OutgoingPacket::BossEvent(_)))
+            .count();
+        assert!(queued > 0, "no BossEventPacket queued");
+
+        // Running it again turns the bar off.
+        manager.apply_command_actions(&[action]);
+        assert!(manager.tps_bars.read().is_empty());
+        assert!(manager.bossbar_get(boss_id).is_none());
+    }
+
+    /// Purpur's default `fill-mode: MSPT`: the bar fill is the tick body as a
+    /// fraction of the 50 ms budget, and the colour follows the same value.
+    #[test]
+    fn tpsbar_fill_and_color_follow_the_mspt_budget() {
+        let manager = SessionManager::new();
+        let mut session = joined_session(1, &[(0, 0)]);
+        session.username = "Steve".to_string();
+        manager.add_session(session);
+
+        manager
+            .metrics()
+            .record_tick_time(std::time::Duration::from_millis(20));
+        manager.apply_command_actions(&[CommandAction::TpsBar {
+            target: "Steve".to_string(),
+            notify: "Steve".to_string(),
+        }]);
+
+        let boss_id = *manager.tps_bars.read().get("steve").expect("bar");
+        let bar = manager.bossbar_get(boss_id).expect("bar");
+        assert!(
+            (bar.percentage() - 0.4).abs() < 0.001,
+            "20 ms is 40% of the budget, got {}",
+            bar.percentage()
+        );
+        assert_eq!(bar.color(), BossBarColor::Green as u8);
+        // Every threshold is covered by the title/colour helpers.
+        assert_eq!(tps_bar_bar_color(39.9), BossBarColor::Green as u8);
+        assert_eq!(tps_bar_bar_color(45.0), BossBarColor::Yellow as u8);
+        assert_eq!(tps_bar_bar_color(50.0), BossBarColor::Red as u8);
+        let healthy = tps_bar_title(20.0, 12.5, 40);
+        assert!(healthy.contains("§a20.00") && healthy.contains("§a12.50") && healthy.contains("§a40ms"));
+        let lagging = tps_bar_title(10.0, 60.0, 250);
+        assert!(lagging.contains("§c10.00") && lagging.contains("§c60.00") && lagging.contains("§c250ms"));
+    }
+
     /// Chunk streaming must not hold the sessions lock while it builds
     /// columns: a block break's `UpdateBlock` and destroy particles are queued
     /// by a packet handler that needs that same lock, so a slow column used to
@@ -9827,14 +11807,82 @@ mod block_sync_tests {
             })
         };
 
+        // With an 80 ms generator the pass cannot stream anything: it must not
+        // generate on the tick thread, so it only requests the columns.
         let queued = manager.drive_chunk_requests();
-        assert_eq!(queued, 2, "both queued columns are streamed");
+        assert_eq!(queued, 0, "the tick never generates terrain");
 
         let waited = waiter.join().expect("waiter thread");
         assert!(
             waited < std::time::Duration::from_millis(40),
             "a packet handler waited {waited:?} for the sessions lock while chunks were built"
         );
+
+        // Once the payloads exist, the next pass streams them.
+        manager.warm_chunks(&[(0, 0), (1, 0)]);
+        assert_eq!(manager.drive_chunk_requests(), 2);
+    }
+
+    /// The central tick never blocks on terrain generation, and the packets it
+    /// sends come from payloads the shared pipeline already produced.
+    #[test]
+    fn tick_never_generates_chunks_on_its_thread() {
+        struct SlowGenerator;
+
+        impl WorldGenerator for SlowGenerator {
+            fn generator_type(&self) -> i32 {
+                1
+            }
+            fn spawn_position(&self) -> (i32, i32, i32) {
+                (0, 64, 0)
+            }
+            fn player_position(&self) -> (f32, f32, f32) {
+                (0.5, 64.0, 0.5)
+            }
+            fn generate_chunk(&self, _chunk_x: i32, _chunk_z: i32) -> (u32, Vec<u8>) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                (0, Vec::new())
+            }
+        }
+
+        let manager = SessionManager::with_generator(Arc::new(SlowGenerator));
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(1, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.view_distance_received = true;
+        session.chunk_radius = 4;
+        session.next_chunk_order_run = 0;
+        session.world = Arc::clone(manager.world());
+        manager.add_session(session);
+
+        let started = std::time::Instant::now();
+        let report = manager.tick();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(40),
+            "the tick sat on terrain generation for {elapsed:?}"
+        );
+        assert_eq!(
+            report.chunk_packets_queued, 1,
+            "only the PublisherUpdate is queued while the pipeline generates"
+        );
+
+        // Warming is the pipeline's job; the tick just streams what it built.
+        let warm: Vec<(i32, i32)> = manager
+            .sessions
+            .read()
+            .get(&1)
+            .expect("session")
+            .chunk_load_queue
+            .iter()
+            .take(CHUNK_SENDING_PER_TICK)
+            .copied()
+            .collect();
+        manager.warm_chunks(&warm);
+        let report = manager.tick();
+        assert_eq!(report.chunk_packets_queued, CHUNK_SENDING_PER_TICK);
     }
 
     #[test]
@@ -9995,6 +12043,9 @@ mod block_sync_tests {
         }];
         manager.apply_actions(&actions, 0);
         assert_eq!(manager.get_scoreboard("Player_1"), Some(board));
+        assert!(!manager.is_scoreboard_persisted("Player_1"));
+        manager.remove_session(1);
+        assert_eq!(manager.get_scoreboard("Player_1"), None);
         let _ = ScoreboardData::default();
     }
 
@@ -10131,7 +12182,20 @@ mod block_sync_tests {
         placer.world = Arc::clone(manager.world());
         manager.add_session(placer);
 
-        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        // A floor lever on its support block (components now break when the
+        // block they sit on disappears).
+        let lever = bedrock_world::block_states::with_property(
+            bedrock_world::block_states::network_id("lever").unwrap(),
+            "lever_direction",
+            "up_north_south",
+        )
+        .unwrap();
+        manager.world().set_block(
+            2,
+            79,
+            3,
+            bedrock_world::block_states::network_id("stone").unwrap(),
+        );
         assert!(manager.world().set_block(2, 80, 3, lever));
         let on = bedrock_world::block_states::with_property(lever, "open_bit", "true").unwrap();
 
@@ -10153,6 +12217,504 @@ mod block_sync_tests {
         assert_eq!(manager.world().block_at(2, 81, 3), AIR);
     }
 
+    /// PM `Door::onInteract()`: the clicked half swings, the other half follows
+    /// (both share `open_bit`) and one door sound is queued.
+    #[test]
+    fn bedrock_click_on_a_door_swings_both_halves() {
+        use bedrock_world::block_states;
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let lower = block_states::network_id("spruce_door").unwrap();
+        let upper = block_states::with_property(lower, "upper_block_bit", "true").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, lower));
+        assert!(manager.world().set_block(2, 81, 3, upper));
+
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        assert_eq!(block_states::bool_property(manager.world().block_at(2, 80, 3), "open_bit"), Some(true));
+        assert_eq!(block_states::bool_property(manager.world().block_at(2, 81, 3), "open_bit"), Some(true));
+        assert!(!actions.is_empty(), "the door sound must be queued");
+        assert_eq!(manager.world().block_at(2, 81, 4), AIR, "nothing is placed");
+    }
+
+    /// PM `CraftingTable::onInteract()`: the click opens window 10 instead of
+    /// placing the held block against the table.
+    #[test]
+    fn bedrock_click_on_a_crafting_table_opens_the_workbench() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let table = bedrock_world::block_states::network_id("crafting_table").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, table));
+
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: (2, 80, 3),
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: ItemStack::new(1, 1),
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 0,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        let out = manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes())
+            .expect("use item");
+
+        assert!(
+            out.iter().any(|packet| packet.packet_id() == 0x2E),
+            "ContainerOpenPacket must be sent"
+        );
+        assert_eq!(
+            manager.sessions.read()[&1]
+                .open_container
+                .as_ref()
+                .map(|c| c.kind.as_str()),
+            Some("crafting_table")
+        );
+        // The held block was not placed against the table.
+        assert!(manager.sessions.read()[&1].pending_actions.is_empty());
+        assert_eq!(manager.world().block_at(2, 81, 3), AIR);
+    }
+
+    /// A container whose inventory is not modelled yet (loom, grindstone,
+    /// enchanting table, ...) still consumes the click: nothing may be placed
+    /// against it.
+    #[test]
+    fn bedrock_click_on_an_unmodelled_container_places_nothing() {
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let loom = bedrock_world::block_states::network_id("loom").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, loom));
+
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        assert!(actions.is_empty(), "no placement: {actions:?}");
+        assert_eq!(manager.world().block_at(2, 81, 3), AIR);
+        let map = manager.sessions.read();
+        assert!(map[&1].open_container.is_none());
+    }
+
+    /// Q (`ItemStackRequest` `Drop`): the block leaves the hotbar as an item
+    /// entity thrown from the eye along the look direction, so it can be
+    /// picked up again, instead of vanishing from the inventory.
+    #[test]
+    fn dropping_a_block_spawns_an_item_entity() {
+        use bedrock_protocol::packets::item_stack_request::{
+            ItemStackContainerSlot, ItemStackRequestAction, ItemStackRequestPacket,
+        };
+
+        let manager = SessionManager::new();
+        let mut session = joined_session(1, &[(0, 0)]);
+        session.world = Arc::clone(manager.world());
+        session.position = Vector3f::new(8.5, 4.0, 8.5);
+        session.yaw = 0.0;
+        session.pitch = 0.0;
+        manager.add_session(session);
+
+        let sand = ItemStack::new(
+            crate::inventory::item_network_id("minecraft:sand").unwrap(),
+            2,
+        );
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1)
+                .unwrap()
+                .inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, 0, sand.clone());
+        }
+        let request = ItemStackRequestPacket::new(
+            9,
+            vec![ItemStackRequestAction::Drop {
+                count: 1,
+                source: ItemStackContainerSlot::new(crate::crafting::UI_INVENTORY, 0),
+                randomly: false,
+            }],
+        );
+        let mut writer = Writer::new();
+        request.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x93, &writer.into_bytes())
+            .expect("item stack request");
+
+        let entities = manager.world().entities_snapshot();
+        let dropped = entities
+            .iter()
+            .find(|entity| entity.network_type_id() == "minecraft:item")
+            .expect("the dropped block is an item entity");
+        let crate::entity::EntityKind::Item { item, .. } = &dropped.kind else {
+            panic!("the drop did not spawn an item entity");
+        };
+        assert_eq!(item.network_id, sand.network_id);
+        assert_eq!(item.count, 1);
+        assert!(
+            dropped.position.y > 5.0,
+            "thrown from the eye, not the feet: {:?}",
+            dropped.position
+        );
+        assert!(
+            (dropped.position.x - 8.5).abs() < 1e-3
+                && (dropped.position.z - 8.5).abs() < 1e-3
+        );
+        assert!(dropped.motion.z > 0.0, "thrown along +Z at yaw 0");
+        assert_eq!(
+            manager.sessions.read()[&1]
+                .inventory
+                .window_slot(WINDOW_ID_INVENTORY, 0)
+                .unwrap()
+                .count,
+            1
+        );
+    }
+
+    #[test]
+    fn dropping_a_block_with_container_36_spawns_an_item_entity() {
+        use bedrock_protocol::packets::item_stack_request::{
+            ItemStackContainerSlot, ItemStackRequestAction, ItemStackRequestPacket, UI_HOTBAR_ALT,
+        };
+
+        let manager = SessionManager::new();
+        let mut session = joined_session(1, &[(0, 0)]);
+        session.world = Arc::clone(manager.world());
+        session.position = Vector3f::new(8.5, 4.0, 8.5);
+        session.yaw = 0.0;
+        session.pitch = 0.0;
+        manager.add_session(session);
+
+        let stone = ItemStack::new(
+            crate::inventory::item_network_id("minecraft:stone").unwrap(),
+            5,
+        );
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1)
+                .unwrap()
+                .inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, 3, stone.clone());
+        }
+        let request = ItemStackRequestPacket::new(
+            15,
+            vec![ItemStackRequestAction::Drop {
+                count: 2,
+                source: ItemStackContainerSlot::new(UI_HOTBAR_ALT, 3),
+                randomly: false,
+            }],
+        );
+        let mut writer = Writer::new();
+        request.encode_payload(&mut writer);
+        let responses = manager
+            .handle_session_packet(1, 0x93, &writer.into_bytes())
+            .expect("item stack request");
+
+        assert!(responses.iter().any(|p| p.packet_id() == 0x94));
+
+        let entities = manager.world().entities_snapshot();
+        let dropped = entities
+            .iter()
+            .find(|entity| entity.network_type_id() == "minecraft:item")
+            .expect("the dropped block is an item entity");
+        let crate::entity::EntityKind::Item { item, .. } = &dropped.kind else {
+            panic!("the drop did not spawn an item entity");
+        };
+        assert_eq!(item.network_id, stone.network_id);
+        assert_eq!(item.count, 2);
+        assert_eq!(
+            manager.sessions.read()[&1]
+                .inventory
+                .window_slot(WINDOW_ID_INVENTORY, 3)
+                .unwrap()
+                .count,
+            3
+        );
+    }
+
+    #[test]
+    fn dropping_item_via_inventory_transaction_spawns_entity() {
+        use bedrock_protocol::packets::inventory_transaction::{
+            InventoryTransactionPacket, NetworkInventoryAction, TransactionData,
+            ACTION_MAGIC_SLOT_DROP_ITEM, SOURCE_CONTAINER, SOURCE_WORLD,
+        };
+
+        let manager = SessionManager::new();
+        let mut session = joined_session(1, &[(0, 0)]);
+        session.world = Arc::clone(manager.world());
+        session.position = Vector3f::new(8.5, 4.0, 8.5);
+        manager.add_session(session);
+
+        let stone = ItemStack::new(
+            crate::inventory::item_network_id("minecraft:stone").unwrap(),
+            4,
+        );
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1)
+                .unwrap()
+                .inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, 0, stone.clone());
+        }
+
+        let packet = InventoryTransactionPacket {
+            request_id: 20,
+            request_changed_slots: None,
+            actions: vec![
+                NetworkInventoryAction {
+                    source_type: SOURCE_CONTAINER,
+                    window_id: Some(WINDOW_ID_INVENTORY as i8),
+                    source_flags: None,
+                    inventory_slot: 0,
+                    old_item: stone.clone(),
+                    new_item: ItemStack::new(stone.network_id, 3),
+                },
+                NetworkInventoryAction {
+                    source_type: SOURCE_WORLD,
+                    window_id: None,
+                    source_flags: None,
+                    inventory_slot: ACTION_MAGIC_SLOT_DROP_ITEM,
+                    old_item: ItemStack::empty(),
+                    new_item: ItemStack::new(stone.network_id, 1),
+                },
+            ],
+            data: TransactionData::Normal,
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes())
+            .expect("inventory transaction");
+
+        let entities = manager.world().entities_snapshot();
+        let dropped = entities
+            .iter()
+            .find(|entity| entity.network_type_id() == "minecraft:item")
+            .expect("the dropped block is an item entity");
+        let crate::entity::EntityKind::Item { item, .. } = &dropped.kind else {
+            panic!("the drop did not spawn an item entity");
+        };
+        assert_eq!(item.count, 1);
+        assert_eq!(
+            manager.sessions.read()[&1]
+                .inventory
+                .window_slot(WINDOW_ID_INVENTORY, 0)
+                .unwrap()
+                .count,
+            3
+        );
+    }
+
+    /// `Dispenser::onInteract()`: the click opens a window with the block's
+    /// real 9 slots, and an `ItemStackRequest` moves an item from the hotbar
+    /// into it. The slots are persisted in the world, so the same inventory a
+    /// player edits is what the dispenser fires from, and reopening the block
+    /// shows the same contents.
+    #[test]
+    fn a_dispenser_window_moves_items_and_keeps_them() {
+        use bedrock_protocol::packets::inventory_content::InventoryContentPacket;
+        use bedrock_protocol::packets::item_stack_request::{
+            ItemStackContainerSlot, ItemStackRequestAction, ItemStackRequestPacket,
+        };
+
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        manager.add_session(placer);
+
+        let dispenser = bedrock_world::block_states::network_id("dispenser").unwrap();
+        assert!(manager.world().set_block(2, 80, 3, dispenser));
+
+        // `ContainerOpenPacket` (window 4, dispenser type) + `InventoryContent`.
+        let out = use_item_packets(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        assert!(out.iter().any(|packet| packet.packet_id() == 0x2E));
+        let content = out
+            .iter()
+            .find(|packet| packet.packet_id() == 0x31)
+            .expect("the window contents are sent");
+        let bytes = content.to_bytes().unwrap();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            reader.read_var_u32().unwrap(),
+            InventoryContentPacket::PACKET_ID
+        );
+        let contents = InventoryContentPacket::decode_payload(&mut reader).expect("decode");
+        assert_eq!(contents.window_id, 4);
+        assert_eq!(contents.items.len(), 9);
+
+        // Move one stone from the hotbar into the dispenser.
+        let stone = ItemStack::new(
+            crate::inventory::item_network_id("minecraft:stone").unwrap(),
+            1,
+        );
+        {
+            let mut map = manager.sessions.write();
+            map.get_mut(&1)
+                .unwrap()
+                .inventory
+                .set_window_slot(WINDOW_ID_INVENTORY, 0, stone.clone());
+        }
+        let request = ItemStackRequestPacket::new(
+            7,
+            vec![ItemStackRequestAction::Place {
+                count: 1,
+                source: ItemStackContainerSlot::new(crate::crafting::UI_INVENTORY, 0),
+                destination: ItemStackContainerSlot::new(4, 0),
+            }],
+        );
+        let mut writer = Writer::new();
+        request.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x93, &writer.into_bytes())
+            .expect("item stack request");
+
+        assert_eq!(
+            manager.world().container_slots((2, 80, 3), 9)[0].network_id,
+            stone.network_id,
+            "the block owns the slot the client moved the item into"
+        );
+        assert!(manager.sessions.read()[&1]
+            .inventory
+            .window_slot(WINDOW_ID_INVENTORY, 0)
+            .unwrap()
+            .is_empty());
+
+        // Closing (`ContainerClosePacket` 0x2F) keeps the contents in the block.
+        manager
+            .handle_session_packet(1, 0x2F, &[4, 6, 0])
+            .expect("close");
+        assert!(manager.sessions.read()[&1].inventory.block_container().is_none());
+        assert_eq!(
+            manager.world().container_slots((2, 80, 3), 9)[0].network_id,
+            stone.network_id
+        );
+
+        // Reopening sends the stored contents again.
+        let out = use_item_packets(&manager, (2, 80, 3), 1, ItemStack::new(1, 1));
+        let content = out
+            .iter()
+            .find(|packet| packet.packet_id() == 0x31)
+            .expect("contents on reopen");
+        let bytes = content.to_bytes().unwrap();
+        let mut reader = Reader::new(&bytes);
+        reader.read_var_u32().unwrap();
+        let contents = InventoryContentPacket::decode_payload(&mut reader).expect("decode");
+        assert_eq!(contents.items[0].network_id, stone.network_id);
+    }
+
+    /// Dispatches a `UseItem` CLICK_BLOCK transaction and returns the packets
+    /// the session answered with (the open window included).
+    fn use_item_packets(
+        manager: &SessionManager,
+        block_position: (i32, i32, i32),
+        face: u8,
+        held: ItemStack,
+    ) -> Vec<OutgoingPacket> {
+        use bedrock_protocol::packets::inventory_transaction::{
+            TransactionData, ACTION_CLICK_BLOCK, UseItemData,
+        };
+
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions: vec![],
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position,
+                face,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 0,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes())
+            .expect("use item")
+    }
+
+    /// `Door::place()`: a door takes the player's facing, gets its hinge side
+    /// from the blocks beside it and places the upper half in the cell above.
+    #[test]
+    fn placing_a_door_uses_the_player_facing_and_places_both_halves() {
+        let manager = SessionManager::new();
+        let mut placer = joined_session(1, &[(0, 0)]);
+        placer.world = Arc::clone(manager.world());
+        // Yaw 90 = west (Bedrock yaw grows clockwise from south).
+        placer.yaw = 90.0;
+        manager.add_session(placer);
+
+        assert!(manager.world().set_block(
+            2,
+            80,
+            3,
+            bedrock_world::block_states::network_id("stone").unwrap()
+        ));
+        let door = bedrock_world::block_states::network_id("spruce_door").unwrap();
+        let mut held = ItemStack::new(
+            crate::inventory::item_network_id("minecraft:spruce_door").unwrap_or(1),
+            1,
+        );
+        held.block_runtime_id = door;
+
+        let actions = right_click_actions(&manager, (2, 80, 3), 1, held);
+        let placed: Vec<(i32, u32)> = actions
+            .iter()
+            .filter_map(|action| match action {
+                PluginAction::SetBlock {
+                    x, y, z, block_id, ..
+                } if *x == 2 && *z == 3 => Some((*y, *block_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(placed.len(), 2, "lower and upper halves: {actions:?}");
+        let (lower_y, lower) = placed[0];
+        let (upper_y, upper) = placed[1];
+        assert_eq!((lower_y, upper_y), (81, 82));
+        assert_eq!(
+            bedrock_world::block_states::string_property(lower, "minecraft:cardinal_direction"),
+            Some("north"),
+            "the door faces where the player looks (a quarter turn behind the state)"
+        );
+        assert_eq!(
+            bedrock_world::block_states::string_property(upper, "minecraft:cardinal_direction"),
+            Some("north")
+        );
+        assert_eq!(
+            bedrock_world::block_states::bool_property(upper, "upper_block_bit"),
+            Some(true)
+        );
+        assert_eq!(
+            bedrock_world::block_states::bool_property(lower, "upper_block_bit"),
+            Some(false)
+        );
+    }
+
     /// PM `Button::onInteract()` + `onScheduledUpdate()`: press, `power.on`,
     /// and after `getActivationTime()` ticks the button releases itself with
     /// `power.off`.
@@ -10163,7 +12725,18 @@ mod block_sync_tests {
         placer.world = Arc::clone(manager.world());
         manager.add_session(placer);
 
-        let button = bedrock_world::block_states::network_id("stone_button").unwrap();
+        let button = bedrock_world::block_states::with_property(
+            bedrock_world::block_states::network_id("stone_button").unwrap(),
+            "facing_direction",
+            "1",
+        )
+        .unwrap();
+        manager.world().set_block(
+            2,
+            79,
+            3,
+            bedrock_world::block_states::network_id("stone").unwrap(),
+        );
         let pressed =
             bedrock_world::block_states::with_property(button, "button_pressed_bit", "true")
                 .unwrap();
@@ -10217,7 +12790,20 @@ mod block_sync_tests {
         placer.is_sneaking = true;
         manager.add_session(placer);
 
-        let lever = bedrock_world::block_states::network_id("lever").unwrap();
+        // A floor lever on its support block (components now break when the
+        // block they sit on disappears).
+        let lever = bedrock_world::block_states::with_property(
+            bedrock_world::block_states::network_id("lever").unwrap(),
+            "lever_direction",
+            "up_north_south",
+        )
+        .unwrap();
+        manager.world().set_block(
+            2,
+            79,
+            3,
+            bedrock_world::block_states::network_id("stone").unwrap(),
+        );
         assert!(manager.world().set_block(2, 80, 3, lever));
 
         let mut held = ItemStack::new(1, 1);
@@ -10696,6 +13282,22 @@ mod block_sync_tests {
     }
 
     #[test]
+    /// Java's `set_time` carries the game time as the "world age" and the
+    /// client animates the clouds from it, so it must count every tick and
+    /// ignore `/time set` (a constant age made the clouds snap back).
+    #[test]
+    fn game_time_counts_ticks_and_ignores_time_set() {
+        let manager = SessionManager::new();
+        let world = manager.world().clone();
+        let start = world.game_time();
+        world.tick();
+        world.tick();
+        assert_eq!(world.game_time(), start + 2);
+        world.set_time(6000);
+        assert_eq!(world.game_time(), start + 2, "game time is not the time of day");
+    }
+
+    #[test]
     fn tick_world_time_advances_and_broadcasts_every_interval_and_on_jump() {
         let manager = SessionManager::new();
         manager.add_session(joined_session(1, &[(0, 0)]));
@@ -11170,20 +13772,43 @@ mod block_sync_tests {
         idle.state = SessionState::PreSpawn;
         manager.add_session(idle);
 
+        // First pass: ordering only. Terrain comes from the off-tick pipeline,
+        // so the tick queues the PublisherUpdate and sends no chunk yet.
         let report = manager.tick();
-        assert_eq!(report.chunk_packets_queued, 1 + CHUNK_SENDING_PER_TICK);
+        assert_eq!(report.chunk_packets_queued, 1);
         {
             let map = manager.sessions.read();
             let viewer = &map[&1];
-            assert_eq!(
-                viewer.pending_outgoing.len(),
-                1 + CHUNK_SENDING_PER_TICK
-            );
+            assert_eq!(viewer.pending_outgoing.len(), 1);
             // PublisherUpdate precedes the chunks it unlocks.
             assert!(matches!(
                 viewer.pending_outgoing[0],
                 OutgoingPacket::NetworkChunkPublisherUpdate(_)
             ));
+            assert!(viewer.sent_chunks.is_empty());
+            assert!(map[&2].pending_outgoing.is_empty());
+            assert!(map[&2].sent_chunks.is_empty());
+        }
+
+        // The pipeline warms the columns the ordering pass selected (on rayon
+        // in production; synchronously here); the tick then streams them.
+        let warm: Vec<(i32, i32)> = manager
+            .sessions
+            .read()
+            .get(&1)
+            .expect("session")
+            .chunk_load_queue
+            .iter()
+            .take(2 * CHUNK_SENDING_PER_TICK)
+            .copied()
+            .collect();
+        manager.warm_chunks(&warm);
+
+        let report = manager.tick();
+        assert_eq!(report.chunk_packets_queued, CHUNK_SENDING_PER_TICK);
+        {
+            let map = manager.sessions.read();
+            let viewer = &map[&1];
             assert_eq!(
                 viewer.pending_outgoing
                     .iter()
@@ -11192,8 +13817,6 @@ mod block_sync_tests {
                 CHUNK_SENDING_PER_TICK
             );
             assert_eq!(viewer.sent_chunks.len(), CHUNK_SENDING_PER_TICK);
-            assert!(map[&2].pending_outgoing.is_empty());
-            assert!(map[&2].sent_chunks.is_empty());
         }
 
         // The tick flush (`flushGamePacketQueue`) encodes what the tick
@@ -11216,6 +13839,107 @@ mod block_sync_tests {
                 .filter(|p| matches!(p, OutgoingPacket::LevelChunk(_)))
                 .count(),
             CHUNK_SENDING_PER_TICK
+        );
+    }
+}
+
+#[cfg(test)]
+mod mob_look_sync_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// A mob standing on solid ground must be reported as such: the client
+    /// animates falling actors (chicken wing flap) from this flag.
+    #[test]
+    fn a_mob_on_the_ground_is_reported_as_on_ground() {
+        let manager = SessionManager::with_generator(Arc::new(FlatGenerator::new()));
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(1, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.position = Vector3f::new(2.5, 4.0, 4.5);
+        session.sent_chunks = [(0, 0)].into_iter().collect();
+        session.world = Arc::clone(manager.world());
+        manager.add_session(session);
+        manager
+            .world()
+            .spawn_mob("chicken", Vector3f::new(4.5, 4.0, 4.5))
+            .expect("chicken is spawnable");
+        manager.sync_entities();
+
+        // Let it fall to the flat surface first.
+        for _ in 0..20 {
+            manager.tick();
+            let mut map = manager.sessions.write();
+            map.get_mut(&1).unwrap().pending_outgoing.clear();
+        }
+
+        let mut deltas = 0;
+        for _ in 0..100 {
+            manager.tick();
+            let queued: Vec<OutgoingPacket> = {
+                let mut map = manager.sessions.write();
+                std::mem::take(&mut map.get_mut(&1).expect("session").pending_outgoing)
+            };
+            for packet in queued {
+                if let OutgoingPacket::MoveActorDelta(packet) = packet {
+                    deltas += 1;
+                    assert!(
+                        packet.on_ground,
+                        "a walking mob on flat ground is airborne on the wire"
+                    );
+                }
+            }
+        }
+        assert!(deltas > 0, "the chicken moved and sent packets");
+    }
+
+    /// `look_at_player` only turns the head; the wire must carry it: the
+    /// move packet's `head_yaw` differs from its body `yaw` once the mob
+    /// looks at the player.
+    #[test]
+    fn a_mob_looking_at_a_player_sends_its_head_yaw() {
+        let manager = SessionManager::with_generator(Arc::new(FlatGenerator::new()));
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(1, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.position = Vector3f::new(2.5, 4.0, 4.5);
+        session.sent_chunks = [(0, 0)].into_iter().collect();
+        session.world = Arc::clone(manager.world());
+        manager.add_session(session);
+        manager
+            .world()
+            .spawn_mob("cow", Vector3f::new(4.5, 4.0, 4.5))
+            .expect("cow is spawnable");
+        assert!(manager.sync_entities() > 0, "the cow spawns for the viewer");
+
+        let mut saw_head_yaw = false;
+        for _ in 0..2000 {
+            manager.tick();
+            let queued: Vec<OutgoingPacket> = {
+                let mut map = manager.sessions.write();
+                std::mem::take(&mut map.get_mut(&1).expect("session").pending_outgoing)
+            };
+            for packet in queued {
+                if let OutgoingPacket::MoveActorDelta(packet) = packet {
+                    if let (Some(yaw), Some(head_yaw)) = (packet.yaw, packet.head_yaw) {
+                        let delta = (head_yaw - yaw).abs();
+                        if delta.min(360.0 - delta) > 5.0 {
+                            saw_head_yaw = true;
+                        }
+                    }
+                }
+            }
+            if saw_head_yaw {
+                break;
+            }
+        }
+        assert!(
+            saw_head_yaw,
+            "the mob's head yaw must reach its viewers"
         );
     }
 }
@@ -12212,7 +14936,7 @@ mod engine_physics_tests {
 
         // The spawn reaches the viewer holding the chunk...
         manager.sync_entities();
-        {
+        let drop_id = {
             let map = manager.sessions.read();
             let add = map[&1]
                 .pending_outgoing
@@ -12224,7 +14948,12 @@ mod engine_physics_tests {
                 .expect("AddItemActorPacket for the drop");
             assert_eq!(add.item.network_id, 1, "stone");
             assert_eq!(add.item.count, 1);
-        }
+            assert_eq!(
+                add.actor_unique_id, add.actor_runtime_id as i64,
+                "actor_unique_id and actor_runtime_id must match"
+            );
+            add.actor_unique_id
+        };
 
         // ...and after its 10-tick pickup delay it enters the inventory.
         for _ in 0..20 {
@@ -12241,6 +14970,10 @@ mod engine_physics_tests {
             .pending_outgoing
             .iter()
             .any(|packet| matches!(packet, OutgoingPacket::TakeItemActor(_))));
+        assert!(map[&1].pending_outgoing.iter().any(|packet| match packet {
+            OutgoingPacket::RemoveActor(r) => r.actor_unique_id == drop_id,
+            _ => false,
+        }));
     }
 
     #[test]
@@ -12366,6 +15099,280 @@ mod engine_physics_tests {
                     .any(|packet| matches!(packet, OutgoingPacket::RemoveActor(_))),
                 "the actor is despawned once it turns back into a block"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement_item_tests {
+    use super::*;
+
+    fn resolve(network_id: i16) -> Option<u32> {
+        PlayerSession::resolve_block_id_from_item(network_id)
+    }
+
+    /// Redstone dust used to hit the `id > 0 => STONE` fallback and place
+    /// stone; every redstone item must resolve to its own block.
+    #[test]
+    fn redstone_items_resolve_to_their_blocks() {
+        let wire = bedrock_world::block_states::network_id("redstone_wire").unwrap();
+        assert_eq!(resolve(405), Some(wire), "redstone dust");
+        assert_eq!(
+            resolve(451),
+            bedrock_world::block_states::network_id("unpowered_repeater"),
+            "repeater item"
+        );
+        assert_eq!(
+            resolve(561),
+            bedrock_world::block_states::network_id("unpowered_comparator"),
+            "comparator item"
+        );
+        assert_eq!(
+            resolve(76),
+            bedrock_world::block_states::network_id("redstone_torch"),
+            "redstone torch item"
+        );
+        assert_eq!(
+            resolve(152),
+            bedrock_world::block_states::network_id("redstone_block"),
+            "block of redstone"
+        );
+        // Non-block items place nothing (they used to place stone).
+        assert_eq!(resolve(0), None);
+        assert_eq!(resolve(280), None, "stick is not a block");
+    }
+
+    use bedrock_protocol::packets::inventory_transaction::{
+        NetworkInventoryAction, TransactionData, ACTION_CLICK_BLOCK, SOURCE_CONTAINER, UseItemData,
+    };
+
+    const CLICKED: (i32, i32, i32) = (2, 79, 3);
+    const SPAWNED: (i32, i32, i32) = (2, 80, 3);
+
+    fn egg_stack(network_id: i16, count: u16) -> ItemStack {
+        ItemStack {
+            network_id,
+            count,
+            ..ItemStack::empty()
+        }
+    }
+
+    fn container_action(old: ItemStack, new: ItemStack) -> NetworkInventoryAction {
+        NetworkInventoryAction {
+            source_type: SOURCE_CONTAINER,
+            window_id: Some(0),
+            source_flags: None,
+            inventory_slot: 0,
+            old_item: old,
+            new_item: new,
+        }
+    }
+
+    /// A joined session holding `held` in hotbar slot 0, over a stone block
+    /// at [`CLICKED`] with air above it for the mob.
+    fn spawn_egg_session(manager: &SessionManager, held: ItemStack, gamemode: i32) {
+        let addr: std::net::SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let mut session = PlayerSession::new(1, addr);
+        session.state = SessionState::InGame;
+        session.joined = true;
+        session.spawned = true;
+        session.gamemode = gamemode;
+        session.world = Arc::clone(manager.world());
+        session.inventory.set_window_slot(WINDOW_ID_INVENTORY, 0, held);
+        manager.add_session(session);
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        manager.world().set_block(CLICKED.0, CLICKED.1, CLICKED.2, stone);
+    }
+
+    /// The right-click `UseItem` transaction for the top face of [`CLICKED`],
+    /// carrying the inventory `actions` the client sent with it.
+    fn use_spawn_egg(manager: &SessionManager, held: ItemStack, actions: Vec<NetworkInventoryAction>) {
+        let packet = InventoryTransactionPacket {
+            request_id: 0,
+            request_changed_slots: None,
+            actions,
+            data: TransactionData::UseItem(UseItemData {
+                action_type: ACTION_CLICK_BLOCK,
+                trigger_type: 0,
+                block_position: CLICKED,
+                face: 1,
+                hotbar_slot: 0,
+                hand: 0,
+                item_in_hand: held,
+                player_position: (2.5, 80.06, 3.5),
+                click_position: (2.5, 80.0, 3.5),
+                block_runtime_id: 0,
+                client_interact_prediction: 0,
+                client_cooldown_state: 0,
+            }),
+        };
+        let mut writer = Writer::new();
+        packet.encode_payload(&mut writer);
+        manager
+            .handle_session_packet(1, 0x1E, &writer.into_bytes())
+            .expect("use item");
+    }
+
+    fn slot_zero(manager: &SessionManager) -> ItemStack {
+        manager.sessions.read()[&1]
+            .inventory
+            .window_slot(WINDOW_ID_INVENTORY, 0)
+            .cloned()
+            .expect("hotbar slot 0")
+    }
+
+    /// The egg summons its mob in the adjacent cell and never places the
+    /// egg's `block_runtime_id` (0 = air) there.
+    #[test]
+    fn a_spawn_egg_summons_its_mob_and_places_no_block() {
+        let manager = SessionManager::new();
+        let egg = crate::inventory::item_network_id("minecraft:zombie_spawn_egg").unwrap();
+        spawn_egg_session(&manager, egg_stack(egg, 1), 1);
+
+        use_spawn_egg(&manager, egg_stack(egg, 1), vec![]);
+
+        assert_eq!(manager.world().entity_count(), 1);
+        let entity = manager
+            .world()
+            .entities_snapshot()
+            .pop()
+            .expect("the egg summoned a mob");
+        assert_eq!(entity.network_type_id(), "minecraft:zombie");
+        // Adjacent to the clicked top face, centred in the cell.
+        assert_eq!(entity.position.x, 2.5);
+        assert_eq!(entity.position.y, 80.0);
+        assert_eq!(entity.position.z, 3.5);
+        assert_eq!(
+            manager.world().block_at(SPAWNED.0, SPAWNED.1, SPAWNED.2),
+            bedrock_world::block_id::AIR
+        );
+    }
+
+    /// In survival the inventory action of the transaction removes one egg
+    /// and the server summons one mob; neither side does it twice.
+    #[test]
+    fn survival_spawn_eggs_spawn_one_mob_per_egg_consumed() {
+        let manager = SessionManager::new();
+        let egg = crate::inventory::item_network_id("minecraft:zombie_spawn_egg").unwrap();
+        spawn_egg_session(&manager, egg_stack(egg, 2), 0);
+
+        use_spawn_egg(
+            &manager,
+            egg_stack(egg, 2),
+            vec![container_action(egg_stack(egg, 2), egg_stack(egg, 1))],
+        );
+        assert_eq!(manager.world().entity_count(), 1);
+        assert_eq!(slot_zero(&manager), egg_stack(egg, 1));
+
+        use_spawn_egg(
+            &manager,
+            egg_stack(egg, 1),
+            vec![container_action(egg_stack(egg, 1), ItemStack::empty())],
+        );
+        assert_eq!(manager.world().entity_count(), 2);
+        assert!(slot_zero(&manager).is_empty());
+
+        // A transaction whose old stack no longer matches is rejected whole:
+        // no egg is consumed and no mob appears.
+        use_spawn_egg(
+            &manager,
+            egg_stack(egg, 2),
+            vec![container_action(egg_stack(egg, 2), egg_stack(egg, 1))],
+        );
+        assert_eq!(manager.world().entity_count(), 2);
+        assert!(slot_zero(&manager).is_empty());
+    }
+
+    /// Creative does not decrement the stack (the server never edits it).
+    #[test]
+    fn creative_spawn_eggs_are_not_consumed() {
+        let manager = SessionManager::new();
+        let egg = crate::inventory::item_network_id("minecraft:cow_spawn_egg").unwrap();
+        spawn_egg_session(&manager, egg_stack(egg, 2), 1);
+
+        use_spawn_egg(&manager, egg_stack(egg, 2), vec![]);
+
+        assert_eq!(manager.world().entity_count(), 1);
+        assert_eq!(slot_zero(&manager), egg_stack(egg, 2));
+    }
+}
+
+/// `BlockEventHook` backed by the plugin manager.
+///
+/// The world tick (fluid and random-tick passes) calls it synchronously before
+/// applying a change and with no world lock held, so a listener can call back
+/// into the world. It reads the same plugin slot [`SessionManager`] installs in
+/// [`SessionManager::set_plugin_manager`]; holding a `WorldState` here instead
+/// would create a reference cycle (the hook lives inside that world).
+struct SessionBlockEvents {
+    plugins: Arc<RwLock<Option<Arc<PluginManager>>>>,
+    world_name: String,
+}
+
+impl crate::world_state::BlockEventHook for SessionBlockEvents {
+    fn spread(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        source_id: u32,
+        new_id: u32,
+    ) -> bool {
+        let Some(plugins) = self.plugins.read().clone() else {
+            return true;
+        };
+        if !plugins.has_listeners("BlockSpreadEvent") {
+            return true;
+        }
+        let mut event = php_plugin_bridge::BlockSpreadEvent::new(
+            self.world_name.clone(),
+            x,
+            y,
+            z,
+            block_id,
+            source_id,
+            new_id,
+        );
+        match plugins.dispatch_event_sync(&mut event) {
+            Ok(_) => !event.cancelled,
+            Err(error) => {
+                warn!("BlockSpreadEvent failed: {}", error);
+                true
+            }
+        }
+    }
+
+    fn form(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        causing_id: u32,
+        new_id: u32,
+    ) -> bool {
+        let Some(plugins) = self.plugins.read().clone() else {
+            return true;
+        };
+        if !plugins.has_listeners("BlockFormEvent") {
+            return true;
+        }
+        let mut event = php_plugin_bridge::BlockFormEvent::new(
+            self.world_name.clone(),
+            x,
+            y,
+            z,
+            block_id,
+            causing_id,
+            new_id,
+        );
+        match plugins.dispatch_event_sync(&mut event) {
+            Ok(_) => !event.cancelled,
+            Err(error) => {
+                warn!("BlockFormEvent failed: {}", error);
+                true
+            }
         }
     }
 }

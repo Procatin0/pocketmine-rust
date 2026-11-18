@@ -12,27 +12,9 @@ declare(strict_types=1);
 
 $runtimeDirectory = __DIR__;
 
-$runtimeFiles = [
-    'math.php',
-    'text.php',
-    'permission.php',
-    'config.php',
-    'thread.php',
-    'scheduler.php',
-    'command.php',
-    'item.php',
-    'world.php',
-    'player.php',
-    'scoreboard.php',
-    'bossbar.php',
-    'chat.php',
-    'core.php',
-    'event.php',
-    'PlayerDataSaveEvent.php',
-    'plugin.php',
-    'autoload.php',
-    'ipc.php',
-];
+// Shared with `thread.php`, which has to re-declare the runtime inside child
+// threads (see `CommonThreadPartsTrait::loadRuntimeForThread()`).
+$runtimeFiles = require $runtimeDirectory . DIRECTORY_SEPARATOR . 'runtime_files.php';
 
 foreach ($runtimeFiles as $runtimeFile) {
     $path = $runtimeDirectory . DIRECTORY_SEPARATOR . $runtimeFile;

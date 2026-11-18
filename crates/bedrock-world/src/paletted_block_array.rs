@@ -51,6 +51,48 @@ impl PalettedBlockArray {
         }
     }
 
+    /// Fills `y_start..=y_end` of column `(x, z)` with `val`.
+    ///
+    /// Same result as calling [`Self::set`] per cell, but the palette entry is
+    /// resolved once and the word cursor advances by one block instead of
+    /// recomputing `index / blocks_per_word` (two integer divisions) per
+    /// block: the terrain generator fills tens of thousands of cells per
+    /// chunk, so this is the difference between a few milliseconds and a few
+    /// microseconds per column.
+    pub fn fill_y(&mut self, x: usize, z: usize, y_start: usize, y_end: usize, val: u32) {
+        let start = y_start.min(16);
+        let end = (y_end + 1).min(16);
+        if start >= end {
+            return;
+        }
+        let palette_index = if let Some(pos) = self.palette.iter().position(|&p| p == val) {
+            pos as u32
+        } else {
+            self.palette.push(val);
+            let pos = (self.palette.len() - 1) as u32;
+            self.check_resize();
+            pos
+        };
+        if self.bits_per_block == 0 {
+            return;
+        }
+        let bpb = self.bits_per_block as usize;
+        let blocks_per_word = 32 / bpb;
+        let mask = (1u32 << bpb) - 1;
+        let value = palette_index & mask;
+        let index = (x << 8) | (z << 4) | start;
+        let mut word = index / blocks_per_word;
+        let mut shift = (index % blocks_per_word) * bpb;
+        for _ in start..end {
+            self.words[word] = (self.words[word] & !(mask << shift)) | (value << shift);
+            shift += bpb;
+            if shift >= 32 {
+                shift = 0;
+                word += 1;
+            }
+        }
+    }
+
     pub fn words_count_for_bpb(bpb: u8) -> Option<usize> {
         match bpb {
             0 => Some(0),

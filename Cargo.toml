@@ -9,6 +9,7 @@ members = [
     "crates/php-plugin-bridge",
     "crates/java-protocol",
     "crates/java-bridge",
+    "crates/bds-probe",
 ]
 
 [workspace.dependencies]

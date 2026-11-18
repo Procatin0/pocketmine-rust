@@ -23,6 +23,7 @@
 
 pub mod bossbar;
 pub mod display;
+pub mod entity_ids;
 pub mod hooks;
 pub mod profile;
 pub mod server;
@@ -30,8 +31,8 @@ pub mod session;
 pub mod wire;
 
 pub use hooks::{
-    BlockChange, BossBarFrame, ChatOutcome, LegacyChunk, LoadedData, ModernChunkData,
-    PlayerSnapshot, ScoreboardFrame, ServerHooks,
+    ActorSnapshot, BlockChange, BossBarFrame, ChatOutcome, LegacyChunk, LoadedData,
+    ModernChunkData, PlayerSnapshot, ScoreboardFrame, ServerHooks,
 };
 pub use server::JavaServer;
-pub use session::{EntityTarget, JavaSession, SessionState, TabTarget};
+pub use session::{ActorTarget, EntityTarget, JavaSession, SessionState, TabTarget};

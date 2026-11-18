@@ -128,16 +128,6 @@ static SANDY_COVER: &[u32] = &[
     block_id::SANDSTONE,
 ];
 
-/// Badlands surface: PocketMine has no red sand/terracotta block in
-/// `block_id`, so the desert's sand/sandstone stack stands in.
-static BADLANDS_COVER: &[u32] = &[
-    block_id::SAND,
-    block_id::SAND,
-    block_id::SAND,
-    block_id::SANDSTONE,
-    block_id::SANDSTONE,
-];
-
 static SNOWY_COVER: &[u32] = &[
     block_id::SNOW_LAYER,
     block_id::GRASS_BLOCK,
@@ -162,7 +152,70 @@ static GRAVEL_COVER: &[u32] = &[
     block_id::GRAVEL,
 ];
 
+/// Old growth taiga: podzol over dirt. The populator mixes it with grass and
+/// coarse dirt in patches, the way vanilla's `podzol`/`coarse_dirt` surface
+/// rules do, so the forest floor is not one flat brown sheet.
+static PODZOL_COVER: &[u32] = &[
+    block_id::PODZOL,
+    block_id::DIRT,
+    block_id::DIRT,
+    block_id::DIRT,
+    block_id::DIRT,
+];
+
+/// Badlands: red sand over red sandstone. Vanilla layers terracotta bands under
+/// the sand; the banded clay is not part of the block set, so the sandstone
+/// underneath keeps the warm, layered look without inventing a block.
+static RED_SAND_COVER: &[u32] = &[
+    block_id::RED_SAND,
+    block_id::RED_SAND,
+    block_id::RED_SAND,
+    block_id::RED_SANDSTONE,
+    block_id::RED_SANDSTONE,
+];
+
+/// Bare rock: stony peaks and stone shores.
+static STONE_COVER: &[u32] = &[
+    block_id::STONE,
+    block_id::STONE,
+    block_id::STONE,
+    block_id::STONE,
+    block_id::STONE,
+];
+
+/// Gravelly mountains: vanilla puts gravel on top of the stone.
+static GRAVELLY_COVER: &[u32] = &[
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+    block_id::GRAVEL,
+    block_id::STONE,
+    block_id::STONE,
+];
+
+/// Above the tree line: a snow layer over bare stone.
+static SNOWY_STONE_COVER: &[u32] = &[
+    block_id::SNOW_LAYER,
+    block_id::STONE,
+    block_id::STONE,
+    block_id::STONE,
+    block_id::STONE,
+];
+
+/// Snowy beach: snow over sand, not over grass.
+static SNOWY_SAND_COVER: &[u32] = &[
+    block_id::SNOW_LAYER,
+    block_id::SAND,
+    block_id::SAND,
+    block_id::SANDSTONE,
+    block_id::SANDSTONE,
+];
+
 static _EMPTY_COVER: &[u32] = &[];
+
+/// Bare rock cover, for surfaces that are too steep to hold soil.
+pub fn stone_cover() -> &'static [u32] {
+    STONE_COVER
+}
 
 pub fn get_biome_info(id: u8) -> BiomeInfo {
     match id {
@@ -216,7 +269,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Taiga",
             min_elevation: 63.0,
             max_elevation: 81.0,
-            ground_cover: SNOWY_COVER,
+            ground_cover: GRASSY_COVER,
             temperature: 0.05,
             rainfall: 0.8,
         },
@@ -270,7 +323,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Badlands",
             min_elevation: 63.0,
             max_elevation: 120.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.0,
         },
@@ -279,7 +332,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Wooded Badlands Plateau",
             min_elevation: 63.0,
             max_elevation: 110.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.2,
         },
@@ -288,7 +341,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Badlands Plateau",
             min_elevation: 63.0,
             max_elevation: 100.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.0,
         },
@@ -297,7 +350,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Eroded Badlands",
             min_elevation: 63.0,
             max_elevation: 127.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.0,
         },
@@ -306,7 +359,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Modified Wooded Badlands Plateau",
             min_elevation: 63.0,
             max_elevation: 110.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.2,
         },
@@ -315,7 +368,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Modified Badlands Plateau",
             min_elevation: 63.0,
             max_elevation: 100.0,
-            ground_cover: BADLANDS_COVER,
+            ground_cover: RED_SAND_COVER,
             temperature: 2.0,
             rainfall: 0.0,
         },
@@ -382,7 +435,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Stone Shore",
             min_elevation: 63.0,
             max_elevation: 90.0,
-            ground_cover: GRAVEL_COVER,
+            ground_cover: STONE_COVER,
             temperature: 0.2,
             rainfall: 0.3,
         },
@@ -391,7 +444,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Snowy Beach",
             min_elevation: 62.0,
             max_elevation: 64.0,
-            ground_cover: SNOWY_COVER,
+            ground_cover: SNOWY_SAND_COVER,
             temperature: 0.05,
             rainfall: 0.3,
         },
@@ -418,7 +471,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Giant Tree Taiga",
             min_elevation: 63.0,
             max_elevation: 86.0,
-            ground_cover: GRASSY_COVER,
+            ground_cover: PODZOL_COVER,
             temperature: 0.3,
             rainfall: 0.8,
         },
@@ -535,7 +588,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Gravelly Mountains",
             min_elevation: 63.0,
             max_elevation: 140.0,
-            ground_cover: GRAVEL_COVER,
+            ground_cover: GRAVELLY_COVER,
             temperature: 0.2,
             rainfall: 0.3,
         },
@@ -571,7 +624,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Giant Spruce Taiga",
             min_elevation: 63.0,
             max_elevation: 86.0,
-            ground_cover: GRASSY_COVER,
+            ground_cover: PODZOL_COVER,
             temperature: 0.25,
             rainfall: 0.8,
         },
@@ -589,7 +642,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Jagged Peaks",
             min_elevation: 90.0,
             max_elevation: 200.0,
-            ground_cover: SNOWY_COVER,
+            ground_cover: SNOWY_STONE_COVER,
             temperature: 0.05,
             rainfall: 0.3,
         },
@@ -598,7 +651,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Frozen Peaks",
             min_elevation: 90.0,
             max_elevation: 200.0,
-            ground_cover: SNOWY_COVER,
+            ground_cover: SNOWY_STONE_COVER,
             temperature: 0.05,
             rainfall: 0.3,
         },
@@ -652,7 +705,7 @@ pub fn get_biome_info(id: u8) -> BiomeInfo {
             name: "Stony Peaks",
             min_elevation: 70.0,
             max_elevation: 160.0,
-            ground_cover: GRAVEL_COVER,
+            ground_cover: STONE_COVER,
             temperature: 1.0,
             rainfall: 0.3,
         },
@@ -946,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn badlands_family_uses_sandy_cover_and_hot_dry_climate() {
+    fn badlands_family_uses_red_sand_cover_and_hot_dry_climate() {
         for id in [
             BADLANDS,
             WOODED_BADLANDS_PLATEAU,
@@ -959,10 +1012,23 @@ mod tests {
             assert_eq!(info.id, id, "bioma {id}");
             assert_eq!(info.temperature, 2.0, "bioma {id}: calor como el desierto");
             assert!(info.rainfall < info.temperature, "bioma {id}: seco");
+            // Vanilla badlands are red sand over terracotta bands; with no
+            // terracotta in the block set the red sandstone underneath stands in
+            // for it, and the top is red sand, not the desert's yellow.
+            assert_eq!(
+                info.ground_cover[0],
+                block_id::RED_SAND,
+                "bioma {id}: arena roja arriba"
+            );
             assert!(
-                info.ground_cover.iter().any(|&b| b == block_id::SAND)
-                    && info.ground_cover.iter().any(|&b| b == block_id::SANDSTONE),
-                "bioma {id}: cubierta arenosa (sin red sand en block_id)"
+                info.ground_cover
+                    .iter()
+                    .any(|&b| b == block_id::RED_SANDSTONE),
+                "bioma {id}: roca roja debajo"
+            );
+            assert!(
+                !info.ground_cover.iter().any(|&b| b == block_id::SAND),
+                "bioma {id}: nada de arena amarilla"
             );
         }
         // Plains/ocean references for the comparison: grass vs gravel.

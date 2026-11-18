@@ -395,6 +395,19 @@ namespace pocketmine\math {
                 && $vector->z >= $this->minZ && $vector->z <= $this->maxZ;
         }
 
+        /** PM `AxisAlignedBB::expandedCopy()`: copia crecida en cada eje. */
+        public function expandedCopy(float $x, float $y, float $z): AxisAlignedBB
+        {
+            return new AxisAlignedBB(
+                $this->minX - $x,
+                $this->minY - $y,
+                $this->minZ - $z,
+                $this->maxX + $x,
+                $this->maxY + $y,
+                $this->maxZ + $z
+            );
+        }
+
         public function intersectsWith(AxisAlignedBB $bb): bool
         {
             return $this->maxX > $bb->minX && $this->minX < $bb->maxX
@@ -402,10 +415,200 @@ namespace pocketmine\math {
                 && $this->maxZ > $bb->minZ && $this->minZ < $bb->maxZ;
         }
 
+        public static function one(): self
+        {
+            return new self(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+        }
+
+        public function offset(float $x, float $y, float $z): self
+        {
+            $this->minX += $x;
+            $this->minY += $y;
+            $this->minZ += $z;
+            $this->maxX += $x;
+            $this->maxY += $y;
+            $this->maxZ += $z;
+            return $this;
+        }
+
+        public function contract(float $x, float $y, float $z): self
+        {
+            $this->minX += $x;
+            $this->minY += $y;
+            $this->minZ += $z;
+            $this->maxX -= $x;
+            $this->maxY -= $y;
+            $this->maxZ -= $z;
+            return $this;
+        }
+
+        public function extend(int $facing, float $dist): self
+        {
+            match ($facing) {
+                Facing::DOWN => $this->minY -= $dist,
+                Facing::UP => $this->maxY += $dist,
+                Facing::NORTH => $this->minZ -= $dist,
+                Facing::SOUTH => $this->maxZ += $dist,
+                Facing::WEST => $this->minX -= $dist,
+                Facing::EAST => $this->maxX += $dist,
+                default => throw new \InvalidArgumentException("Invalid facing $facing"),
+            };
+            return $this;
+        }
+
+        public function trim(int $facing, float $dist): self
+        {
+            return $this->extend($facing, -$dist);
+        }
+
+        public function squash(int $axis, float $dist): self
+        {
+            match ($axis) {
+                Axis::X => $this->contract($dist, 0.0, 0.0),
+                Axis::Y => $this->contract(0.0, $dist, 0.0),
+                Axis::Z => $this->contract(0.0, 0.0, $dist),
+                default => throw new \InvalidArgumentException("Invalid axis $axis"),
+            };
+            return $this;
+        }
+
+        public function getAverageEdgeLength(): float
+        {
+            return (($this->maxX - $this->minX) + ($this->maxY - $this->minY) + ($this->maxZ - $this->minZ)) / 3.0;
+        }
+
+        public function isCube(): bool
+        {
+            $x = $this->maxX - $this->minX;
+            $y = $this->maxY - $this->minY;
+            $z = $this->maxZ - $this->minZ;
+            return abs($x - $y) < 0.00001 && abs($y - $z) < 0.00001;
+        }
+
+        public function calculateIntercept(Vector3 $pos1, Vector3 $pos2): ?RayTraceResult
+        {
+            return null;
+        }
+
         public function __toString(): string
         {
             return 'AxisAlignedBB(' . $this->minX . ',' . $this->minY . ',' . $this->minZ . ' - '
                 . $this->maxX . ',' . $this->maxY . ',' . $this->maxZ . ')';
+        }
+    }
+
+    final class Axis
+    {
+        public const X = 0;
+        public const Y = 1;
+        public const Z = 2;
+
+        private function __construct()
+        {
+        }
+    }
+
+    final class Facing
+    {
+        public const DOWN = 0;
+        public const UP = 1;
+        public const NORTH = 2;
+        public const SOUTH = 3;
+        public const WEST = 4;
+        public const EAST = 5;
+
+        public const ALL = [self::DOWN, self::UP, self::NORTH, self::SOUTH, self::WEST, self::EAST];
+        public const HORIZONTAL = [self::NORTH, self::SOUTH, self::WEST, self::EAST];
+
+        public const OFFSET = [
+            self::DOWN => [0, -1, 0],
+            self::UP => [0, 1, 0],
+            self::NORTH => [0, 0, -1],
+            self::SOUTH => [0, 0, 1],
+            self::WEST => [-1, 0, 0],
+            self::EAST => [1, 0, 0],
+        ];
+
+        public const OPPOSITE = [
+            self::DOWN => self::UP,
+            self::UP => self::DOWN,
+            self::NORTH => self::SOUTH,
+            self::SOUTH => self::NORTH,
+            self::WEST => self::EAST,
+            self::EAST => self::WEST,
+        ];
+
+        public const AXIS = [
+            self::DOWN => Axis::Y,
+            self::UP => Axis::Y,
+            self::NORTH => Axis::Z,
+            self::SOUTH => Axis::Z,
+            self::WEST => Axis::X,
+            self::EAST => Axis::X,
+        ];
+
+        private function __construct()
+        {
+        }
+
+        public static function opposite(int $facing): int
+        {
+            return self::OPPOSITE[$facing] ?? throw new \InvalidArgumentException("Invalid facing $facing");
+        }
+
+        public static function axis(int $facing): int
+        {
+            return self::AXIS[$facing] ?? throw new \InvalidArgumentException("Invalid facing $facing");
+        }
+
+        public static function rotateY(int $facing, bool $clockwise): int
+        {
+            return match ($facing) {
+                self::NORTH => $clockwise ? self::EAST : self::WEST,
+                self::EAST => $clockwise ? self::SOUTH : self::NORTH,
+                self::SOUTH => $clockwise ? self::WEST : self::EAST,
+                self::WEST => $clockwise ? self::NORTH : self::SOUTH,
+                default => throw new \InvalidArgumentException("Invalid horizontal facing $facing"),
+            };
+        }
+
+        public static function rotateX(int $facing, bool $clockwise): int
+        {
+            return match ($facing) {
+                self::UP => $clockwise ? self::NORTH : self::SOUTH,
+                self::NORTH => $clockwise ? self::DOWN : self::UP,
+                self::DOWN => $clockwise ? self::SOUTH : self::NORTH,
+                self::SOUTH => $clockwise ? self::UP : self::DOWN,
+                default => throw new \InvalidArgumentException("Invalid facing for X rotation $facing"),
+            };
+        }
+
+        public static function rotateZ(int $facing, bool $clockwise): int
+        {
+            return match ($facing) {
+                self::UP => $clockwise ? self::EAST : self::WEST,
+                self::EAST => $clockwise ? self::DOWN : self::UP,
+                self::DOWN => $clockwise ? self::WEST : self::EAST,
+                self::WEST => $clockwise ? self::UP : self::DOWN,
+                default => throw new \InvalidArgumentException("Invalid facing for Z rotation $facing"),
+            };
+        }
+
+        public static function validate(int $facing): void
+        {
+            if (!isset(self::OPPOSITE[$facing])) {
+                throw new \InvalidArgumentException("Invalid facing $facing");
+            }
+        }
+    }
+
+    class RayTraceResult
+    {
+        public function __construct(
+            public AxisAlignedBB $boundingBox,
+            public int $hitFace,
+            public Vector3 $hitVector
+        ) {
         }
     }
 }
@@ -416,12 +619,18 @@ namespace pocketmine\world {
 
     class Position extends Vector3
     {
+        protected ?\pocketmine\world\World $world = null;
         private string $worldName;
 
-        public function __construct(float $x = 0.0, float $y = 0.0, float $z = 0.0, string $worldName = '')
+        public function __construct(float $x = 0.0, float $y = 0.0, float $z = 0.0, mixed $world = null)
         {
             parent::__construct($x, $y, $z);
-            $this->worldName = $worldName;
+            if ($world instanceof \pocketmine\world\World) {
+                $this->world = $world;
+                $this->worldName = $world->getFolderName();
+            } else {
+                $this->worldName = (string)$world;
+            }
         }
 
         public function getWorldName(): string
@@ -429,8 +638,16 @@ namespace pocketmine\world {
             return $this->worldName;
         }
 
+        public function isValid(): bool
+        {
+            return $this->world !== null || $this->worldName !== '';
+        }
+
         public function isWorldLoaded(): bool
         {
+            if ($this->world !== null) {
+                return $this->world->isLoaded();
+            }
             if (!class_exists(\pocketmine\Server::class)) {
                 return false;
             }
@@ -444,6 +661,9 @@ namespace pocketmine\world {
 
         public function getWorld()
         {
+            if ($this->world !== null) {
+                return $this->world;
+            }
             if (!class_exists(\pocketmine\Server::class)) {
                 return null;
             }

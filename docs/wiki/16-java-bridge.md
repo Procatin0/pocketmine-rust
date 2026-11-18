@@ -208,6 +208,33 @@ Vistas: paquetes `spawn_entity` (0x01 en modernos, `lpVec3` en
 (93 en 769 … 99 en 775, componente Optional tipo 6 + presencia
 `0x01` antes del NBT anónimo) y `entity_teleport` (119/118/123/125).
 
+Entidades que **no** son jugadores (bloques cayendo, animales, mobs,
+items, proyectiles, TNT, orbes de XP): `ServerHooks::actor_snapshots`
+(`WorldState::entities_snapshot`) + `server::actor_targets_for` +
+`JavaSession::sync_actors`. El id Java del actor lo asigna
+`ServerHooks::actor_entity_id` (desde `2_000_000`, rango separado del
+de jugadores) para que todos los observadores usen el mismo.
+`spawn_entity.type` es el id de la **registry**
+`minecraft:entity_type`, que cambia en cada versión: lo resuelve
+`java_bridge::entity_ids::entity_type_id` con tablas por protocolo
+(769/770/773/774/775, generadas del `entities.json` de
+minecraft-data; `player` = 147/148/151/155/155 coincide con
+`profile::player_entity_type`). Un tipo sin equivalente Java
+(`minecraft:ice_bomb`) o un cliente 340 no recibe el actor.
+
+Un bloque cayendo llega como `falling_block` con su **block state
+Java global** en el campo `data` de `spawn_entity`
+(`FallingBlockEntity::getAddEntityPacket` envía
+`Block.getId(blockState)`; no hay metadato de bloque en 1.21+), así
+que la sesión lo obtiene de `modern_block_state(network_id, protocol)`
+usando el `block_id` Bedrock de la entidad. Los mobs se spawnean con
+su tipo y, si tienen `name_tag`, un `entity_metadata` con
+`custom_name`.
+
+Los items se envían como entidad `item` sin `ItemStack` en el
+metadato: el cliente los crea pero no dibuja el objeto (pendiente:
+metadato de slot para items).
+
 Colas de bloques Bedrock → Java y Java → Bedrock son
 independientes en `WorldState` (cap `512`, descarta lo más
 antiguo): drenar Java no roba cambios a Bedrock ni al revés.

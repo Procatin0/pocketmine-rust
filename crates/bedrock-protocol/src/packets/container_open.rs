@@ -20,8 +20,22 @@ pub const CONTAINER_TYPE_INVENTORY: u8 = 0xFF;
 pub const CONTAINER_TYPE_CONTAINER: u8 = 0x00;
 /// `WindowTypes::WORKBENCH`: crafting table.
 pub const CONTAINER_TYPE_WORKBENCH: u8 = 0x01;
+/// `WindowTypes::FURNACE`.
+pub const CONTAINER_TYPE_FURNACE: u8 = 0x02;
+/// `WindowTypes::BREWING_STAND`.
+pub const CONTAINER_TYPE_BREWING_STAND: u8 = 0x04;
 /// `WindowTypes::ANVIL`.
 pub const CONTAINER_TYPE_ANVIL: u8 = 0x05;
+/// `WindowTypes::DISPENSER`.
+pub const CONTAINER_TYPE_DISPENSER: u8 = 0x06;
+/// `WindowTypes::DROPPER`.
+pub const CONTAINER_TYPE_DROPPER: u8 = 0x07;
+/// `WindowTypes::HOPPER`.
+pub const CONTAINER_TYPE_HOPPER: u8 = 0x08;
+/// `WindowTypes::BLAST_FURNACE`.
+pub const CONTAINER_TYPE_BLAST_FURNACE: u8 = 0x1B;
+/// `WindowTypes::SMOKER`.
+pub const CONTAINER_TYPE_SMOKER: u8 = 0x1C;
 
 /// `ActorUniqueID` used by `ContainerOpenPacket::blockInv` for block
 /// containers (no actor owns the screen).

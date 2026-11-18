@@ -210,6 +210,9 @@ pub enum CommandAction {
     },
     Teleport { target: String, position: (f64, f64, f64), yaw: Option<f32>, pitch: Option<f32> },
     TeleportToSpawn { target: String },
+    /// `/tpsbar`: toggles Purpur's TPS/MSPT/ping boss bar for `target` and
+    /// reports the resulting state to `notify` (a player name or `CONSOLE`).
+    TpsBar { target: String, notify: String },
     Broadcast { message: String },
     Message { target: String, message: String },
     Kick { target: String, reason: String },
@@ -218,6 +221,16 @@ pub enum CommandAction {
     SetWeather {
         state: WeatherState,
         duration_ticks: i32,
+    },
+    /// Bedrock `/summon`: spawn an entity with the resolved position,
+    /// rotation and optional name tag (`spawnEvent` is accepted and ignored:
+    /// this port has no behavior-pack event table).
+    Summon {
+        entity: String,
+        position: (f32, f32, f32),
+        yaw: f32,
+        pitch: f32,
+        name_tag: String,
     },
     SetWorldSpawn { x: i32, y: i32, z: i32 },
     SetOp { target: String, op: bool },
@@ -641,6 +654,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Reads back the server's performance.",
     },
     CommandInfo {
+        name: "tpsbar",
+        aliases: &[],
+        usage: "/tpsbar [player|selector]",
+        description: "Toggles a boss bar showing TPS, MSPT and ping",
+    },
+    CommandInfo {
         name: "effect",
         aliases: &[],
         usage: "/effect <player> <effect> [seconds] [amplifier] [hideParticles] OR /effect <player> clear OR /effect <player> <effect> infinite [amplifier] [hideParticles]",
@@ -671,6 +690,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         description: "Records timings to see performance of the server.",
     },
     CommandInfo {
+        name: "profiler",
+        aliases: &["spark", "prof"],
+        usage: "/profiler <start [seconds]|stop|report|status|reset>",
+        description: "Profiles the tick loop to find what causes lag",
+    },
+    CommandInfo {
         name: "gc",
         aliases: &[],
         usage: "/gc",
@@ -693,6 +718,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         aliases: &[],
         usage: "/weather <clear|rain|thunder> [duration]",
         description: "Changes world weather",
+    },
+    CommandInfo {
+        name: "summon",
+        aliases: &[],
+        usage: "/summon <entity> [spawnPos: x y z] [yRot: value] [xRot: value] [spawnEvent: string] [nameTag: string]",
+        description: "Summons an entity",
     },
     CommandInfo {
         name: "op",
@@ -811,12 +842,14 @@ pub fn handle_command(
         "save-on" => Some(set_auto_save(source, true)),
         "save-off" => Some(set_auto_save(source, false)),
         "tps" => Some(tps(source)),
+        "tpsbar" => Some(tpsbar(source, players, &args)),
         "status" => Some(status(source, players)),
         "effect" => Some(effect(source, players, &args)),
         "enchant" => Some(enchant(source, players, &args)),
         "xp" => Some(xp(source, players, &args)),
         "particle" => Some(particle(source, players, &args)),
         "timings" => Some(timings(source, &args)),
+        "profiler" | "spark" | "prof" => Some(profiler(source, &args)),
         "gc" => Some(gc(source)),
         "dumpmemory" => Some(dumpmemory(source, &args)),
         "time" => Some(time(source, &args)),
@@ -824,6 +857,7 @@ pub fn handle_command(
         "scoreboard" | "sb" => Some(scoreboard(source, players, &args)),
         "transferserver" => Some(transfer(source, &args)),
         "weather" => Some(weather(source, &args)),
+        "summon" => Some(summon(source, &args)),
         "op" => Some(set_op(&args, true)),
         "deop" => Some(set_op(&args, false)),
         "version" | "ver" | "about" => Some(version(source, &args)),
@@ -2311,6 +2345,116 @@ fn weather(source: &CommandSource, args: &[&str]) -> CommandOutput {
     )
 }
 
+/// Bedrock `/summon`.
+///
+/// Faithful to the Bedrock Dedicated Server overloads:
+///
+/// ```text
+/// /summon <entityType> [spawnPos: x y z] [yRot: value] [xRot: value] [spawnEvent: string] [nameTag: string]
+/// /summon <entityType> <nameTag> [spawnPos: x y z]
+/// ```
+///
+/// `spawnPos` defaults to the execution position and accepts `~`/`^`; `yRot`
+/// and `xRot` accept `~` (relative to 0 for sources other than players) and
+/// default to `0`; `spawnEvent` is parsed and ignored because this port has no
+/// behavior-pack event table; the remaining token(s) are the name tag, with
+/// optional double quotes. An unknown entity type is a failure in this port
+/// (BDS rejects it while parsing), reported with the vanilla failure text.
+fn summon(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if !source.can_use_privileged() {
+        return permission_error();
+    }
+    let Some(entity) = args.first().copied() else {
+        return usage("summon");
+    };
+    if crate::entity_types::lookup(entity).is_none() || entity.eq_ignore_ascii_case("minecraft:player")
+    {
+        return error("Unable to summon object.");
+    }
+
+    let origin = source.position;
+    let (mut position, mut rest) = match args.get(1..4).and_then(|tokens| {
+        parse_position(tokens, origin).map(|position| (position, &args[4..]))
+    }) {
+        Some(parsed) => parsed,
+        None => (origin, &args[1..]),
+    };
+
+    // `/summon <entity> <nameTag> [spawnPos]`: the second token is a name, not
+    // a coordinate, so the position may follow it.
+    let mut name_tag = String::new();
+    if rest == &args[1..] {
+        if let Some(first) = rest.first() {
+            if rest.len() >= 4 {
+                if let Some(parsed) = parse_position(&rest[1..4], origin) {
+                    position = parsed;
+                    name_tag = unquote(first);
+                    rest = &rest[4..];
+                }
+            }
+            if name_tag.is_empty() && rest.len() == 1 {
+                name_tag = unquote(first);
+                rest = &[];
+            }
+        }
+    }
+
+    let mut yaw = 0.0;
+    let mut pitch = 0.0;
+    if rest.len() >= 2 {
+        if let (Some(parsed_yaw), Some(parsed_pitch)) =
+            (parse_rotation(rest[0]), parse_rotation(rest[1]))
+        {
+            yaw = parsed_yaw;
+            pitch = parsed_pitch;
+            rest = &rest[2..];
+        }
+    }
+
+    // `spawnEvent: string` (e.g. `minecraft:as_baby`): accepted, no-op here.
+    if let Some(event) = rest.first() {
+        if event.starts_with("minecraft:") || event.starts_with("minecraft.") {
+            rest = &rest[1..];
+        }
+    }
+
+    if name_tag.is_empty() && !rest.is_empty() {
+        name_tag = unquote(&rest.join(" "));
+    }
+
+    action(
+        "Object successfully summoned",
+        CommandAction::Summon {
+            entity: entity.to_string(),
+            position: (position.0 as f32, position.1 as f32, position.2 as f32),
+            yaw: yaw as f32,
+            pitch: pitch as f32,
+            name_tag,
+        },
+    )
+}
+
+/// `RelativeFloat`: absolute value or `~offset` relative to the execution
+/// rotation (0 for the console).
+fn parse_rotation(value: &str) -> Option<f64> {
+    let parsed = match value.strip_prefix('~') {
+        Some("") => 0.0,
+        Some(offset) => offset.parse::<f64>().ok()?,
+        None => value.parse::<f64>().ok()?,
+    };
+    parsed.is_finite().then_some(parsed)
+}
+
+/// Strips one pair of surrounding double quotes (`"name tag"`).
+fn unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 fn set_op(args: &[&str], op: bool) -> CommandOutput {
     let Some(name) = args.first() else {
         return usage(if op { "op" } else { "deop" });
@@ -2855,6 +2999,198 @@ fn timings(source: &CommandSource, args: &[&str]) -> CommandOutput {
             notify: source.name.clone(),
         }],
     }
+}
+
+/// `/profiler`, a spark-style profiler for the 20 TPS tick loop.
+///
+/// Spark samples the JVM; this server times instrumented sections (see
+/// [`crate::profiler`]) and reports exclusive/inclusive time per hotspot plus
+/// tick percentiles, so a lag report names the subsystem responsible instead of
+/// only saying the TPS dropped. Data survives `stop` so one operator can start
+/// it and another can read the report afterwards.
+fn profiler(source: &CommandSource, args: &[&str]) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_PROFILER) {
+        return permission_for("profiler");
+    }
+    let Some(mode) = args.first().map(|arg| arg.to_lowercase()) else {
+        return usage("profiler");
+    };
+    match mode.as_str() {
+        "start" => {
+            if args.len() > 2 {
+                return usage("profiler");
+            }
+            let limit = match args.get(1) {
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(seconds) if seconds > 0 => {
+                        Some(std::time::Duration::from_secs(seconds))
+                    }
+                    _ => return feedback("§cUsage: /profiler start [seconds]"),
+                },
+                None => None,
+            };
+            if !crate::profiler::global().start(limit) {
+                return feedback(
+                    "§cThe profiler is already running. Use §e/profiler stop§c to finish it.",
+                );
+            }
+            let hint = match limit {
+                Some(limit) => format!(" It stops by itself after {}s.", limit.as_secs()),
+                None => String::new(),
+            };
+            feedback(format!(
+                "§aProfiler started§r — reproduce the lag, then run §e/profiler stop§r.{hint}"
+            ))
+        }
+        "stop" => {
+            let profiler = crate::profiler::global();
+            let was_running = profiler.is_active();
+            profiler.stop();
+            if !was_running && !profiler.has_data() {
+                return feedback(
+                    "§cThe profiler is not running and has no samples. Use §e/profiler start§c.",
+                );
+            }
+            CommandOutput {
+                feedback: profiler_report(source),
+                actions: Vec::new(),
+            }
+        }
+        "report" | "info" => {
+            if !crate::profiler::global().has_data() {
+                return feedback("§cNo profiler samples yet. Use §e/profiler start§c first.");
+            }
+            CommandOutput {
+                feedback: profiler_report(source),
+                actions: Vec::new(),
+            }
+        }
+        "reset" => {
+            crate::profiler::global().reset();
+            feedback("§aProfiler stopped and samples cleared.")
+        }
+        "status" => {
+            let snapshot = crate::profiler::global().snapshot();
+            let state = if snapshot.active {
+                "§arunning"
+            } else {
+                "§cstopped"
+            };
+            feedback(format!(
+                "§6Profiler: {state}§r · {:.1}s · {} ticks · {} sections",
+                snapshot.elapsed.as_secs_f64(),
+                snapshot.ticks,
+                snapshot.rows.len()
+            ))
+        }
+        _ => usage("profiler"),
+    }
+}
+
+/// Renders a `/profiler` report: session summary, tick percentiles, ranked
+/// hotspots (exclusive time) and the slowest ticks.
+fn profiler_report(source: &CommandSource) -> Vec<String> {
+    let snapshot = crate::profiler::global().snapshot();
+    let base = snapshot.base_ns().max(1);
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let state = if snapshot.active {
+        "§arunning"
+    } else {
+        "§cstopped"
+    };
+    let mut lines = vec![
+        "§e--------- §rProfiler§e ---------".to_string(),
+        format!(
+            "§6Session: {state}§r · {:.1}s · {} ticks · TPS {}§r, {}§r, {}",
+            snapshot.elapsed.as_secs_f64(),
+            snapshot.ticks,
+            format_tps(source.tps.0),
+            format_tps(source.tps.1),
+            format_tps(source.tps.2),
+        ),
+    ];
+    if snapshot.ticks > 0 {
+        lines.push(format!(
+            "§6Tick time: §favg {:.1}ms · p50 {:.1}ms · p95 {:.1}ms · p99 {:.1}ms · max {:.1}ms",
+            ms(snapshot.avg_ns),
+            ms(snapshot.p50_ns),
+            ms(snapshot.p95_ns),
+            ms(snapshot.p99_ns),
+            ms(snapshot.max_ns),
+        ));
+    }
+    let tick_rows: Vec<&crate::profiler::Row> = snapshot
+        .rows
+        .iter()
+        .filter(|row| row.stats.tick.calls > 0)
+        .collect();
+    if !tick_rows.is_empty() {
+        lines.push(format!(
+            "§6Attributed: §f{:.1}%§r of tick time (tick thread) · {:.1}%§r unattributed",
+            snapshot.tick_profiled_ns as f64 * 100.0 / base as f64,
+            snapshot.unattributed_ns() as f64 * 100.0 / base as f64,
+        ));
+        lines.push("§eTick hotspots (tick thread, self time, % of tick time):".to_string());
+        for row in tick_rows.iter().take(12) {
+            let pct = row.stats.tick.self_ns as f64 * 100.0 / base as f64;
+            let color = if pct >= 30.0 {
+                "§c"
+            } else if pct >= 10.0 {
+                "§e"
+            } else {
+                "§f"
+            };
+            lines.push(format!(
+                " {color}{pct:>5.1}% §f{:>7.2}ms/call §r{} §f(n={}, max {:.1}ms)",
+                row.stats.tick.avg_self_ms(),
+                row.name,
+                row.stats.tick.calls,
+                row.stats.tick.max_self_ms(),
+            ));
+        }
+    } else if snapshot.ticks > 0 {
+        lines.push("§rNo instrumented tick section ran during the session.".to_string());
+    }
+    // Off-tick work gets its own table: it never enters the tick percentages.
+    let off_tick: Vec<&crate::profiler::Row> = snapshot
+        .rows
+        .iter()
+        .filter(|row| row.stats.other.calls > 0)
+        .collect();
+    if !off_tick.is_empty() {
+        let other_base = snapshot.other_profiled_ns.max(1);
+        lines.push(format!(
+            "§eOff-tick threads: §f{:.1}ms§r measured outside the tick (§eNOT§r tick time)",
+            snapshot.other_profiled_ns as f64 / 1_000_000.0,
+        ));
+        for row in off_tick.iter().take(6) {
+            let pct = row.stats.other.self_ns as f64 * 100.0 / other_base as f64;
+            lines.push(format!(
+                " §f{pct:>5.1}% §f{:>7.2}ms/call §r{} §f(n={}, max {:.1}ms)",
+                row.stats.other.avg_self_ms(),
+                row.name,
+                row.stats.other.calls,
+                row.stats.other.max_self_ms(),
+            ));
+        }
+    }
+    if !snapshot.slowest.is_empty() {
+        let worst = snapshot
+            .slowest
+            .iter()
+            .take(3)
+            .map(|tick| format!("#{} {:.1}ms", tick.tick, tick.ms()))
+            .collect::<Vec<_>>()
+            .join("§r · ");
+        lines.push(format!("§6Slowest ticks: §f{worst}"));
+    }
+    if snapshot.ticks == 0 && snapshot.rows.is_empty() {
+        lines.push(
+            "§rNo samples yet. §f/profiler start§r, reproduce the lag, then §f/profiler stop§r."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// `/gc`, ported from `pocketmine\command\defaults\GarbageCollectorCommand`.
@@ -3452,12 +3788,16 @@ fn permission_nodes(command: &str) -> Option<&'static [&'static str]> {
         "save-on" => Some(&[COMMAND_SAVE_ENABLE]),
         "save-off" => Some(&[COMMAND_SAVE_DISABLE]),
         "tps" => Some(&[COMMAND_TPS]),
+        // Purpur gates `/tpsbar` with `bukkit.command.tpsbar` and the optional
+        // target argument with `bukkit.command.tpsbar.other`.
+        "tpsbar" => Some(&[COMMAND_TPSBAR]),
         "status" => Some(&[COMMAND_STATUS]),
         "effect" => Some(&[COMMAND_EFFECT_SELF, COMMAND_EFFECT_OTHER]),
         "enchant" => Some(&[COMMAND_ENCHANT_SELF, COMMAND_ENCHANT_OTHER]),
         "xp" => Some(&[COMMAND_XP_SELF, COMMAND_XP_OTHER]),
         "particle" => Some(&[COMMAND_PARTICLE]),
         "timings" => Some(&[COMMAND_TIMINGS]),
+        "profiler" | "spark" | "prof" => Some(&[COMMAND_PROFILER]),
         "gc" => Some(&[COMMAND_GC]),
         "dumpmemory" => Some(&[COMMAND_DUMPMEMORY]),
         _ => None,
@@ -3823,6 +4163,52 @@ fn tps(source: &CommandSource) -> CommandOutput {
     feedback(format!("§6TPS from last 1m, 5m, 15m: {joined}"))
 }
 
+/// `/tpsbar [targets]`, ported from Purpur's `TPSBarCommand`: toggles a boss
+/// bar showing TPS, MSPT and ping for the sender, or for the given players.
+///
+/// The bar state lives in the sessions (the pure command layer cannot know
+/// whether it is currently on), so the action does the toggle and reports it.
+fn tpsbar(source: &CommandSource, players: &[OnlinePlayer], args: &[&str]) -> CommandOutput {
+    if !source.can(crate::permission::COMMAND_TPSBAR) {
+        return permission_for("tpsbar");
+    }
+    // No argument: the sender's own bar (`getPlayerOrException()` in Purpur).
+    if args.is_empty() {
+        if source.is_console {
+            return error("§cThis command must be run by a player, or be given a target");
+        }
+        return CommandOutput {
+            feedback: Vec::new(),
+            actions: vec![CommandAction::TpsBar {
+                target: source.name.clone(),
+                notify: source.name.clone(),
+            }],
+        };
+    }
+    if !source.can(crate::permission::COMMAND_TPSBAR_OTHER) {
+        return permission_for("tpsbar");
+    }
+    let mut feedback = Vec::new();
+    let mut actions = Vec::new();
+    for query in args {
+        let targets = resolve_players(source, players, query);
+        if targets.is_empty() {
+            feedback.push(red(fill_named(
+                lang::PLAYER_NOT_FOUND,
+                &[("playerName", query)],
+            )));
+            continue;
+        }
+        for player in targets {
+            actions.push(CommandAction::TpsBar {
+                target: player.name.clone(),
+                notify: source.name.clone(),
+            });
+        }
+    }
+    CommandOutput { feedback, actions }
+}
+
 /// `/save-on` and `/save-off`, ported from `SaveOnCommand`/`SaveOffCommand`.
 fn set_auto_save(source: &CommandSource, enabled: bool) -> CommandOutput {
     let command = if enabled { "save-on" } else { "save-off" };
@@ -3887,6 +4273,51 @@ mod tests {
                 gamemode: 1,
             },
         ]
+    }
+
+    #[test]
+    fn tpsbar_toggles_for_the_sender_and_gates_other_players() {
+        let source = player_source("Steve", (10.0, 64.0, -5.0));
+
+        // No argument: the sender's own bar.
+        let output = handle_command("/tpsbar", &source, &players()).expect("native");
+        assert!(output.feedback.is_empty());
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::TpsBar {
+                target: "Steve".to_string(),
+                notify: "Steve".to_string(),
+            }]
+        );
+
+        // Targeting another player needs `pocketmine.command.tpsbar.other`,
+        // which operators have by default.
+        let output = handle_command("/tpsbar Alex", &source, &players()).expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::TpsBar {
+                target: "Alex".to_string(),
+                notify: "Steve".to_string(),
+            }]
+        );
+
+        // A selector expands to every match.
+        let output = handle_command("/tpsbar @a", &source, &players()).expect("native");
+        assert_eq!(output.actions.len(), 2);
+
+        // The base node is operator-only: a guest is denied.
+        let mut guest = player_source("Guest", (0.0, 64.0, 0.0));
+        guest.is_op = false;
+        guest.allow_cheats = false;
+        let output = handle_command("/tpsbar", &guest, &players()).expect("native");
+        assert!(output.feedback.iter().any(|line| line.contains("permission")));
+        assert!(output.actions.is_empty());
+
+        // The console has no bar of its own and must pass a target.
+        let console = CommandSource::console(1_000);
+        let output = handle_command("/tpsbar", &console, &players()).expect("native");
+        assert!(output.feedback[0].contains("must be run by a player"));
+        assert!(output.actions.is_empty());
     }
 
     #[test]
@@ -4512,6 +4943,118 @@ mod tests {
             output.feedback[0],
             "§6TPS from last 1m, 5m, 15m: §49.5§r, §e17.0§r, §a*20.0"
         );
+    }
+
+    #[test]
+    fn summon_uses_the_bedrock_overloads() {
+        let mut source = player_source("Steve", (10.0, 64.0, -5.0));
+        source.is_op = true;
+        let players = players();
+
+        // `/summon <entity>`: execution position, zero rotation, no name.
+        let output = handle_command("/summon zombie", &source, &players).expect("native");
+        assert_eq!(output.feedback, vec!["Object successfully summoned"]);
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Summon {
+                entity: "zombie".to_string(),
+                position: (10.0, 64.0, -5.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                name_tag: String::new(),
+            }]
+        );
+
+        // `/summon <entity> <spawnPos> <yRot> <xRot> <nameTag>`.
+        let output = handle_command(
+            "/summon minecraft:cow 1 70 2 90 45 \"Bessie the cow\"",
+            &source,
+            &players,
+        )
+        .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Summon {
+                entity: "minecraft:cow".to_string(),
+                position: (1.0, 70.0, 2.0),
+                yaw: 90.0,
+                pitch: 45.0,
+                name_tag: "Bessie the cow".to_string(),
+            }]
+        );
+
+        // Name-first overload: `/summon <entity> <nameTag> <spawnPos>`.
+        let output = handle_command("/summon chicken Boss 3 70 4", &source, &players)
+            .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Summon {
+                entity: "chicken".to_string(),
+                position: (3.0, 70.0, 4.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                name_tag: "Boss".to_string(),
+            }]
+        );
+
+        // `~` is relative to the execution position, and `spawnEvent` is
+        // accepted (and ignored) before the name.
+        let output = handle_command(
+            "/summon creeper ~1 ~2 ~3 ~ ~ minecraft:become_charged Charged",
+            &source,
+            &players,
+        )
+        .expect("native");
+        assert_eq!(
+            output.actions,
+            vec![CommandAction::Summon {
+                entity: "creeper".to_string(),
+                position: (11.0, 66.0, -2.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                name_tag: "Charged".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn summon_rejects_unknown_entities_and_requires_privileges() {
+        let players = players();
+        let mut source = player_source("Steve", (0.0, 64.0, 0.0));
+        source.is_op = true;
+        let output = handle_command("/summon minecraft:not_a_mob", &source, &players)
+            .expect("native");
+        assert_eq!(output.feedback, vec!["Unable to summon object."]);
+        assert!(output.actions.is_empty());
+
+        // Missing entity: usage.
+        let output = handle_command("/summon", &source, &players).expect("native");
+        assert!(output.feedback[0].starts_with("§cUsage: /summon"));
+
+        let mut guest = player_source("Guest", (0.0, 64.0, 0.0));
+        guest.is_op = false;
+        guest.allow_cheats = false;
+        let output = handle_command("/summon zombie", &guest, &players).expect("native");
+        assert!(output.feedback[0].contains("don't have permission"));
+        assert!(output.actions.is_empty());
+    }
+
+    #[test]
+    fn profiler_command_is_operator_only_and_documents_its_modes() {
+        let admin = player_source("Admin", (0.0, 64.0, 0.0));
+        let output = handle_command("/profiler", &admin, &players()).expect("native");
+        assert!(
+            output.feedback[0].starts_with("§cUsage: /profiler"),
+            "{:?}",
+            output.feedback
+        );
+
+        let mut guest = player_source("Guest", (0.0, 64.0, 0.0));
+        guest.is_op = false;
+        guest.allow_cheats = false;
+        let output = handle_command("/spark start", &guest, &players()).expect("native");
+        assert!(output.feedback[0].contains("permission"), "{:?}", output.feedback);
+        assert!(output.actions.is_empty());
     }
 
     #[test]

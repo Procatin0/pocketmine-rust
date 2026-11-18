@@ -1,7 +1,10 @@
 use bedrock_protocol::packets::inventory_transaction::{
-    NetworkInventoryAction, SOURCE_CONTAINER, SOURCE_CREATIVE,
+    NetworkInventoryAction, ACTION_MAGIC_SLOT_DROP_ITEM, SOURCE_CONTAINER, SOURCE_CREATIVE,
+    SOURCE_WORLD,
 };
-use bedrock_protocol::ItemStack;
+pub use bedrock_protocol::ItemStack;
+
+use crate::block_container::BlockContainer;
 
 /// Slots in the player's main inventory window (9 hotbar + 27 storage).
 pub const INVENTORY_SIZE: usize = 36;
@@ -43,6 +46,11 @@ pub struct PlayerInventory {
     /// 3x3 crafting-table grid (9 inputs + result at index 9).
     craft_big: Vec<ItemStack>,
     selected_hotbar_slot: u8,
+    /// Block container currently open (`Player::currentWindow`): chest,
+    /// dispenser, hopper, brewing stand, furnace, ... Its window id resolves
+    /// through [`PlayerInventory::window`] so `ItemStackRequest` moves work
+    /// for container slots exactly like for the player windows.
+    block_container: Option<BlockContainer>,
 }
 
 /// Result of applying an `InventoryTransactionPacket`.
@@ -50,6 +58,8 @@ pub struct PlayerInventory {
 pub struct AppliedTransaction {
     /// `(window id, slot)` pairs that changed and must be resent.
     pub changed: Vec<(u32, u32)>,
+    /// Items dropped into the world (`SOURCE_WORLD` with `ACTION_MAGIC_SLOT_DROP_ITEM`).
+    pub dropped: Vec<ItemStack>,
     /// The client's idea of a slot did not match the server: resync everything.
     pub rejected: bool,
 }
@@ -70,7 +80,29 @@ impl PlayerInventory {
             craft_small: vec![ItemStack::empty(); CRAFT_SMALL_RESULT + 1],
             craft_big: vec![ItemStack::empty(); CRAFT_BIG_RESULT + 1],
             selected_hotbar_slot: 0,
+            block_container: None,
         }
+    }
+
+    /// Block container currently open, when one is.
+    pub fn block_container(&self) -> Option<&BlockContainer> {
+        self.block_container.as_ref()
+    }
+
+    /// Window id of the open block container (`ContainerOpenPacket`), used to
+    /// translate the container slots of an `ItemStackRequest`.
+    pub fn block_container_window(&self) -> Option<u32> {
+        self.block_container.as_ref().map(|container| container.window_id as u32)
+    }
+
+    /// Makes `container` the open block window, replacing any previous one.
+    pub fn set_block_container(&mut self, container: BlockContainer) {
+        self.block_container = Some(container);
+    }
+
+    /// Removes the open block container (window closed).
+    pub fn take_block_container(&mut self) -> Option<BlockContainer> {
+        self.block_container.take()
     }
 
     pub fn slots(&self) -> &[ItemStack] {
@@ -276,13 +308,21 @@ impl PlayerInventory {
     }
 
     /// Slots of a window, when the server models it.
+    ///
+    /// Besides the player windows this resolves the window id of the open
+    /// block container, which is what makes container `ItemStackRequest`
+    /// slots interchangeable with inventory ones.
     pub fn window(&self, window_id: u32) -> Option<&[ItemStack]> {
         match window_id {
             WINDOW_ID_INVENTORY => Some(&self.slots),
             WINDOW_ID_ARMOR => Some(&self.armor),
             WINDOW_ID_OFFHAND => Some(&self.offhand),
             WINDOW_ID_CURSOR => Some(&self.cursor),
-            _ => None,
+            _ => self
+                .block_container
+                .as_ref()
+                .filter(|container| container.window_id as u32 == window_id)
+                .map(|container| container.slots.as_slice()),
         }
     }
 
@@ -292,7 +332,11 @@ impl PlayerInventory {
             WINDOW_ID_ARMOR => Some(&mut self.armor),
             WINDOW_ID_OFFHAND => Some(&mut self.offhand),
             WINDOW_ID_CURSOR => Some(&mut self.cursor),
-            _ => None,
+            _ => self
+                .block_container
+                .as_mut()
+                .filter(|container| container.window_id as u32 == window_id)
+                .map(|container| &mut container.slots),
         }
     }
 
@@ -348,7 +392,15 @@ impl PlayerInventory {
                 // validating them the server would trust the client, so they
                 // force a resync.
                 SOURCE_CREATIVE => result.rejected = true,
-                // Drops, pickups and client-side windows are not modelled yet.
+                SOURCE_WORLD => {
+                    if action.inventory_slot == ACTION_MAGIC_SLOT_DROP_ITEM
+                        && !action.new_item.is_empty()
+                        && action.new_item.count > 0
+                    {
+                        result.dropped.push(action.new_item.clone());
+                    }
+                }
+                // Pickups and client-side windows are not modelled yet.
                 _ => {}
             }
         }
@@ -400,7 +452,10 @@ impl PlayerInventory {
 
     /// Offhand item, as broadcast when another player spawns the holder.
     pub fn offhand_item(&self) -> ItemStack {
-        self.offhand.first().cloned().unwrap_or_else(ItemStack::empty)
+        self.offhand
+            .first()
+            .cloned()
+            .unwrap_or_else(ItemStack::empty)
     }
 }
 
@@ -420,7 +475,9 @@ impl Default for ArmorInventory {
 
 impl ArmorInventory {
     pub fn new() -> Self {
-        Self { slots: vec![ItemStack::empty(); ARMOR_SIZE] }
+        Self {
+            slots: vec![ItemStack::empty(); ARMOR_SIZE],
+        }
     }
 
     pub fn slots(&self) -> &[ItemStack] {
@@ -473,7 +530,10 @@ impl PlayerInventory {
 
     /// Cursor stack (window 124): the stack held between click and drop.
     pub fn cursor_item(&self) -> ItemStack {
-        self.cursor.first().cloned().unwrap_or_else(ItemStack::empty)
+        self.cursor
+            .first()
+            .cloned()
+            .unwrap_or_else(ItemStack::empty)
     }
 
     pub fn set_cursor(&mut self, item: ItemStack) -> bool {
@@ -487,7 +547,11 @@ impl PlayerInventory {
     /// Crafting slot: `small=true` addresses the player 2x2 window (4 inputs +
     /// result at index 4), otherwise the 3x3 window (9 inputs + result at 9).
     pub fn craft_slot(&self, small: bool, slot: usize) -> Option<ItemStack> {
-        let window = if small { &self.craft_small } else { &self.craft_big };
+        let window = if small {
+            &self.craft_small
+        } else {
+            &self.craft_big
+        };
         window.get(slot).cloned()
     }
 
@@ -506,24 +570,26 @@ impl PlayerInventory {
 
     /// Q-key drop: removes up to `count` items from `(window, slot)` and
     /// returns the dropped stack (`None` when the slot is empty or unknown).
-    pub fn drop_from_slot(
-        &mut self,
-        window_id: u32,
-        slot: u32,
-        count: u32,
-    ) -> Option<ItemStack> {
+    pub fn drop_from_slot(&mut self, window_id: u32, slot: u32, count: u32) -> Option<ItemStack> {
         let current = self.window_slot(window_id, slot)?.clone();
         if current.is_empty() {
             return None;
         }
         let taken = count.min(current.count as u32) as u16;
-        let dropped = ItemStack { count: taken, ..current.clone() };
+        let dropped = ItemStack {
+            count: taken,
+            ..current.clone()
+        };
         let mut updated = current;
         updated.count -= taken;
         self.set_window_slot(
             window_id,
             slot,
-            if updated.count == 0 { ItemStack::empty() } else { updated },
+            if updated.count == 0 {
+                ItemStack::empty()
+            } else {
+                updated
+            },
         );
         Some(dropped)
     }
@@ -558,7 +624,9 @@ fn same_item(a: &ItemStack, b: &ItemStack) -> bool {
     a.network_id == b.network_id
         && a.meta == b.meta
         && a.count == b.count
-        && a.block_runtime_id == b.block_runtime_id
+        && (a.block_runtime_id == b.block_runtime_id
+            || a.block_runtime_id == 0
+            || b.block_runtime_id == 0)
 }
 
 /// Stack size limit for an item; block-like items stack to 64 and the few
@@ -634,12 +702,7 @@ pub fn item_network_id(name: &str) -> Option<i16> {
 fn reverse_registry() -> &'static std::collections::HashMap<i16, &'static str> {
     static REVERSE: std::sync::OnceLock<std::collections::HashMap<i16, &'static str>> =
         std::sync::OnceLock::new();
-    REVERSE.get_or_init(|| {
-        registry()
-            .iter()
-            .map(|(name, id)| (*id, *name))
-            .collect()
-    })
+    REVERSE.get_or_init(|| registry().iter().map(|(name, id)| (*id, *name)).collect())
 }
 
 /// Resolves the `<item[:damage]>` argument the way PocketMine does: the name
@@ -672,6 +735,11 @@ pub fn resolve_item(input: &str) -> Option<(i16, u32, &'static str)> {
     let canonical = resolve_item_name(base)?;
     let id = item_network_id(canonical)?;
     Some((id, meta, canonical))
+}
+
+/// Canonical identifier (`minecraft:redstone`) of a numeric item id.
+pub fn item_canonical_name(network_id: i16) -> Option<&'static str> {
+    reverse_registry().get(&network_id).copied()
 }
 
 /// Human readable item name, e.g. `347` -> `"Diamond Sword"`, which is what the
@@ -755,7 +823,10 @@ mod tests {
 
         assert_eq!(resolve_item_name("stone"), Some("minecraft:stone"));
         assert_eq!(resolve_item_name("Stone"), Some("minecraft:stone"));
-        assert_eq!(resolve_item_name("minecraft:stone"), Some("minecraft:stone"));
+        assert_eq!(
+            resolve_item_name("minecraft:stone"),
+            Some("minecraft:stone")
+        );
         assert_eq!(
             resolve_item_name("DIAMOND_SWORD"),
             Some("minecraft:diamond_sword")
@@ -774,7 +845,10 @@ mod tests {
     #[test]
     fn resolve_item_accepts_names_ids_and_damage() {
         assert_eq!(resolve_item("stone"), Some((1, 0, "minecraft:stone")));
-        assert_eq!(resolve_item("minecraft:stone"), Some((1, 0, "minecraft:stone")));
+        assert_eq!(
+            resolve_item("minecraft:stone"),
+            Some((1, 0, "minecraft:stone"))
+        );
         assert_eq!(resolve_item("1"), Some((1, 0, "minecraft:stone")));
         assert_eq!(resolve_item("1:2"), Some((1, 2, "minecraft:stone")));
         assert_eq!(
@@ -804,7 +878,10 @@ mod tests {
         inventory.add_item(&ItemStack::new(1, 3));
 
         assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 0), (3, true));
-        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (3, false));
+        assert_eq!(
+            inventory.clear_matching(Some(&filter(1, 0)), -1),
+            (3, false)
+        );
         // Only the tagged stack is left, and clearing everything removes it.
         assert_eq!(inventory.clear_matching(None, -1), (4, false));
     }
@@ -819,7 +896,10 @@ mod tests {
         assert_eq!(inventory.total_items(), 16);
         assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 5), (5, false));
         assert_eq!(inventory.total_items(), 11);
-        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (11, false));
+        assert_eq!(
+            inventory.clear_matching(Some(&filter(1, 0)), -1),
+            (11, false)
+        );
         assert!(inventory.is_empty());
     }
 
@@ -839,9 +919,15 @@ mod tests {
         assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), 5), (5, false));
         assert_eq!(inventory.total_items(), 0);
         assert_eq!(inventory.window_slot(WINDOW_ID_ARMOR, 0).unwrap().count, 2);
-        assert_eq!(inventory.window_slot(WINDOW_ID_OFFHAND, 0).unwrap().count, 1);
+        assert_eq!(
+            inventory.window_slot(WINDOW_ID_OFFHAND, 0).unwrap().count,
+            1
+        );
 
-        assert_eq!(inventory.clear_matching(Some(&filter(1, 0)), -1), (3, false));
+        assert_eq!(
+            inventory.clear_matching(Some(&filter(1, 0)), -1),
+            (3, false)
+        );
         assert!(inventory
             .window(WINDOW_ID_ARMOR)
             .unwrap()
@@ -868,14 +954,31 @@ mod tests {
     #[test]
     fn models_every_player_window() {
         let mut inventory = PlayerInventory::new();
-        assert_eq!(inventory.window(WINDOW_ID_INVENTORY).map(<[ItemStack]>::len), Some(36));
-        assert_eq!(inventory.window(WINDOW_ID_ARMOR).map(<[ItemStack]>::len), Some(ARMOR_SIZE));
-        assert_eq!(inventory.window(WINDOW_ID_OFFHAND).map(<[ItemStack]>::len), Some(1));
-        assert_eq!(inventory.window(WINDOW_ID_CURSOR).map(<[ItemStack]>::len), Some(UI_SIZE));
+        assert_eq!(
+            inventory
+                .window(WINDOW_ID_INVENTORY)
+                .map(<[ItemStack]>::len),
+            Some(36)
+        );
+        assert_eq!(
+            inventory.window(WINDOW_ID_ARMOR).map(<[ItemStack]>::len),
+            Some(ARMOR_SIZE)
+        );
+        assert_eq!(
+            inventory.window(WINDOW_ID_OFFHAND).map(<[ItemStack]>::len),
+            Some(1)
+        );
+        assert_eq!(
+            inventory.window(WINDOW_ID_CURSOR).map(<[ItemStack]>::len),
+            Some(UI_SIZE)
+        );
         assert!(inventory.window(999).is_none());
 
         assert!(inventory.set_window_slot(WINDOW_ID_ARMOR, 2, ItemStack::new(347, 1)));
-        assert_eq!(inventory.window_slot(WINDOW_ID_ARMOR, 2), Some(&ItemStack::new(347, 1)));
+        assert_eq!(
+            inventory.window_slot(WINDOW_ID_ARMOR, 2),
+            Some(&ItemStack::new(347, 1))
+        );
         assert!(!inventory.set_window_slot(WINDOW_ID_ARMOR, 9, ItemStack::new(1, 1)));
     }
 
@@ -890,8 +993,14 @@ mod tests {
         ]);
         assert!(!applied.rejected);
         assert_eq!(applied.changed, vec![(0, 0), (0, 5)]);
-        assert!(inventory.window_slot(WINDOW_ID_INVENTORY, 0).unwrap().is_empty());
-        assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count, 32);
+        assert!(inventory
+            .window_slot(WINDOW_ID_INVENTORY, 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count,
+            32
+        );
 
         // The client now claims a different stack than the server holds.
         let applied = inventory.apply_actions(&[
@@ -899,8 +1008,14 @@ mod tests {
             container_action(0, 6, ItemStack::empty(), ItemStack::new(1, 64)),
         ]);
         assert!(applied.rejected);
-        assert_eq!(inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count, 32);
-        assert!(inventory.window_slot(WINDOW_ID_INVENTORY, 6).unwrap().is_empty());
+        assert_eq!(
+            inventory.window_slot(WINDOW_ID_INVENTORY, 5).unwrap().count,
+            32
+        );
+        assert!(inventory
+            .window_slot(WINDOW_ID_INVENTORY, 6)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -922,12 +1037,18 @@ mod tests {
         let helmet = ItemStack::new(item_network_id("minecraft:iron_helmet").unwrap(), 1);
         let boots = ItemStack::new(item_network_id("minecraft:iron_boots").unwrap(), 1);
         let mut inventory = PlayerInventory::new();
-        assert_eq!(inventory.equip_armor(0, helmet.clone()), Some(ItemStack::empty()));
+        assert_eq!(
+            inventory.equip_armor(0, helmet.clone()),
+            Some(ItemStack::empty())
+        );
         assert_eq!(inventory.armor_slots()[0].network_id, helmet.network_id);
         // Boots do not fit the helmet slot, and the slot stays untouched.
         assert_eq!(inventory.equip_armor(0, boots.clone()), None);
         assert_eq!(inventory.armor_slots()[0].network_id, helmet.network_id);
-        assert_eq!(inventory.equip_armor(3, boots.clone()), Some(ItemStack::empty()));
+        assert_eq!(
+            inventory.equip_armor(3, boots.clone()),
+            Some(ItemStack::empty())
+        );
         assert_eq!(inventory.armor_slots()[3].network_id, boots.network_id);
     }
 

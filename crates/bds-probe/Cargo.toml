@@ -1,0 +1,15 @@
+[package]
+name = "bds-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Reads Bedrock Dedicated Server LevelDB worlds (Data3D biomes, heightmaps) to produce ground-truth captures for the world generator parity work."
+publish = false
+
+[dependencies]
+bedrock-world = { path = "../bedrock-world" }
+flate2 = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "bds-probe"
+path = "src/main.rs"

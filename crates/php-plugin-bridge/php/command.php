@@ -262,7 +262,14 @@ namespace pocketmine\command {
             $this->executor = $executor;
         }
 
-        public function getExecutor(): mixed
+        /**
+         * Bridge-internal accessor for the executor passed to
+         * `setExecutor()`. PM has no `Command::getExecutor()`, and declaring one
+         * here breaks plugins that add their own `getExecutor()` with a
+         * different signature (EasyEdit does: `getExecutor(array &$args):
+         * CommandExecutor`), so it stays out of the public API.
+         */
+        protected function getRegisteredExecutor(): mixed
         {
             return $this->executor;
         }
@@ -400,7 +407,7 @@ namespace pocketmine\command {
                 return ($this->callable)($sender, $commandLabel, $args);
             }
 
-            $executor = $this->getExecutor();
+            $executor = $this->getRegisteredExecutor();
             if (is_callable($executor)) {
                 return $executor($sender, $commandLabel, $args);
             }
@@ -551,6 +558,16 @@ namespace pocketmine\command {
             }
             $this->commands[$key] = $command;
             $this->aliases[$key] = strtolower($command->getName());
+
+            // If the command or alias starts with '/', also register the bare key
+            // as an alias if available (e.g. '/pos1' -> bare 'pos1').
+            if (str_starts_with($key, '/')) {
+                $bareKey = ltrim($key, '/');
+                if ($bareKey !== '' && !isset($this->commands[$bareKey]) && !isset($this->aliases[$bareKey])) {
+                    $this->aliases[$bareKey] = strtolower($command->getName());
+                }
+            }
+
             return true;
         }
 
@@ -584,7 +601,34 @@ namespace pocketmine\command {
                 return $this->commands[$name];
             }
             $resolved = $this->aliases[$name] ?? null;
-            return $resolved === null ? null : ($this->commands[$resolved] ?? null);
+            if ($resolved !== null && isset($this->commands[$resolved])) {
+                return $this->commands[$resolved];
+            }
+
+            // Fallback for commands registered with or without leading slash(es)
+            // (e.g. EasyEdit registers /pos1, /set, /wand).
+            $bare = ltrim($name, '/');
+            if ($bare !== '' && $bare !== $name) {
+                if (isset($this->commands[$bare])) {
+                    return $this->commands[$bare];
+                }
+                $resolved = $this->aliases[$bare] ?? null;
+                if ($resolved !== null && isset($this->commands[$resolved])) {
+                    return $this->commands[$resolved];
+                }
+            }
+            $withSlash = '/' . $bare;
+            if ($withSlash !== $name) {
+                if (isset($this->commands[$withSlash])) {
+                    return $this->commands[$withSlash];
+                }
+                $resolved = $this->aliases[$withSlash] ?? null;
+                if ($resolved !== null && isset($this->commands[$resolved])) {
+                    return $this->commands[$resolved];
+                }
+            }
+
+            return null;
         }
 
         /** @return array<string, Command> */
@@ -604,9 +648,6 @@ namespace pocketmine\command {
             $commandLine = trim($commandLine);
             if ($commandLine === '') {
                 return false;
-            }
-            if ($commandLine[0] === '/') {
-                $commandLine = substr($commandLine, 1);
             }
 
             $order = preg_split('/\s+/', $commandLine) ?: [];
@@ -885,7 +926,7 @@ namespace pocketmine\command {
                 }
             }
             if (isset($args['gamemode'])) {
-                $pool = array_filter($pool, static fn($player) => (int)$player->getGamemode() === (int)$args['gamemode']);
+                $pool = array_filter($pool, static fn($player) => $player->getGamemode()->id() === (int)$args['gamemode']);
             }
             $min = $args['distance_min'] ?? null;
             $max = $args['distance_max'] ?? null;

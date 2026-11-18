@@ -749,6 +749,28 @@ pub const BEDROCK_STATES: &[(u32, i32)] = &[
     (3417975282, 38 << 4),
 ];
 
+/// Blocks this generator places that the PHP table never had, so the Java
+/// column keeps them instead of punching them out as air: clay (82, a normal
+/// sea floor block) and the water plants 1.12 does not know, which become tall
+/// grass.
+/// 1.12.2 state of a Bedrock network id: the PHP table first, then the blocks
+/// this generator places that the table never had.
+fn legacy_state(bedrock_id: u32) -> Option<i32> {
+    BEDROCK_STATES
+        .iter()
+        .find(|(id, _)| *id == bedrock_id)
+        .map(|(_, state)| *state)
+        .or_else(|| extra_legacy_state(bedrock_id))
+}
+
+fn extra_legacy_state(bedrock_id: u32) -> Option<i32> {
+    const JAVA_TALL_GRASS: i32 = (31 << 4) | 1;
+    if bedrock_id == crate::block_id::CLAY {
+        return Some(82 << 4);
+    }
+    crate::block_id::is_water_plant(bedrock_id).then_some(JAVA_TALL_GRASS)
+}
+
 /// Java 1.12 / PocketMine legacy ids by block name
 /// (`ChunkBuilder.php` `NAME_TO_LEGACY`), in PHP order so that
 /// `name_for_legacy` returns the first name per id, like the PHP loop.
@@ -795,17 +817,13 @@ impl ChunkBuilder {
 
     /// 1.12.2 state for a Bedrock network id; unknown ids become air.
     pub fn java_state(bedrock_id: u32) -> i32 {
-        BEDROCK_STATES
-            .iter()
-            .find(|(id, _)| *id == bedrock_id)
-            .map(|(_, state)| *state)
-            .unwrap_or(JAVA_AIR)
+        legacy_state(bedrock_id).unwrap_or(JAVA_AIR)
     }
 
     /// Whether a Bedrock network id has a 1.12.2 translation. An
     /// untranslated id renders as air, so unmapped terrain vanishes.
     pub fn is_mapped(bedrock_id: u32) -> bool {
-        BEDROCK_STATES.iter().any(|(id, _)| *id == bedrock_id)
+        legacy_state(bedrock_id).is_some()
     }
 
     /// Legacy id (the one `Block::setBlock()` expects) for a block
@@ -828,10 +846,7 @@ impl ChunkBuilder {
     /// Legacy id (`state >> 4`) for a Bedrock network id, or `None`
     /// without a translation.
     pub fn legacy_id_for_bedrock(bedrock_id: u32) -> Option<i32> {
-        BEDROCK_STATES
-            .iter()
-            .find(|(id, _)| *id == bedrock_id)
-            .map(|(_, state)| state >> 4)
+        legacy_state(bedrock_id).map(|state| state >> 4)
     }
 
     /// Bedrock network id for a legacy id (+ meta), or `None` when the

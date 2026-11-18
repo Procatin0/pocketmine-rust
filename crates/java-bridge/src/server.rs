@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,9 +45,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::display::java_view_display_name;
-use crate::hooks::{PlayerSnapshot, ServerHooks};
+use crate::hooks::{ActorSnapshot, PlayerSnapshot, ServerHooks};
 use crate::profile;
-use crate::session::{EntityTarget, JavaSession, TabTarget};
+use crate::session::{ActorTarget, EntityTarget, JavaSession, TabEntry, TabTarget};
 use crate::wire;
 
 pub const DEFAULT_PORT: u16 = 25565;
@@ -135,19 +135,15 @@ pub fn tab_targets(hooks: &dyn ServerHooks, extra: Option<&[TabTarget]>) -> Vec<
     targets.into_values().collect()
 }
 
-/// Entity targets for one observer: everyone but itself, chunk-gated,
-/// Bedrock yaw/pitch converted to Java. Bedrock snapshots win over
-/// virtual ones with the same raw name (same rule as `sync_virtuals_locked`).
-/// `name` is the Java-view display name (Bedrock verbatim, Java players keep
-/// their `"."` prefix), so `spawn_entity` UUID, TAB UUID and nametag all derive
-/// from one string.
-pub fn entity_targets_for(
-    _hooks: &dyn ServerHooks,
-    observer: &JavaSession,
-    snapshots: &[PlayerSnapshot],
-) -> Vec<EntityTarget> {
-    let self_name = observer.username.as_deref().unwrap_or("");
-    let mut by_name: HashMap<String, PlayerSnapshot> = HashMap::new();
+/// Deduplicate snapshots by lowercase name for one tick, keeping the Bedrock
+/// snapshot when a virtual one shares its name (same rule as
+/// `sync_virtuals_locked`).
+///
+/// The tick calls this once and hands the result to every observer:
+/// [`entity_targets_for`] used to rebuild this map and clone every
+/// `PlayerSnapshot` per session, i.e. O(P²) `String` clones per tick.
+pub fn dedup_snapshots(snapshots: &[PlayerSnapshot]) -> Vec<PlayerSnapshot> {
+    let mut by_name: HashMap<String, PlayerSnapshot> = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
         if snapshot.name.is_empty() {
             continue;
@@ -161,9 +157,26 @@ pub fn entity_targets_for(
             by_name.insert(key, snapshot.clone());
         }
     }
-    let mut targets = Vec::new();
-    for snapshot in by_name.values() {
-        if snapshot.name.eq_ignore_ascii_case(self_name) {
+    by_name.into_values().collect()
+}
+
+/// Entity targets for one observer: everyone but itself, chunk-gated,
+/// Bedrock yaw/pitch converted to Java.
+///
+/// `snapshots` must already be name-deduplicated for this tick (see
+/// [`dedup_snapshots`]); deduplicating here again was O(P) clones **per
+/// observer**. `name` is the Java-view display name (Bedrock verbatim, Java
+/// players keep their `"."` prefix), so `spawn_entity` UUID, TAB UUID and
+/// nametag all derive from one string.
+pub fn entity_targets_for(
+    _hooks: &dyn ServerHooks,
+    observer: &JavaSession,
+    snapshots: &[PlayerSnapshot],
+) -> Vec<EntityTarget> {
+    let self_name = observer.username.as_deref().unwrap_or("");
+    let mut targets = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        if snapshot.name.is_empty() || snapshot.name.eq_ignore_ascii_case(self_name) {
             continue;
         }
         let cx = (snapshot.x / 16.0).floor() as i32;
@@ -182,6 +195,53 @@ pub fn entity_targets_for(
             is_sneaking: snapshot.is_sneaking,
             gamemode: snapshot.gamemode,
             ping: snapshot.ping,
+        });
+    }
+    targets
+}
+
+/// Actor targets for one observer: every live non-player entity
+/// ([`ServerHooks::actor_snapshots`]) whose chunk has been sent, translated
+/// to Java entity-type ids and yaw/pitch.
+///
+/// The `minecraft:entity_type` registry id is resolved per observer protocol
+/// ([`crate::entity_ids::entity_type_id`]): a type this version cannot render
+/// — or a legacy 340 client — is skipped instead of spawning a wrong entity.
+/// A falling block carries its Java global block state in `spawn_entity.data`.
+pub fn actor_targets_for(
+    hooks: &dyn ServerHooks,
+    observer: &JavaSession,
+    actors: &[ActorSnapshot],
+) -> Vec<ActorTarget> {
+    if !observer.is_modern() {
+        return Vec::new();
+    }
+    let mut targets = Vec::new();
+    for actor in actors {
+        let Some(entity_type) = crate::entity_ids::entity_type_id(observer.protocol, actor.type_id)
+        else {
+            continue;
+        };
+        let cx = (actor.x / 16.0).floor() as i32;
+        let cz = (actor.z / 16.0).floor() as i32;
+        if !observer.has_sent_chunk(cx, cz) {
+            continue;
+        }
+        let block_state = actor.block_network_id.map_or(0, |network_id| {
+            hooks.modern_block_state(network_id, observer.protocol)
+        });
+        targets.push(ActorTarget {
+            runtime_id: actor.runtime_id,
+            entity: hooks.actor_entity_id(actor.runtime_id),
+            entity_type,
+            x: actor.x,
+            y: actor.y,
+            z: actor.z,
+            yaw: wire::bedrock_yaw_to_java(actor.yaw),
+            pitch: wire::bedrock_pitch_to_java(actor.pitch),
+            head_yaw: wire::bedrock_yaw_to_java(actor.head_yaw),
+            name_tag: actor.name_tag.clone(),
+            block_state,
         });
     }
     targets
@@ -211,6 +271,11 @@ pub struct JavaServer {
     last_broadcast_time_running: Mutex<Option<bool>>,
     last_known_blocks: Mutex<HashMap<(i32, i32, i32), Option<u32>>>,
     slow_tick_log_at: Mutex<Option<Instant>>,
+    /// Shared 20 ms flush pulse for every connection, so a server with N Java
+    /// players owns one timer instead of N. Started lazily by the first
+    /// [`JavaServer::handle_stream`] (tests drive that directly, not `run_arc`).
+    flush_tick: Arc<tokio::sync::Notify>,
+    flush_started: AtomicBool,
 }
 
 impl JavaServer {
@@ -227,6 +292,8 @@ impl JavaServer {
             last_broadcast_time_running: Mutex::new(None),
             last_known_blocks: Mutex::new(HashMap::new()),
             slow_tick_log_at: Mutex::new(None),
+            flush_tick: Arc::new(tokio::sync::Notify::new()),
+            flush_started: AtomicBool::new(false),
         }
     }
 
@@ -310,19 +377,32 @@ impl JavaServer {
         // `run_arc` runs no interval of its own.
         // `streamChunks` consumes the background-warmed payload cache,
         // so a warm tick never pays generation at all.
-        let ids: Vec<u64> = self.sessions.lock().keys().copied().collect();
+        // One map lock for the phase gate and the id list: `any_playing()`
+        // locked and scanned the whole map four times per tick. The per-session
+        // ticks still drop the map lock between sessions (see above), so a slow
+        // session cannot starve another connection task.
+        let (ids, playing) = {
+            let sessions = self.sessions.lock();
+            if sessions.is_empty() {
+                return;
+            }
+            (
+                sessions.keys().copied().collect::<Vec<u64>>(),
+                sessions.values().any(|session| session.is_playing()),
+            )
+        };
         for id in ids {
             if let Some(session) = self.sessions.lock().get_mut(&id) {
                 session.tick(self.hooks.as_ref(), Some(deadline));
             }
         }
         let after_sessions = Instant::now();
-        self.tick_tab();
+        self.tick_tab(playing);
         let after_tab = Instant::now();
         if Instant::now() <= deadline {
-            self.tick_time_sync();
+            self.tick_time_sync(playing);
             if tick_count.is_multiple_of(ENTITY_SYNC_INTERVAL_TICKS) {
-                self.tick_entities();
+                self.tick_entities(playing);
             }
         }
         // `tick_block_changes` (Bedrock -> Java block sync) is a bounded
@@ -333,7 +413,7 @@ impl JavaServer {
         // viewers. It mirrors the Bedrock side, where `poll_block_changes`
         // runs first in `SessionManager::tick`.
         if tick_count.is_multiple_of(BLOCK_CHANGES_INTERVAL_TICKS) {
-            self.tick_block_changes();
+            self.tick_block_changes(playing);
         }
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(10) {
@@ -384,21 +464,38 @@ impl JavaServer {
         protocols
     }
 
-    fn tick_tab(&self) {
-        if !self.any_playing() {
+    fn tick_tab(&self, playing: bool) {
+        if !playing {
             return;
         }
+        // Normalized once per tick: `sync_tab` used to rebuild this map and
+        // clone every name once per session (P² allocations per tick).
         let targets = tab_targets(self.hooks.as_ref(), None);
+        let normalized: Vec<(String, TabEntry)> = targets
+            .iter()
+            .map(|target| {
+                (
+                    target.name.to_lowercase(),
+                    TabEntry {
+                        name: target.name.clone(),
+                        gamemode: target.gamemode.clamp(0, 3),
+                        ping: target.ping.max(0),
+                    },
+                )
+            })
+            .collect();
         for session in self.sessions.lock().values_mut() {
-            session.sync_tab(&targets);
+            session.sync_tab_normalized(&normalized);
         }
     }
 
-    fn tick_entities(&self) {
-        if !self.any_playing() {
+    fn tick_entities(&self, playing: bool) {
+        if !playing {
             return;
         }
-        let snapshots = self.hooks.snapshots();
+        // Deduplicated once per tick instead of once per observer.
+        let snapshots = dedup_snapshots(&self.hooks.snapshots());
+        let actors = self.hooks.actor_snapshots();
         let mut sessions = self.sessions.lock();
         for session in sessions.values_mut() {
             if !session.is_playing() {
@@ -406,11 +503,13 @@ impl JavaServer {
             }
             let targets = entity_targets_for(self.hooks.as_ref(), session, &snapshots);
             session.sync_entities(self.hooks.as_ref(), &targets);
+            let actor_targets = actor_targets_for(self.hooks.as_ref(), session, &actors);
+            session.sync_actors(&actor_targets);
         }
     }
 
-    fn tick_time_sync(&self) {
-        if !self.any_playing() {
+    fn tick_time_sync(&self, playing: bool) {
+        if !playing {
             return;
         }
         let mut since = self.ticks_since_time_sync.lock();
@@ -420,25 +519,26 @@ impl JavaServer {
             return;
         }
         let time = self.hooks.world_time();
+        let world_age = self.hooks.world_age();
         let running = self.hooks.world_time_running();
         let jumped = last
             .map(|prev| (time - prev).abs() > TIME_SYNC_INTERVAL_TICKS as i64)
             .unwrap_or(false);
-        let running_changed = *self.last_broadcast_time_running.lock() != Some(running)
-            && self.last_broadcast_time_running.lock().is_some();
+        let previous_running = *self.last_broadcast_time_running.lock();
+        let running_changed = previous_running != Some(running) && previous_running.is_some();
         if last.is_some() && !jumped && !running_changed && *since < TIME_SYNC_INTERVAL_TICKS {
             return;
         }
         for session in self.sessions.lock().values_mut() {
-            session.send_time(time, running);
+            session.send_time(world_age, time, running);
         }
         *self.last_broadcast_time.lock() = Some(time);
         *self.last_broadcast_time_running.lock() = Some(running);
         *since = 0;
     }
 
-    fn tick_block_changes(&self) {
-        if !self.any_playing() {
+    fn tick_block_changes(&self, playing: bool) {
+        if !playing {
             return;
         }
         let changes: Vec<_> = self.hooks.drain_block_changes();
@@ -466,10 +566,6 @@ impl JavaServer {
                 change.previous_network_id,
             );
         }
-    }
-
-    fn any_playing(&self) -> bool {
-        self.sessions.lock().values().any(|s| s.is_playing())
     }
 
     /// Send a chat line to every Java client in play (`broadcastChat`).
@@ -522,16 +618,21 @@ impl JavaServer {
             (z as f64 / 16.0).floor() as i32,
         );
         let mut recipients = 0usize;
+        // The world-event state depends only on (protocol, prev_id): resolve it
+        // once per protocol instead of once per recipient.
+        let mut prev_states: HashMap<i32, i32> = HashMap::new();
         for session in self.sessions.lock().values_mut() {
             if session.is_playing() && session.has_sent_chunk(cx, cz) {
                 session.send_block_change(self.hooks.as_ref(), x, y, z, kind, network_id);
                 if is_break {
-                    let prev_state = match prev_id {
-                        Some(pid) if session.is_modern() => self.hooks.modern_block_state(pid, session.protocol),
+                    let protocol = session.protocol;
+                    let modern = session.is_modern();
+                    let prev_state = *prev_states.entry(protocol).or_insert_with(|| match prev_id {
+                        Some(pid) if modern => self.hooks.modern_block_state(pid, protocol),
                         Some(pid) => self.hooks.legacy_block_state(pid),
-                        None if session.is_modern() => 1,
+                        None if modern => 1,
                         None => 1 << 4,
-                    };
+                    });
                     session.send_world_event(self.hooks.as_ref(), 2001, x, y, z, prev_state, false);
                 }
                 recipients += 1;
@@ -541,6 +642,30 @@ impl JavaServer {
             "broadcast_block_change: ({},{},{}) kind={} chunk=({},{}) recipients={}",
             x, y, z, kind, cx, cz, recipients
         );
+    }
+
+    /// Start the shared 20 ms flush pulse once per server.
+    ///
+    /// A per-connection `tokio::time::interval` was one timer + one wakeup
+    /// every 20 ms for every player; one pulse per server wakes all connections
+    /// through [`tokio::sync::Notify::notify_waiters`] instead. The task holds a
+    /// `Weak` to the notify so it exits when the server is dropped.
+    fn ensure_flush_pulse(&self) {
+        if self.flush_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.flush_tick);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(flush_tick) = weak.upgrade() else {
+                    break;
+                };
+                flush_tick.notify_waiters();
+            }
+        });
     }
 
     /// Names of Java players currently in play (`javaPlayerNames`).
@@ -582,27 +707,36 @@ impl JavaServer {
             .peer_addr()
             .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
         let session_id = self.add_session(peer);
+        self.ensure_flush_pulse();
         let (mut read, mut write) = stream.into_split();
         let mut buffer = [0u8; 65536];
-        let mut drain = tokio::time::interval(Duration::from_millis(20));
+        // One outgoing buffer per connection, reused across flushes:
+        // `take_out()` handed the `Vec` away, so `out_buf` restarted at
+        // capacity 0 every 20 ms and chunk streaming re-grew it from scratch.
+        let mut out = Vec::with_capacity(8 * 1024);
         loop {
+            // Shared 20 ms pulse (`run_arc`): a per-connection `interval` was
+            // one timer + one wakeup every 20 ms for every Java player.
+            let pulse = self.flush_tick.notified();
+            tokio::pin!(pulse);
             tokio::select! {
                 result = read.read(&mut buffer) => {
                     match result {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let (alive, out) = {
+                            let alive = {
                                 let mut sessions = self.sessions.lock();
                                 let Some(session) = sessions.get_mut(&session_id) else {
                                     break;
                                 };
                                 let alive = session.poll_bytes(self.hooks.as_ref(), &buffer[..n]);
-                                let out = session.take_out();
-                                (alive, out)
+                                session.take_out_into(&mut out);
+                                alive
                             };
                             if !out.is_empty() {
                                 let _ = write.write_all(&out).await;
                                 let _ = write.flush().await;
+                                out.clear();
                             }
                             if !alive {
                                 break;
@@ -610,19 +744,21 @@ impl JavaServer {
                         }
                     }
                 }
-                _ = drain.tick() => {
+                _ = &mut pulse => {
                     // Flush sidecar: drain envelopes queued by the central
                     // tick (chunks, TAB, entities) without a client write.
                     // This is socket flush only — no logical tick runs here.
-                    let out = {
+                    {
                         let mut sessions = self.sessions.lock();
-                        sessions
-                            .get_mut(&session_id)
-                            .map(|s| s.take_out())
-                            .unwrap_or_default()
-                    };
-                    if !out.is_empty() && write.write_all(&out).await.is_err() {
-                        break;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.take_out_into(&mut out);
+                        }
+                    }
+                    if !out.is_empty() {
+                        if write.write_all(&out).await.is_err() {
+                            break;
+                        }
+                        out.clear();
                     }
                 }
             }

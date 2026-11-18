@@ -14,7 +14,9 @@ use crate::error::PluginError;
 use crate::event::{Event, EventDispatcher};
 use crate::host::PluginHost;
 use crate::plugin::Plugin;
-use crate::runtime::{DiscoveredPluginManifest, PhpPlugin, PhpWorker, PluginSource};
+use crate::runtime::{
+    DiscoveredPluginManifest, PhpCommandInfo, PhpPlugin, PhpWorker, PluginSource,
+};
 
 /// `plugin/PluginEnableOrder.php`: plugins enable in `STARTUP` before worlds
 /// and in `POSTWORLD` after them.
@@ -88,6 +90,10 @@ pub struct PluginManager {
     /// listener events per plugin, used to rebuild the union set.
     listener_events_by_plugin: RwLock<HashMap<String, Vec<String>>>,
     listener_events: RwLock<HashSet<String>>,
+    /// Listener union reported by the PHP runtime on the last `tick` response.
+    /// Covers plugins that register listeners after `onEnable` (the per-plugin
+    /// snapshot only changes on enable/disable).
+    runtime_listener_events: RwLock<HashSet<String>>,
     current_tick: AtomicU64,
     enable_failures: RwLock<Vec<PluginFailure>>,
 }
@@ -110,6 +116,7 @@ impl PluginManager {
             load_order: RwLock::new(Vec::new()),
             listener_events_by_plugin: RwLock::new(HashMap::new()),
             listener_events: RwLock::new(HashSet::new()),
+            runtime_listener_events: RwLock::new(HashSet::new()),
             current_tick: AtomicU64::new(0),
             enable_failures: RwLock::new(Vec::new()),
         }
@@ -537,7 +544,14 @@ impl PluginManager {
     ) -> Result<Vec<PluginAction>, PluginError> {
         let mut actions = self.dispatcher.dispatch(event)?;
 
-        if !self.php_worker.is_shutting_down() && self.php_worker.is_available() {
+        // No listener registered for this event means PHP has nothing to run:
+        // skip the process round trip entirely (chat/join/quit used to pay it
+        // unconditionally). The runtime reports its live listener union on
+        // every tick, so listeners added after `onEnable` are seen within 50 ms.
+        if !self.php_worker.is_shutting_down()
+            && self.php_worker.is_available()
+            && self.has_listeners(event.name())
+        {
             let ipc_started = std::time::Instant::now();
             let response = self.php_worker.request_sync(
                 "dispatch_event",
@@ -585,12 +599,61 @@ impl PluginManager {
         Ok(actions)
     }
 
+    /// Delivers a `ModalFormResponsePacket` to the PHP form that produced it.
+    ///
+    /// `Player::sendForm()` keeps the form object in the runtime keyed by the
+    /// id it sent; the runtime calls `Form::handleResponse($player, $data)` and
+    /// returns the actions the handler emitted, which the caller applies like
+    /// any other plugin action.
+    pub fn dispatch_form_response_sync(
+        &self,
+        player: &str,
+        form_id: u32,
+        data: Option<String>,
+    ) -> Result<Vec<PluginAction>, PluginError> {
+        if self.php_worker.is_shutting_down() || !self.php_worker.is_available() {
+            return Ok(Vec::new());
+        }
+        let response = self.php_worker.request_sync(
+            "form_response",
+            json!({
+                "player": player,
+                "form_id": form_id,
+                "data": data
+            }),
+        )?;
+        if response.status != "ok" {
+            warn!(
+                "PHP form_response for '{}' (form {}) returned status '{}': {:?}",
+                player, form_id, response.status, response.message
+            );
+            return Ok(Vec::new());
+        }
+        Ok(response.actions)
+    }
+
     /// Async wrapper around [`PluginManager::dispatch_event_sync`].
     pub async fn dispatch_event(
         &self,
         event: &mut dyn Event,
     ) -> Result<Vec<PluginAction>, PluginError> {
         self.dispatch_event_sync(event)
+    }
+
+    /// Commands currently registered in the PHP runtime, including the ones
+    /// plugins add at `onEnable()` through `CommandMap::register()` instead
+    /// of declaring them in `plugin.yml`.
+    ///
+    /// Used to advertise plugin commands to clients: `AvailableCommandsPacket`
+    /// is what drives the client's command list and autocomplete.
+    pub fn php_commands(&self) -> Vec<PhpCommandInfo> {
+        match self.php_worker.list_commands() {
+            Ok(commands) => commands,
+            Err(error) => {
+                debug!("Unable to list PHP plugin commands: {}", error);
+                Vec::new()
+            }
+        }
     }
 
     /// Executes a command (legacy API returning only the emitted actions).
@@ -670,6 +733,12 @@ impl PluginManager {
             return Ok(Vec::new());
         }
 
+        // No PHP plugin loaded: the runtime scheduler has nothing to advance and
+        // no action can be produced, so skip the 20/s IPC round trip.
+        if self.plugins.read().is_empty() {
+            return Ok(Vec::new());
+        }
+
         let response = self
             .php_worker
             .request_sync("tick", json!({ "tick": tick }))?;
@@ -680,6 +749,13 @@ impl PluginManager {
                 tick, response.status, response.message
             );
             return Ok(Vec::new());
+        }
+
+        // Refresh the runtime listener union (see `runtime_listener_events`).
+        {
+            let mut runtime = self.runtime_listener_events.write();
+            runtime.clear();
+            runtime.extend(response.listener_events.iter().cloned());
         }
 
         Ok(response.actions)
@@ -695,6 +771,7 @@ impl PluginManager {
     /// Whether PHP has any listener for `event_name`.
     pub fn has_listeners(&self, event_name: &str) -> bool {
         self.listener_events.read().contains(event_name)
+            || self.runtime_listener_events.read().contains(event_name)
     }
 
     /// Rebuilds the listener-name union from the per-plugin metadata.
@@ -1054,8 +1131,9 @@ fn is_valid_base_version(version: &str) -> bool {
 }
 
 fn split_command_line(command_line: &str) -> Option<(String, Vec<String>)> {
-    let trimmed = command_line.trim().trim_start_matches('/');
-    let mut parts = trimmed.split_whitespace();
+    let trimmed = command_line.trim();
+    let without_prefix = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let mut parts = without_prefix.split_whitespace();
     let command = parts.next()?.to_string();
     if command.is_empty() {
         return None;

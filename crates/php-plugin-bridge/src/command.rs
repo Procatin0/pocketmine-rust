@@ -137,15 +137,34 @@ impl CommandMap {
     /// Looks up a command by bare name, alias or `prefix:name`.
     pub fn get_command(&self, name: &str) -> Option<Arc<dyn Command>> {
         let key = name.to_lowercase();
+        if let Some(cmd) = self.lookup_exact(&key) {
+            return Some(cmd);
+        }
+        let bare = key.trim_start_matches('/');
+        if !bare.is_empty() && bare != key {
+            if let Some(cmd) = self.lookup_exact(bare) {
+                return Some(cmd);
+            }
+        }
+        let with_slash = format!("/{}", bare);
+        if with_slash != key {
+            if let Some(cmd) = self.lookup_exact(&with_slash) {
+                return Some(cmd);
+            }
+        }
+        None
+    }
+
+    fn lookup_exact(&self, key: &str) -> Option<Arc<dyn Command>> {
         {
             let map = self.commands.read();
-            if let Some(command) = map.get(&key) {
+            if let Some(command) = map.get(key) {
                 return Some(Arc::clone(command));
             }
         }
         let resolved = {
             let aliases = self.aliases.read();
-            aliases.get(&key).cloned()
+            aliases.get(key).cloned()
         }?;
         let map = self.commands.read();
         map.get(&resolved).cloned()
@@ -156,12 +175,13 @@ impl CommandMap {
         sender: &CommandSender,
         command_line: &str,
     ) -> Result<Option<Vec<PluginAction>>, PluginError> {
-        let trimmed = command_line.trim().trim_start_matches('/');
-        if trimmed.is_empty() {
+        let trimmed = command_line.trim();
+        let without_prefix = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        if without_prefix.is_empty() {
             return Ok(None);
         }
 
-        let mut parts = trimmed.split_whitespace();
+        let mut parts = without_prefix.split_whitespace();
         let cmd_name = match parts.next() {
             Some(name) => name.to_lowercase(),
             None => return Ok(None),

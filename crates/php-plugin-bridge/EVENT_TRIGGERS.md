@@ -55,11 +55,17 @@ y `@trigger TODO: ...` en el docblock PHP.
 
 | Evento | Cancellable | Trigger sugerido | Estado |
 | --- | --- | --- | --- |
-| EntityDamage/ByBlock/ByEntity/ByChildEvent | ✅ | `world_state.rs` damage `TODO: world_state.rs:EntityDamageEvent` | stub |
+| EntityDamageEvent | ✅ | golpe melee, proyectil, caída/explosión del jugador (`SessionManager::damage_chain`) | disparado |
+| EntityDamageByEntityEvent | ✅ | golpe melee del jugador y `Player::attack()` | disparado |
+| EntityDamageByChildEntityEvent | ✅ | impacto de proyectil contra mob (`child` = proyectil) | disparado |
+| EntityDamageByBlockEvent | ✅ | — (el bloque no es damager todavía) | stub |
 | EntityCombust/ByBlock/ByEntityEvent | ✅ | `world_state.rs` `TODO: world_state.rs:EntityCombustEvent` | stub |
 | EntityEffect/Add/RemoveEvent | ✅ | `world_state.rs` `TODO: world_state.rs:EntityEffectEvent` | stub |
-| EntityDeath/Despawn/SpawnEvent | — | `world_state.rs` `TODO: world_state.rs:EntitySpawnEvent` | stub |
-| EntityExplode/PreExplode/FrostWalker/ItemPickup/Motion/RegainHealth/ShootBow/Teleport/Trample/BlockChange/AreaEffectCloudApply/Event | ✅ | `world_state.rs` `TODO: world_state.rs:EntityMotionEvent` | stub |
+| EntitySpawnEvent | — | `WorldState::spawn_entity()` | disparado |
+| EntityDeathEvent | — | `Living::onDeath()` del tick | disparado |
+| EntityDespawnEvent | — | `WorldState::remove_entity()` vivo y barrido de `closed` | disparado |
+| EntityExplodeEvent | ✅ | TNT (`explode_into`) y `Explosion` de PHP (`world.explode` → `queue_explosion`) encolan; `SessionManager::apply_explosions()` dispara antes de destruir bloques | disparado |
+| EntityPreExplode/FrostWalker/ItemPickup/Motion/RegainHealth/ShootBow/Teleport/Trample/BlockChange/AreaEffectCloudApply/Event | ✅ | `world_state.rs` `TODO: world_state.rs:EntityMotionEvent` | stub |
 | EntityExtinguishEvent (—), ItemSpawnEvent (—), ProjectileHit/HitBlock/HitEntityEvent (—), ItemDespawn/Merge/LaunchEvent (✅) | —/✅ | `world_state.rs` `TODO: world_state.rs:ProjectileLaunchEvent` | stub |
 
 ## Inventory (session.rs / world_state.rs)
@@ -74,11 +80,41 @@ y `@trigger TODO: ...` en el docblock PHP.
 
 ## World / Chunk (world_state.rs)
 
-Todos en `world_state.rs`. Cancellables: `ChunkUnloadEvent`, `WorldParticleEvent`, `WorldSoundEvent`, `WorldUnloadEvent`.
+El mundo no conoce el gestor de plugins, así que las mutaciones encolan
+(`WorldState::queue_world_event()`) y `SessionManager::dispatch_world_events()`
+entrega en el tick siguiente (`tick.world_events`).
 
-`WorldLoad/Init/Save/UnloadEvent`, `ChunkLoad/Populate/UnloadEvent`, `SpawnChangeEvent`, `WorldDifficultyChange/DisplayNameChangeEvent`, `WorldParticle/SoundEvent`.
+| Evento | Cancellable | Trigger | Estado |
+| --- | --- | --- | --- |
+| WorldSaveEvent | — | `WorldState::save()` (manual, `/save-all`, autoguardado) | disparado (aplazado al tick) |
+| SpawnChangeEvent | — | `WorldState::set_spawn()` (`/setworldspawn`, `world.set_spawn` de `World::setSpawnLocation()`) | disparado (aplazado al tick) |
+| WorldDifficultyChangeEvent | — | `WorldState::set_difficulty()` (`/difficulty`, `world.set_difficulty`) | disparado (aplazado al tick) |
+| WorldLoad/Init/UnloadEvent | Unload ✅ | `WorldManager::loadWorld`/`unloadWorld` (mundos espejo, sin tick) | stub |
+| ChunkLoadEvent | — | primera vez que la columna se envía a un jugador (`SessionManager::loaded_chunks`, una vez por chunk) | disparado |
+| ChunkPopulate/UnloadEvent | Unload ✅ | no hay cola de pobladores ni descarga de columnas | stub |
+| WorldDisplayNameChangeEvent | — | `World::setDisplayName()` es local (no hay nombre de mundo nativo) | stub |
+| WorldSoundEvent / WorldParticleEvent | ✅ | `World::addSound/addParticle` encolan `PendingWorldEffect`; `SessionManager::dispatch_world_effects()` dispara el evento y emite lo que devuelva (un tick después) | disparado |
 
-`TODO: world_state.rs:WorldLoadEvent`, `TODO: world_state.rs:ChunkLoadEvent`, etc.
+`TODO: world_state.rs:ChunkLoadEvent`, etc.
+
+### Bloque
+
+| Evento | Cancellable | Trigger | Estado |
+| --- | --- | --- | --- |
+| BlockBreakEvent / BlockPlaceEvent | ✅ | hilo de sesión (`PREDICT_DESTROY_BLOCK`, `handle_use_item_place`) | disparado |
+| BlockSpreadEvent | ✅ | `fluid::flow_into()` vía `BlockEventHook`, antes de escribir | disparado |
+| BlockFormEvent | ✅ | `fluid::liquid_collide()` (lava + agua → piedra/cobblestone/obsidiana) | disparado |
+| BlockGrowEvent | ✅ | random tick (cultivos, saplings, sugar cane, cactus, vines) | stub: `TickScene::set_block` crece sin evento previo |
+| LeavesDecayEvent | ✅ | `random_tick::leaves_tick()` | stub: mismo motivo |
+| BlockUpdateEvent | ✅ | cola de actualizaciones por vecino (`World::updateBlockAt`) | stub |
+| BlockExplode/PreExplodeEvent | ✅ | en PM 5 los dispara `RespawnAnchor`, no la TNT | stub |
+| BlockBurn/Melt/DeathEvent | ✅ | fuego/nieve (mecánica ausente) | stub |
+| BlockItemPickupEvent | ✅ | hoppers (mecánica ausente) | stub |
+| SignChange/PressurePlateUpdate/ChestPair/FarmlandHydrationChange/GeyserEruptionPulse/StructureGrow/BlockTeleport | ✅ | mecánica ausente | stub |
+
+La TNT dispara `EntityExplodeEvent` (no `BlockExplodeEvent`): `explode_into()`
+encola los bloques afectados y `SessionManager::apply_explosions()` dispara el
+evento antes de destruirlos, así que cancelar evita destrucción y daño.
 
 ## Server / Plugin
 

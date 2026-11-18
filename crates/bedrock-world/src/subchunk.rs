@@ -47,6 +47,24 @@ impl SubChunk {
         self.layers[layer].set(x, y, z, block_id);
     }
 
+    /// Fills `y_start..=y_end` of column `(x, z)` with `block_id` in `layer`
+    /// ([`PalettedBlockArray::fill_y`], one palette lookup for the run).
+    pub fn fill_column(
+        &mut self,
+        x: usize,
+        z: usize,
+        y_start: usize,
+        y_end: usize,
+        layer: usize,
+        block_id: u32,
+    ) {
+        if layer >= self.layers.len() {
+            self.layers
+                .resize_with(layer + 1, || PalettedBlockArray::new(self.default_block));
+        }
+        self.layers[layer].fill_y(x, z, y_start, y_end, block_id);
+    }
+
     /// Serializes this SubChunk into network format as a byte vector.
     pub fn serialize_network(&self) -> Vec<u8> {
         let mut writer = bedrock_protocol::Writer::new();

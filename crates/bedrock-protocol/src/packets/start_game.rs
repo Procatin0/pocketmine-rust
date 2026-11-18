@@ -101,6 +101,10 @@ impl Default for LevelSettings {
             game_rules: vec![
                 ("naturalregeneration".to_string(), false, false),
                 ("locatorbar".to_string(), false, false),
+                // Coordinates on the HUD. BDS calls it `showCoordinates`; PMMP
+                // keys it lowercase and the client matches the name, so keep the
+                // same lowercase spelling as the two rules above.
+                ("showcoordinates".to_string(), true, true),
             ],
             experiments: Vec::new(),
             experiments_previously_used: false,

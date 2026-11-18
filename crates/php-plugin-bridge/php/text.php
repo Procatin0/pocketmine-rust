@@ -150,6 +150,13 @@ namespace pocketmine\utils {
 
     class Utils
     {
+        public static function checkUTF8(string $string): void
+        {
+            if (!mb_check_encoding($string, 'UTF-8')) {
+                throw new \InvalidArgumentException("Text must be valid UTF-8");
+            }
+        }
+
         public static function getRandomFloat(float $min = 0.0, float $max = 1.0): float
         {
             return $min + ($max - $min) * (mt_rand() / mt_getrandmax());
@@ -229,5 +236,98 @@ namespace pocketmine\utils {
 
     class ConfigException extends ServerException
     {
+    }
+}
+
+namespace pocketmine\lang {
+    /**
+     * PM `Translatable`: anything that carries already-built translation text.
+     */
+    interface Translatable
+    {
+        public function getText(): string;
+    }
+
+    /**
+     * PM `Language` (minimal): this bridge has no `.l10n` resource files, so
+     * translations fall back to the key itself, but the object shape plugins
+     * rely on (`Server::getLanguage()->getLang()`, `translate*()`) is kept.
+     */
+    final class Language
+    {
+        private const NAMES = [
+            'eng' => 'English',
+            'spa' => 'Español',
+            'por' => 'Português',
+            'deu' => 'Deutsch',
+            'fra' => 'Français',
+            'ita' => 'Italiano',
+            'rus' => 'Русский',
+            'zho' => '中文',
+            'jpn' => '日本語',
+            'kor' => '한국어',
+        ];
+
+        public function __construct(
+            private string $lang
+        ) {
+        }
+
+        public function getLang(): string
+        {
+            return $this->lang;
+        }
+
+        public function getName(): string
+        {
+            return self::NAMES[$this->lang] ?? $this->lang;
+        }
+
+        /**
+         * PM fills `{%key}` placeholders with `$params[$key]`.
+         */
+        public function translateString(string $str, array $params = [], ?string $onlyPrefix = null): string
+        {
+            $placeholders = [];
+            foreach ($params as $key => $value) {
+                $placeholders['%' . $key] = self::stringify($value);
+            }
+            return strtr($this->get($str, $onlyPrefix), $placeholders);
+        }
+
+        /**
+         * PM fills `{0}`, `{1}`, ... with the positional arguments.
+         */
+        public function translate(mixed $key, mixed ...$args): string
+        {
+            $placeholders = [];
+            foreach ($args as $i => $arg) {
+                $placeholders['{' . $i . '}'] = self::stringify($arg);
+            }
+            return strtr(self::stringify($key), $placeholders);
+        }
+
+        /**
+         * Without loaded language data the key is the message (PM behaviour for
+         * a missing translation).
+         */
+        public function get(string $key, ?string $onlyPrefix = null): string
+        {
+            return $key;
+        }
+
+        private static function stringify(mixed $value): string
+        {
+            if ($value instanceof Translatable) {
+                return $value->getText();
+            }
+            if (is_bool($value)) {
+                return $value ? 'true' : 'false';
+            }
+            if (is_scalar($value) || $value === null) {
+                return (string)$value;
+            }
+            return (string)json_encode($value);
+        }
     }
 }

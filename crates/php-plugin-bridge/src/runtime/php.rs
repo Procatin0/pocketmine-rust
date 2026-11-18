@@ -37,6 +37,24 @@ pub struct DiscoveredPluginManifest {
     pub manifest: String,
 }
 
+/// A command registered in the PHP `CommandMap`, reported by the
+/// `list_commands` action. Plugin commands keep the label they were
+/// registered with (EasyEdit registers `/set`, `/wand`, ...), which the
+/// client sees as `//set`, `//wand`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhpCommandInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub usage: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub permission: String,
+}
+
 /// A single response line from the PHP worker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IpcResponse {
@@ -429,6 +447,37 @@ impl PhpWorker {
             })?
     }
 
+    /// Lists the commands registered in the PHP `CommandMap`.
+    ///
+    /// Plugins register commands during `onEnable()` instead of declaring
+    /// them in `plugin.yml` (EasyEdit registers `/set`, `/wand`, ... with the
+    /// `easyedit` prefix), so the client's `AvailableCommandsPacket` cannot be
+    /// built from the manifest alone. Failures degrade to an empty list: a
+    /// broken PHP worker must not block a player from joining.
+    pub fn list_commands(&self) -> Result<Vec<PhpCommandInfo>, PluginError> {
+        if self.is_shutting_down() || !self.is_available() {
+            return Ok(Vec::new());
+        }
+
+        let response = self.request_sync("list_commands", json!({}))?;
+        if response.status != "ok" {
+            return Ok(Vec::new());
+        }
+
+        let Some(Value::Array(commands)) = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("commands"))
+        else {
+            return Ok(Vec::new());
+        };
+
+        Ok(commands
+            .iter()
+            .filter_map(|command| serde_json::from_value(command.clone()).ok())
+            .collect())
+    }
+
     /// Dispatches an event to PHP and applies the mutated snapshot back.
     pub async fn dispatch_event(
         &self,
@@ -588,6 +637,8 @@ fn run_worker(
     stderr_lines: Arc<Mutex<VecDeque<String>>>,
 ) {
     let mut reader = BufReader::new(stdout);
+    // Reused encoding buffer for requests and host-call results.
+    let mut out_buf = Vec::with_capacity(4096);
 
     while let Ok(request) = receiver.recv() {
         let mut payload = Map::new();
@@ -598,18 +649,7 @@ fn run_worker(
             }
         }
 
-        let line = match serde_json::to_string(&Value::Object(payload)) {
-            Ok(line) => line,
-            Err(error) => {
-                let _ = request.reply.send(Err(PluginError::PhpRuntime(format!(
-                    "Failed to encode PHP request: {}",
-                    error
-                ))));
-                continue;
-            }
-        };
-
-        if let Err(error) = write_json_line(&mut stdin, &line) {
+        if let Err(error) = write_json_line(&mut stdin, &mut out_buf, &Value::Object(payload)) {
             let _ = request.reply.send(Err(error));
             break;
         }
@@ -622,7 +662,7 @@ fn run_worker(
             break;
         }
 
-        let result = read_response(&mut reader, &mut stdin, &host, &stderr_lines);
+        let result = read_response(&mut reader, &mut stdin, &host, &stderr_lines, &mut out_buf);
         let failed = result.is_err();
         let _ = request.reply.send(result);
 
@@ -656,6 +696,7 @@ fn read_response(
     stdin: &mut ChildStdin,
     host: &RwLock<Option<Arc<dyn PluginHost>>>,
     stderr_lines: &Arc<Mutex<VecDeque<String>>>,
+    out_buf: &mut Vec<u8>,
 ) -> Result<IpcResponse, PluginError> {
     loop {
         let mut line = String::new();
@@ -695,31 +736,43 @@ fn read_response(
             continue;
         }
 
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(PluginError::PhpRuntime(format!(
-                    "Invalid JSON from PHP worker: {} (line: {})",
-                    error, trimmed
-                )));
+        // Control lines are the only ones carrying a top-level `type`
+        // (`{"type":"host_call",...}`); the runtime writes every response
+        // starting with `{"status"`. Checking the prefix keeps the response
+        // path to a single JSON pass: parsing to `Value` and then walking that
+        // DOM into `IpcResponse` built a whole tree per tick/event for nothing.
+        if trimmed.as_bytes().starts_with(b"{\"type\"") {
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(PluginError::PhpRuntime(format!(
+                        "Invalid JSON from PHP worker: {} (line: {})",
+                        error, trimmed
+                    )));
+                }
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("host_call") => {
+                    handle_host_call(&value, stdin, host, out_buf)?;
+                    continue;
+                }
+                Some("host_result") => {
+                    // Late/unsolicited result from an earlier call; ignore it.
+                    debug!("Ignoring unsolicited host_result from PHP worker");
+                    continue;
+                }
+                _ => {
+                    debug!("Ignoring unknown control line from PHP worker");
+                    continue;
+                }
             }
-        };
-
-        match value.get("type").and_then(Value::as_str) {
-            Some("host_call") => {
-                handle_host_call(&value, stdin, host)?;
-                continue;
-            }
-            Some("host_result") => {
-                // Late/unsolicited result from an earlier call; ignore it.
-                debug!("Ignoring unsolicited host_result from PHP worker");
-                continue;
-            }
-            _ => {}
         }
 
-        let response: IpcResponse = serde_json::from_value(value).map_err(|error| {
-            PluginError::PhpRuntime(format!("Invalid IPC response from PHP worker: {}", error))
+        let response: IpcResponse = serde_json::from_str(trimmed).map_err(|error| {
+            PluginError::PhpRuntime(format!(
+                "Invalid IPC response from PHP worker: {} (line: {})",
+                error, trimmed
+            ))
         })?;
 
         if response.status == "fatal_error" {
@@ -737,6 +790,7 @@ fn handle_host_call(
     value: &Value,
     stdin: &mut ChildStdin,
     host: &RwLock<Option<Arc<dyn PluginHost>>>,
+    out_buf: &mut Vec<u8>,
 ) -> Result<(), PluginError> {
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let method = value
@@ -766,13 +820,23 @@ fn handle_host_call(
         }),
     };
 
-    write_json_line(stdin, &response.to_string())
+    write_json_line(stdin, out_buf, &response)
 }
 
-fn write_json_line(stdin: &mut ChildStdin, line: &str) -> Result<(), PluginError> {
-    stdin.write_all(line.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
+/// Encode `value` into `buffer` and write it as one line.
+///
+/// The buffer is reused across requests (no `String` per message) and the
+/// newline is appended before a single `write_all`, so each message costs one
+/// syscall instead of two (`ChildStdin` is unbuffered: `flush` was a no-op).
+fn write_json_line(
+    stdin: &mut ChildStdin,
+    buffer: &mut Vec<u8>,
+    value: &Value,
+) -> Result<(), PluginError> {
+    buffer.clear();
+    serde_json::to_writer(&mut *buffer, value)?;
+    buffer.push(b'\n');
+    stdin.write_all(buffer)?;
     Ok(())
 }
 

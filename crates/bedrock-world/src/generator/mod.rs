@@ -10,7 +10,12 @@ pub mod bds_noise_params;
 pub mod bds_seed_hash;
 pub mod bds_terrain;
 pub mod caves;
+pub mod cubiomes;
 pub mod flat;
+pub mod java_biome_tree;
+pub mod java_blended_noise;
+pub mod java_density;
+pub mod java_biomes;
 pub mod java_terrain;
 pub mod manager;
 pub mod noise;
@@ -23,6 +28,8 @@ pub use bds_noise_params::{BEDROCK_CLIMATE_SEEDS, BedrockNoiseConfig, CLIMATE_TE
 pub use bds_seed_hash::{bedrock_string_to_seed, bedrock_string_seed_to_u64, murmur3_32};
 pub use bds_terrain::{BDSTerrain, BDS_SEA_LEVEL};
 pub use flat::FlatGenerator;
+pub use java_biomes::{JavaBiomes, DoublePerlinNoise as JavaDoublePerlinNoise};
+pub use java_density::{DensityRoot, TerrainDensity};
 pub use java_terrain::{
     DoublePerlinNoise, JavaTerrain, PerlinNoise, Spline, Xoroshiro128Plus,
     BEDROCK_NORMAL_SEA_LEVEL, JAVA_SEA_LEVEL,
@@ -65,6 +72,31 @@ pub trait WorldGenerator: Send + Sync {
     /// The default returns air because the trait has no access to a chunk store.
     fn block_at(&self, _x: i32, _y: i32, _z: i32) -> u32 {
         crate::block_id::AIR
+    }
+
+    /// Generates a `width x depth` block of columns, returning them in row
+    /// order.
+    ///
+    /// The default walks [`WorldGenerator::generate_chunk_object`] per
+    /// column; generators whose population pass needs the 3x3 base
+    /// neighbourhood should override it so a bulk pass (pregenerator) builds
+    /// each base chunk once instead of once per neighbour. `BDSTerrain` does
+    /// that with [`BDSTerrain::generate_region`], which measured ~2.3x the
+    /// per-column path on one core and ~3x with 16 threads.
+    fn generate_region(
+        &self,
+        start_x: i32,
+        start_z: i32,
+        width: i32,
+        depth: i32,
+    ) -> Vec<((i32, i32), crate::chunk::Chunk)> {
+        let mut out = Vec::with_capacity((width.max(0) * depth.max(0)) as usize);
+        for cx in start_x..(start_x + width) {
+            for cz in start_z..(start_z + depth) {
+                out.push(((cx, cz), self.generate_chunk_object(cx, cz)));
+            }
+        }
+        out
     }
 
     /// Generates a chunk applying block edits in ABSOLUTE world coordinates.

@@ -8,6 +8,52 @@ namespace pocketmine\entity {
     {
     }
 
+    /**
+     * `pocketmine\entity\EntitySizeInfo`: alto, ancho y altura de ojos.
+     */
+    final class EntitySizeInfo
+    {
+        private float $eyeHeight;
+
+        public function __construct(
+            private float $height,
+            private float $width,
+            ?float $eyeHeight = null
+        ) {
+            $this->eyeHeight = $eyeHeight ?? min($this->height / 2 + 0.1, $this->height);
+        }
+
+        public function getHeight(): float
+        {
+            return $this->height;
+        }
+
+        public function getWidth(): float
+        {
+            return $this->width;
+        }
+
+        public function getEyeHeight(): float
+        {
+            return $this->eyeHeight;
+        }
+
+        public function scale(float $newScale): self
+        {
+            return new self(
+                $this->height * $newScale,
+                $this->width * $newScale,
+                $this->eyeHeight * $newScale
+            );
+        }
+    }
+
+    /** `pocketmine\entity\Ageable`: `WaterAnimal` y `Villager` lo implementan. */
+    interface Ageable
+    {
+        public function isBaby(): bool;
+    }
+
     abstract class Entity
     {
         public int|string $id = 0;
@@ -16,9 +62,207 @@ namespace pocketmine\entity {
         protected string $nameTag = '';
         protected bool $nameTagAlwaysVisible = false;
 
+        /** `Entity::getId()` nativo; `null` mientras no esté en el mundo. */
+        protected ?int $nativeUniqueId = null;
+        /** Runtime id del actor Bedrock (el que usan los paquetes). */
+        protected ?int $nativeRuntimeId = null;
+        /** `getNetworkTypeId()` (`EntityIds`): lo fija la subclase o el proxy. */
+        protected string $networkTypeId = '';
+        protected ?\pocketmine\math\Vector3 $motion = null;
+        protected ?EntitySizeInfo $size = null;
+        protected bool $closed = false;
+
+        /** `getNetworkTypeId()` de la clase (estático, como en PocketMine). */
+        public const NETWORK_TYPE_ID = '';
+        /** Último error del host (`tipo desconocido`, tope de entidades...). */
+        protected ?string $lastError = null;
+
         public function getId(): int|string
         {
             return property_exists($this, 'runtimeId') ? $this->runtimeId : $this->id;
+        }
+
+        public static function getNetworkTypeId(): string
+        {
+            return static::NETWORK_TYPE_ID;
+        }
+
+        /**
+         * Tipo de **esta instancia**: el estático de la clase, o el que fijó
+         * `EntityProxy`/`applyNativeSnapshot()` para un tipo dinámico.
+         */
+        public function getInstanceTypeId(): string
+        {
+            return $this->networkTypeId !== '' ? $this->networkTypeId : static::getNetworkTypeId();
+        }
+
+        /**
+         * `Entity::getName()`: por defecto el nombre corto de la clase, como
+         * `(new ReflectionClass($this))->getShortName()` en PM.
+         */
+        public function getName(): string
+        {
+            return (new \ReflectionClass($this))->getShortName();
+        }
+
+        /** `Entity::getInitialSizeInfo()`; cada clase la sobreescribe. */
+        protected function getInitialSizeInfo(): EntitySizeInfo
+        {
+            return new EntitySizeInfo(1.8, 0.6);
+        }
+
+        public function getSize(): EntitySizeInfo
+        {
+            return $this->size ??= $this->getInitialSizeInfo();
+        }
+
+        /** `Entity::getBoundingBox()`: centrada en x/z, desde los pies hacia arriba. */
+        public function getBoundingBox(): \pocketmine\math\AxisAlignedBB
+        {
+            $location = $this->getLocation();
+            $size = $this->getSize();
+            $half = $size->getWidth() / 2;
+            return new \pocketmine\math\AxisAlignedBB(
+                $location->x - $half,
+                $location->y,
+                $location->z - $half,
+                $location->x + $half,
+                $location->y + $size->getHeight(),
+                $location->z + $half
+            );
+        }
+
+        /** `Entity::getDirectionVector()` (`-sin yaw`, `-sin pitch`, `cos yaw`). */
+        public function getDirectionVector(): \pocketmine\math\Vector3
+        {
+            $location = $this->getLocation();
+            $yaw = deg2rad($location->getYaw());
+            $pitch = deg2rad($location->getPitch());
+            return new \pocketmine\math\Vector3(
+                -sin($yaw) * cos($pitch),
+                -sin($pitch),
+                cos($yaw) * cos($pitch)
+            );
+        }
+
+        public function getMotion(): \pocketmine\math\Vector3
+        {
+            return $this->motion ??= new \pocketmine\math\Vector3(0.0, 0.0, 0.0);
+        }
+
+        /** `Entity::setMotion(Vector3 $motion): bool`. */
+        public function setMotion(\pocketmine\math\Vector3 $motion): bool
+        {
+            $this->motion = $motion;
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.set_motion', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'x' => $motion->x,
+                    'y' => $motion->y,
+                    'z' => $motion->z,
+                ]);
+                return is_array($result) && ($result['ok'] ?? false) === true;
+            }
+            return true;
+        }
+
+        /** `Living::knockBack($x, $z, $force, $verticalLimit)`. */
+        public function knockBack(
+            float $x,
+            float $z,
+            float $force = 0.4,
+            ?float $verticalLimit = 0.4
+        ): void {
+            if ($this->nativeUniqueId === null
+                || !class_exists(\pocketmine\runtime\Bridge::class)
+                || !\pocketmine\runtime\Bridge::isActive()
+            ) {
+                return;
+            }
+            \pocketmine\runtime\Bridge::hostCall('entity.knock_back', [
+                'unique_id' => $this->nativeUniqueId,
+                'dx' => $x,
+                'dz' => $z,
+                'force' => $force,
+            ]);
+        }
+
+        /** Id de PocketMine de la entidad nativa (`null` si no está spawneada). */
+        public function getNativeId(): ?int
+        {
+            return $this->nativeUniqueId;
+        }
+
+        public function isNative(): bool
+        {
+            return $this->nativeUniqueId !== null;
+        }
+
+        public function getLastError(): ?string
+        {
+            return $this->lastError;
+        }
+
+        /** Hidrata la entidad desde un snapshot de `entity.get`/`entity.list`. */
+        public function applyNativeSnapshot(array $data): void
+        {
+            if (isset($data['unique_id'])) {
+                $this->nativeUniqueId = (int)$data['unique_id'];
+                $this->id = $this->nativeUniqueId;
+            }
+            if (isset($data['runtime_id'])) {
+                $this->nativeRuntimeId = (int)$data['runtime_id'];
+                if (property_exists($this, 'runtimeId')) {
+                    $this->runtimeId = $this->nativeRuntimeId;
+                }
+            }
+            if (isset($data['type'])) {
+                $this->networkTypeId = (string)$data['type'];
+            }
+            if (isset($data['x'], $data['y'], $data['z'])) {
+                $this->location = new \pocketmine\world\Location(
+                    (float)$data['x'],
+                    (float)$data['y'],
+                    (float)$data['z'],
+                    (float)($data['yaw'] ?? 0.0),
+                    (float)($data['pitch'] ?? 0.0),
+                    $this->location?->getWorldName() ?? $this->getWorld()->getName()
+                );
+                foreach (['x' => 'x', 'y' => 'y', 'z' => 'z', 'yaw' => 'yaw', 'pitch' => 'pitch'] as $key => $property) {
+                    if (property_exists($this, $property) && isset($data[$key])) {
+                        $this->{$property} = (float)$data[$key];
+                    }
+                }
+            }
+            if (isset($data['motion_x'], $data['motion_y'], $data['motion_z'])) {
+                $this->motion = new \pocketmine\math\Vector3(
+                    (float)$data['motion_x'],
+                    (float)$data['motion_y'],
+                    (float)$data['motion_z']
+                );
+            }
+            if (isset($data['height'], $data['width'])) {
+                $this->size = new EntitySizeInfo(
+                    (float)$data['height'],
+                    (float)$data['width'],
+                    isset($data['eye_height']) ? (float)$data['eye_height'] : null
+                );
+            }
+            if (isset($data['name_tag'])) {
+                $this->nameTag = (string)$data['name_tag'];
+            }
+            if (isset($data['health']) && property_exists($this, 'health')) {
+                $this->health = (float)$data['health'];
+            }
+            if (isset($data['max_health']) && property_exists($this, 'maxHealth')) {
+                $this->maxHealth = (float)$data['max_health'];
+            }
+            if (array_key_exists('alive', $data)) {
+                $this->closed = !((bool)$data['alive']);
+            }
         }
 
         public function getWorld(): \pocketmine\world\World
@@ -66,6 +310,15 @@ namespace pocketmine\entity {
         public function setNameTag(string $name): void
         {
             $this->nameTag = $name;
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                \pocketmine\runtime\Bridge::hostCall('entity.set_name_tag', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'name_tag' => $name,
+                ]);
+            }
         }
 
         public function isNameTagAlwaysVisible(): bool
@@ -78,13 +331,164 @@ namespace pocketmine\entity {
             $this->nameTagAlwaysVisible = $value;
         }
 
+        /**
+         * `Entity::spawnToAll()`. La entidad se crea en el mundo nativo
+         * (`entity.spawn`); la difusión a los clientes la hace el tick del
+         * servidor por chunks (`Entity::spawnTo`).
+         */
+        public function spawnToAll(): void
+        {
+            $this->spawnTo(null);
+        }
+
+        /**
+         * Host call que crea la entidad nativa. Las subclases con estado propio
+         * (`ItemEntity`, `FallingBlock`, `PrimedTNT`, `ExperienceOrb` y los
+         * proyectiles) lo sobrescriben para mandar el suyo.
+         *
+         * @return array{0: string, 1: array<string, mixed>}|null
+         */
+        protected function spawnHostCall(): ?array
+        {
+            $location = $this->getLocation();
+            return ['entity.spawn', [
+                'type' => $this->getInstanceTypeId(),
+                'x' => $location->x,
+                'y' => $location->y,
+                'z' => $location->z,
+                'yaw' => $location->getYaw(),
+                'pitch' => $location->getPitch(),
+                'name_tag' => $this->nameTag,
+            ]];
+        }
+
+        /**
+         * `Entity::spawnTo(Player $player)`. El visor se ignora: la entidad se
+         * registra en el mundo nativo y el servidor la difunde a los jugadores
+         * que tienen cargado su chunk (lo que en PM hace `spawnTo`).
+         */
+        public function spawnTo(?\pocketmine\player\Player $player = null): void
+        {
+            if ($this->nativeUniqueId !== null || $this->getInstanceTypeId() === '') {
+                return;
+            }
+            if (!class_exists(\pocketmine\runtime\Bridge::class) || !\pocketmine\runtime\Bridge::isActive()) {
+                $this->lastError = 'bridge inactive';
+                return;
+            }
+            $call = $this->spawnHostCall();
+            if ($call === null) {
+                $this->lastError = 'unsupported entity';
+                return;
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall($call[0], $call[1]);
+            if (is_array($result) && isset($result['entity'])) {
+                $this->applyNativeSnapshot($result['entity']);
+                $this->lastError = null;
+                return;
+            }
+            $this->lastError = is_array($result)
+                ? (string)($result['error'] ?? 'entity.spawn failed')
+                : 'entity.spawn failed';
+        }
+
+        /** `Entity::kill()`: elimina la entidad del mundo nativo. */
+        public function kill(): void
+        {
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                \pocketmine\runtime\Bridge::hostCall('entity.despawn', ['unique_id' => $this->nativeUniqueId]);
+                $this->nativeUniqueId = null;
+            }
+            $this->closed = true;
+        }
+
+        public function isClosed(): bool
+        {
+            return $this->closed;
+        }
+
         public function isAlive(): bool
         {
+            return !$this->closed;
+        }
+
+        /**
+         * `Entity::teleport(Vector3 $pos, ?float $yaw, ?float $pitch)`.
+         * Aplica el movimiento en el mundo nativo cuando la entidad está
+         * registrada; si no, solo actualiza la posición local.
+         */
+        public function teleport(\pocketmine\math\Vector3 $pos, ?float $yaw = null, ?float $pitch = null): bool
+        {
+            $targetYaw = $yaw ?? ($this->location?->getYaw() ?? 0.0);
+            $targetPitch = $pitch ?? ($this->location?->getPitch() ?? 0.0);
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.teleport', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'x' => $pos->x,
+                    'y' => $pos->y,
+                    'z' => $pos->z,
+                    'yaw' => $targetYaw,
+                    'pitch' => $targetPitch,
+                ]);
+                if (!is_array($result) || ($result['ok'] ?? false) !== true) {
+                    return false;
+                }
+            }
+            foreach (['x' => $pos->x, 'y' => $pos->y, 'z' => $pos->z, 'yaw' => $targetYaw, 'pitch' => $targetPitch] as $property => $value) {
+                if (property_exists($this, $property)) {
+                    $this->{$property} = (float)$value;
+                }
+            }
+            $this->location = new \pocketmine\world\Location(
+                $pos->x,
+                $pos->y,
+                $pos->z,
+                $targetYaw,
+                $targetPitch,
+                $this->location?->getWorldName() ?? $this->getWorld()->getName()
+            );
             return true;
+        }
+
+        /**
+         * `Entity::attack(EntityDamageEvent $source)`. Acepta también un número
+         * (daño directo) y delega en el host (`entity.damage`).
+         */
+        public function attack(mixed $source): void
+        {
+            if (is_numeric($source)) {
+                $amount = (float)$source;
+            } elseif (is_object($source) && method_exists($source, 'getFinalDamage')) {
+                $amount = (float)$source->getFinalDamage();
+            } else {
+                return;
+            }
+            if ($amount <= 0.0 || $this->nativeUniqueId === null) {
+                return;
+            }
+            if (!class_exists(\pocketmine\runtime\Bridge::class) || !\pocketmine\runtime\Bridge::isActive()) {
+                return;
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall('entity.damage', [
+                'unique_id' => $this->nativeUniqueId,
+                'damage' => $amount,
+            ]);
+            if (is_array($result) && isset($result['entity'])) {
+                $this->applyNativeSnapshot($result['entity']);
+            }
         }
 
         public function close(): void
         {
+            if ($this->nativeUniqueId !== null) {
+                $this->kill();
+            }
         }
     }
 
@@ -106,16 +510,174 @@ namespace pocketmine\entity {
         public function setHealth(float $amount): void
         {
             $this->health = max(0.0, min($this->maxHealth, $amount));
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.set_health', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'health' => $this->health,
+                ]);
+                if (is_array($result) && isset($result['entity'])) {
+                    $this->applyNativeSnapshot($result['entity']);
+                }
+            }
         }
 
         public function setMaxHealth(float $amount): void
         {
             $this->maxHealth = max(1.0, $amount);
         }
+
+        // ---- Efectos (`pocketmine\entity\effect`) ----
+
+        private ?\pocketmine\entity\effect\EffectCollection $effects = null;
+
+        /**
+         * `Living::getEffects()`: en una entidad nativa lee el estado del
+         * motor (`entity.effects`, que decae en `tick_entities`); sin puente
+         * devuelve la colección local.
+         */
+        public function getEffects(): \pocketmine\entity\effect\EffectCollection
+        {
+            if ($this->nativeUniqueId === null
+                || !class_exists(\pocketmine\runtime\Bridge::class)
+                || !\pocketmine\runtime\Bridge::isActive()
+            ) {
+                return $this->effects ??= new \pocketmine\entity\effect\EffectCollection();
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall('entity.effects', [
+                'unique_id' => $this->nativeUniqueId,
+            ]);
+            $collection = new \pocketmine\entity\effect\EffectCollection();
+            foreach ((is_array($result) ? ($result['effects'] ?? []) : []) as $data) {
+                if (!is_array($data)) {
+                    continue;
+                }
+                $type = \pocketmine\data\bedrock\effect\EffectIdMap::fromId((int)($data['id'] ?? 0));
+                if ($type === null) {
+                    continue;
+                }
+                $collection->add(new \pocketmine\entity\effect\EffectInstance(
+                    $type,
+                    (int)($data['duration'] ?? 0),
+                    (int)($data['amplifier'] ?? 0),
+                    (bool)($data['visible'] ?? true),
+                    (bool)($data['ambient'] ?? false),
+                    null,
+                    (bool)($data['infinite'] ?? false)
+                ));
+            }
+            return $this->effects = $collection;
+        }
+
+        /**
+         * `Living::addEffect(EffectInstance): bool`. Un efecto sin id Bedrock
+         * (custom) no se puede guardar en el motor y devuelve `false`.
+         */
+        public function addEffect(\pocketmine\entity\effect\EffectInstance $effect): bool
+        {
+            $id = \pocketmine\data\bedrock\effect\EffectIdMap::toId($effect->getType());
+            if ($id === null) {
+                return false;
+            }
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.add_effect', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'id' => $id,
+                    'duration' => $effect->getDuration(),
+                    'amplifier' => $effect->getAmplifier(),
+                    'visible' => $effect->isVisible(),
+                    'ambient' => $effect->isAmbient(),
+                    'infinite' => $effect->isInfinite(),
+                ]);
+                if (!is_array($result) || empty($result['ok'])) {
+                    return false;
+                }
+            }
+            $this->getEffects()->add($effect);
+            // `Effect::add()`: los efectos instantáneos se aplican al añadirlos.
+            $type = $effect->getType();
+            if ($type instanceof \pocketmine\entity\effect\InstantEffect) {
+                $type->applyEffect($this, $effect);
+            }
+            return true;
+        }
+
+        /** `Living::removeEffect(Effect): bool`. */
+        public function removeEffect(\pocketmine\entity\effect\Effect $effect): bool
+        {
+            $id = \pocketmine\data\bedrock\effect\EffectIdMap::toId($effect);
+            if ($id === null) {
+                return false;
+            }
+            $removed = false;
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.remove_effect', [
+                    'unique_id' => $this->nativeUniqueId,
+                    'id' => $id,
+                ]);
+                $removed = is_array($result) && !empty($result['ok']);
+            }
+            if ($this->effects !== null && $this->effects->has($effect)) {
+                $this->effects->remove($effect);
+                $removed = true;
+            }
+            return $removed;
+        }
+
+        /** `Living::hasEffect(Effect): bool`. */
+        public function hasEffect(\pocketmine\entity\effect\Effect $effect): bool
+        {
+            return $this->getEffect($effect) !== null;
+        }
+
+        /** `Living::getEffect(Effect): ?EffectInstance`. */
+        public function getEffect(\pocketmine\entity\effect\Effect $effect): ?\pocketmine\entity\effect\EffectInstance
+        {
+            return $this->getEffects()->get($effect);
+        }
+
+        /** `Living::removeAllEffects(): bool`. */
+        public function removeAllEffects(): bool
+        {
+            $removed = $this->effects !== null && $this->effects->count() > 0;
+            if ($this->nativeUniqueId !== null
+                && class_exists(\pocketmine\runtime\Bridge::class)
+                && \pocketmine\runtime\Bridge::isActive()
+            ) {
+                $result = \pocketmine\runtime\Bridge::hostCall('entity.clear_effects', [
+                    'unique_id' => $this->nativeUniqueId,
+                ]);
+                $removed = $removed || (is_array($result) && ((int)($result['removed'] ?? 0)) > 0);
+            }
+            $this->effects?->clear();
+            return $removed;
+        }
+
+        /** `Living::getDrops()`: sin tabla propia, sin drops. */
+        public function getDrops(): array
+        {
+            return [];
+        }
+
+        /** `Living::getXpDropAmount()`; `Zombie` devuelve 5. */
+        public function getXpDropAmount(): int
+        {
+            return 0;
+        }
     }
 
     class Human extends Living
     {
+        public const NETWORK_TYPE_ID = 'minecraft:player';
+
         protected ?Skin $skin = null;
 
         public function getSkin(): object
@@ -126,6 +688,163 @@ namespace pocketmine\entity {
         public function setSkin(Skin $skin): void
         {
             $this->skin = $skin;
+        }
+    }
+
+    /**
+     * `pocketmine\entity\WaterAnimal` (abstracta): animal acuático.
+     * `canBreathe()`/`onAirExpired()` dependen del estado de agua de la
+     * sesión nativa, que aún no se consulta; se conserva la firma.
+     */
+    abstract class WaterAnimal extends Living implements Ageable
+    {
+        protected bool $baby = false;
+
+        public function isBaby(): bool
+        {
+            return $this->baby;
+        }
+
+        public function setBaby(bool $baby = true): void
+        {
+            $this->baby = $baby;
+        }
+
+        public function canBreathe(): bool
+        {
+            return false;
+        }
+
+        public function onAirExpired(): void
+        {
+        }
+    }
+
+    /** `pocketmine\entity\Zombie`: 20 PV, 1.9x0.6, drops de podredumbre. */
+    class Zombie extends Living
+    {
+        public const NETWORK_TYPE_ID = 'minecraft:zombie';
+
+        public function __construct(?\pocketmine\world\Location $location = null, mixed $nbt = null)
+        {
+            if ($location !== null) {
+                $this->location = $location;
+            }
+        }
+
+        protected function getInitialSizeInfo(): EntitySizeInfo
+        {
+            return new EntitySizeInfo(1.9, 0.6);
+        }
+
+        public function getName(): string
+        {
+            return 'Zombie';
+        }
+
+        public function getDrops(): array
+        {
+            $flesh = \pocketmine\item\ItemFactory::fromString('minecraft:rotten_flesh');
+            $flesh->setCount(mt_rand(0, 2));
+            $drops = [$flesh];
+            if (mt_rand(0, 199) < 5) {
+                $drops[] = match (mt_rand(0, 2)) {
+                    0 => \pocketmine\item\ItemFactory::fromString('minecraft:iron_ingot'),
+                    1 => \pocketmine\item\ItemFactory::fromString('minecraft:carrot'),
+                    default => \pocketmine\item\ItemFactory::fromString('minecraft:potato'),
+                };
+            }
+            return $drops;
+        }
+
+        public function getXpDropAmount(): int
+        {
+            return 5;
+        }
+    }
+
+    /** `pocketmine\entity\Villager`: 20 PV, 1.9x0.6, cinco profesiones. */
+    class Villager extends Living implements Ageable
+    {
+        public const NETWORK_TYPE_ID = 'minecraft:villager';
+
+        public const PROFESSION_FARMER = 0;
+        public const PROFESSION_LIBRARIAN = 1;
+        public const PROFESSION_PRIEST = 2;
+        public const PROFESSION_BLACKSMITH = 3;
+        public const PROFESSION_BUTCHER = 4;
+
+        private bool $baby = false;
+        private int $profession = self::PROFESSION_FARMER;
+
+        public function __construct(?\pocketmine\world\Location $location = null, mixed $nbt = null)
+        {
+            if ($location !== null) {
+                $this->location = $location;
+            }
+        }
+
+        protected function getInitialSizeInfo(): EntitySizeInfo
+        {
+            return new EntitySizeInfo(1.9, 0.6);
+        }
+
+        public function getName(): string
+        {
+            return 'Villager';
+        }
+
+        public function isBaby(): bool
+        {
+            return $this->baby;
+        }
+
+        public function setBaby(bool $baby = true): void
+        {
+            $this->baby = $baby;
+        }
+
+        public function getProfession(): int
+        {
+            return $this->profession;
+        }
+
+        /** `Villager::setProfession()`: fuera de 0..4 se usa `FARMER`. */
+        public function setProfession(int $profession): void
+        {
+            $this->profession = ($profession > 4 || $profession < 0)
+                ? self::PROFESSION_FARMER
+                : $profession;
+        }
+    }
+
+    /** `pocketmine\entity\Squid`: 10 PV, 0.8x0.6, saca de tinta. */
+    class Squid extends WaterAnimal
+    {
+        public const NETWORK_TYPE_ID = 'minecraft:squid';
+
+        public function __construct(?\pocketmine\world\Location $location = null, mixed $nbt = null)
+        {
+            if ($location !== null) {
+                $this->location = $location;
+            }
+        }
+
+        protected function getInitialSizeInfo(): EntitySizeInfo
+        {
+            return new EntitySizeInfo(0.8, 0.6);
+        }
+
+        public function getName(): string
+        {
+            return 'Squid';
+        }
+
+        public function getDrops(): array
+        {
+            $ink = \pocketmine\item\ItemFactory::fromString('minecraft:ink_sac');
+            $ink->setCount(mt_rand(1, 3));
+            return [$ink];
         }
     }
 
@@ -202,8 +921,8 @@ namespace pocketmine\entity {
         public function createFromData(\pocketmine\world\World $world, mixed $nbt): ?Entity
         {
             $id = '';
-            if (is_object($nbt) && method_exists($nbt, 'getString')) {
-                $id = $nbt->getString('id', '');
+            if (is_object($nbt) && method_exists($nbt, 'hasTag') && $nbt->hasTag('id')) {
+                $id = $nbt->getString('id');
             }
             $className = $this->saveNames[strtolower($id)] ?? null;
             if ($className !== null && isset($this->creators[$className])) {
@@ -216,6 +935,39 @@ namespace pocketmine\entity {
         {
             return array_keys($this->saveNames);
         }
+
+        /**
+         * `EntityFactory::create()`: construye la instancia PHP de un tipo de
+         * entidad. Hoy devuelve `EntityProxy`; cada tipo con clase propia
+         * (`Zombie`, `Cow`, ...) se añade en la fase 2 y se registra aquí.
+         */
+        public function create(
+            string $networkTypeId,
+            \pocketmine\world\Location $location,
+            ?string $nameTag = null
+        ): ?Entity {
+            if (!str_contains($networkTypeId, ':')) {
+                $networkTypeId = 'minecraft:' . $networkTypeId;
+            }
+            if ($networkTypeId === 'minecraft:player') {
+                return null;
+            }
+            $map = [
+                'minecraft:zombie' => Zombie::class,
+                'minecraft:villager' => Villager::class,
+                'minecraft:squid' => Squid::class,
+            ];
+            $class = $map[strtolower($networkTypeId)] ?? null;
+            if ($class !== null) {
+                /** @var Entity $entity */
+                $entity = new $class($location);
+                if ($nameTag !== null && $nameTag !== '') {
+                    $entity->setNameTag($nameTag);
+                }
+                return $entity;
+            }
+            return new EntityProxy($networkTypeId, $location, $nameTag ?? '');
+        }
     }
 
     class EntityDataHelper
@@ -224,15 +976,15 @@ namespace pocketmine\entity {
         {
             $pos = [0.0, 0.0, 0.0];
             $rot = [0.0, 0.0];
-            if (is_object($nbt) && method_exists($nbt, 'getListTag')) {
-                $posTag = $nbt->getListTag('Pos');
+            if (is_object($nbt) && method_exists($nbt, 'hasTag') && method_exists($nbt, 'getListTag')) {
+                $posTag = $nbt->hasTag('Pos') ? $nbt->getListTag('Pos') : null;
                 if ($posTag !== null && method_exists($posTag, 'getValue')) {
                     $values = $posTag->getValue();
                     $pos[0] = isset($values[0]) && method_exists($values[0], 'getValue') ? (float)$values[0]->getValue() : 0.0;
                     $pos[1] = isset($values[1]) && method_exists($values[1], 'getValue') ? (float)$values[1]->getValue() : 0.0;
                     $pos[2] = isset($values[2]) && method_exists($values[2], 'getValue') ? (float)$values[2]->getValue() : 0.0;
                 }
-                $rotTag = $nbt->getListTag('Rotation');
+                $rotTag = $nbt->hasTag('Rotation') ? $nbt->getListTag('Rotation') : null;
                 if ($rotTag !== null && method_exists($rotTag, 'getValue')) {
                     $values = $rotTag->getValue();
                     $rot[0] = isset($values[0]) && method_exists($values[0], 'getValue') ? (float)$values[0]->getValue() : 0.0;
@@ -241,166 +993,97 @@ namespace pocketmine\entity {
             }
             return new \pocketmine\world\Location($pos[0], $pos[1], $pos[2], $rot[0], $rot[1], $world);
         }
+
+        /**
+         * ¿Hay un `Server` que `applyNativeSnapshot()` pueda usar?
+         *
+         * La resolución del mundo es el único paso del snapshot que puede
+         * fallar por el entorno: `Player::getWorld()` llama a
+         * `Server::getInstance()` sin guardas, así que hace falta la clase
+         * cargada **y** una instancia inicializable. Sin eso se hidrata el
+         * snapshot sin posición; cualquier otro error se propaga.
+         */
+        private static function serverAvailable(): bool
+        {
+            try {
+                if (!class_exists(\pocketmine\Server::class)) {
+                    return false;
+                }
+                \pocketmine\Server::getInstance();
+                return true;
+            } catch (\Throwable) {
+                return false;
+            }
+        }
+
+        /**
+         * Construye una entidad desde el snapshot que envía Rust
+         * (`entity_json()`: `entity.get`, `entity.list` y eventos).
+         */
+        public static function entityFromArray(array $data): Entity
+        {
+            $location = new \pocketmine\world\Location(
+                (float)($data['x'] ?? 0.0),
+                (float)($data['y'] ?? 0.0),
+                (float)($data['z'] ?? 0.0),
+                (float)($data['yaw'] ?? 0.0),
+                (float)($data['pitch'] ?? 0.0),
+                (string)($data['world'] ?? 'world')
+            );
+            $type = (string)($data['type'] ?? '');
+            // `minecraft:player` no tiene entrada en `EntityFactory`; un evento
+            // de daño sobre un jugador debe entregar un `Player`, como en PM.
+            if ($type === 'minecraft:player') {
+                $player = new \pocketmine\player\Player(
+                    $data + ['name' => (string)($data['name_tag'] ?? 'Steve')]
+                );
+                if (self::serverAvailable()) {
+                    $player->applyNativeSnapshot($data);
+                } else {
+                    // Sin `Server` inicializable `Player::getWorld()` no puede
+                    // resolver el mundo; el constructor ya copió posición, vida
+                    // e ids del mismo payload, así que se hidrata el resto del
+                    // snapshot sin tocar la posición. Cualquier otro error del
+                    // snapshot se propaga en vez de perderse aquí.
+                    unset($data['x'], $data['y'], $data['z'], $data['yaw'], $data['pitch']);
+                    $player->applyNativeSnapshot($data);
+                }
+                if (($data['name_tag'] ?? '') !== '') {
+                    $player->setNameTag((string)$data['name_tag']);
+                }
+                return $player;
+            }
+            $entity = EntityFactory::getInstance()->create($type, $location);
+            if ($entity === null) {
+                $entity = new EntityProxy($type === '' ? null : $type, $location);
+            }
+            $entity->applyNativeSnapshot($data);
+            return $entity;
+        }
     }
-}
 
-namespace pocketmine\nbt\tag {
-
-    abstract class Tag
+    /**
+     * Instancia concreta que devuelve `EntityFactory::create()` para un tipo de
+     * entidad cuya clase PHP todavía no existe (los tipos con clase propia se
+     * portan uno a uno; ver `docs/plugin-compatibility.md`).
+     *
+     * Es la contraparte PHP de una entidad nativa de `entity.rs`: la creación
+     * real ocurre en `spawnToAll()`, que llama al host (`entity.spawn`).
+     */
+    class EntityProxy extends Entity
     {
-        abstract public function getValue(): mixed;
-    }
-
-    class StringTag extends Tag
-    {
-        public function __construct(private string $value = '') {}
-        public function getValue(): string { return $this->value; }
-    }
-
-    class IntTag extends Tag
-    {
-        public function __construct(private int $value = 0) {}
-        public function getValue(): int { return $this->value; }
-    }
-
-    class FloatTag extends Tag
-    {
-        public function __construct(private float $value = 0.0) {}
-        public function getValue(): float { return $this->value; }
-    }
-
-    class DoubleTag extends Tag
-    {
-        public function __construct(private float $value = 0.0) {}
-        public function getValue(): float { return $this->value; }
-    }
-
-    class ByteTag extends Tag
-    {
-        public function __construct(private int $value = 0) {}
-        public function getValue(): int { return $this->value; }
-    }
-
-    class ShortTag extends Tag
-    {
-        public function __construct(private int $value = 0) {}
-        public function getValue(): int { return $this->value; }
-    }
-
-    class ListTag extends Tag
-    {
-        /** @var Tag[] */
-        private array $value = [];
-
-        public function __construct(array $value = [])
-        {
-            $this->value = $value;
-        }
-
-        public function getValue(): array
-        {
-            return $this->value;
-        }
-
-        public function push(Tag $tag): self
-        {
-            $this->value[] = $tag;
-            return $this;
-        }
-    }
-
-    class CompoundTag extends Tag
-    {
-        /** @var array<string, Tag> */
-        private array $tags = [];
-
-        public function __construct(array $tags = [])
-        {
-            $this->tags = $tags;
-        }
-
-        public function get(string $name): ?Tag
-        {
-            return $this->tags[$name] ?? null;
-        }
-
-        public function setTag(string $name, Tag $tag): self
-        {
-            $this->tags[$name] = $tag;
-            return $this;
-        }
-
-        public function getString(string $name, string $default = ''): string
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (string)$tag->getValue() : $default;
-        }
-
-        public function getInt(string $name, int $default = 0): int
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
-        }
-
-        public function getFloat(string $name, float $default = 0.0): float
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (float)$tag->getValue() : $default;
-        }
-
-        public function getDouble(string $name, float $default = 0.0): float
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (float)$tag->getValue() : $default;
-        }
-
-        public function getByte(string $name, int $default = 0): int
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
-        }
-
-        public function getShort(string $name, int $default = 0): int
-        {
-            $tag = $this->get($name);
-            return $tag instanceof Tag ? (int)$tag->getValue() : $default;
-        }
-
-        public function getCompoundTag(string $name): ?CompoundTag
-        {
-            $tag = $this->get($name);
-            return $tag instanceof CompoundTag ? $tag : null;
-        }
-
-        public function getListTag(string $name): ?ListTag
-        {
-            $tag = $this->get($name);
-            return $tag instanceof ListTag ? $tag : null;
-        }
-
-        public function setString(string $name, string $value): self
-        {
-            return $this->setTag($name, new StringTag($value));
-        }
-
-        public function setInt(string $name, int $value): self
-        {
-            return $this->setTag($name, new IntTag($value));
-        }
-
-        public function setFloat(string $name, float $value): self
-        {
-            return $this->setTag($name, new FloatTag($value));
-        }
-
-        public function setDouble(string $name, float $value): self
-        {
-            return $this->setTag($name, new DoubleTag($value));
-        }
-
-        public function getValue(): array
-        {
-            return $this->tags;
+        public function __construct(
+            ?string $networkTypeId = null,
+            ?\pocketmine\world\Location $location = null,
+            string $nameTag = ''
+        ) {
+            if ($networkTypeId !== null) {
+                $this->networkTypeId = $networkTypeId;
+            }
+            if ($location !== null) {
+                $this->location = $location;
+            }
+            $this->nameTag = $nameTag;
         }
     }
 }
@@ -416,6 +1099,105 @@ namespace pocketmine\player {
     use pocketmine\utils\TextFormat;
     use pocketmine\world\Location;
     use pocketmine\world\World;
+
+    /**
+     * PM 5 `pocketmine\player\GameMode`.
+     *
+     * PM 5 lo declara como `enum` con `LegacyEnumShimTrait` (por eso
+     * `GameMode::CREATIVE()` funciona). El puente usa una clase final con las
+     * mismas constantes y métodos estáticos, para no depender de enums ni del
+     * trait: `GameMode::CREATIVE()` y `GameMode::CREATIVE` valen igual.
+     */
+    final class GameMode
+    {
+        public const SURVIVAL = 0;
+        public const CREATIVE = 1;
+        public const ADVENTURE = 2;
+        public const SPECTATOR = 3;
+
+        private function __construct(
+            private int $id,
+            private string $englishName,
+            /** @var string[] */
+            private array $aliases
+        ) {
+        }
+
+        public static function SURVIVAL(): self
+        {
+            return new self(self::SURVIVAL, 'Survival', ['survival', 's', '0']);
+        }
+
+        public static function CREATIVE(): self
+        {
+            return new self(self::CREATIVE, 'Creative', ['creative', 'c', '1']);
+        }
+
+        public static function ADVENTURE(): self
+        {
+            return new self(self::ADVENTURE, 'Adventure', ['adventure', 'a', '2']);
+        }
+
+        public static function SPECTATOR(): self
+        {
+            return new self(self::SPECTATOR, 'Spectator', ['spectator', 'v', 'view', '3']);
+        }
+
+        /** PM `GameMode::fromString()`: acepta nombre, inicial o id. */
+        public static function fromString(string $str): ?self
+        {
+            $needle = mb_strtolower(trim($str));
+            foreach (self::all() as $mode) {
+                if (in_array($needle, $mode->aliases, true)) {
+                    return $mode;
+                }
+            }
+            return null;
+        }
+
+        public static function fromId(int $id): ?self
+        {
+            return match ($id) {
+                self::SURVIVAL => self::SURVIVAL(),
+                self::CREATIVE => self::CREATIVE(),
+                self::ADVENTURE => self::ADVENTURE(),
+                self::SPECTATOR => self::SPECTATOR(),
+                default => null,
+            };
+        }
+
+        /** @return self[] */
+        private static function all(): array
+        {
+            return [self::SURVIVAL(), self::CREATIVE(), self::ADVENTURE(), self::SPECTATOR()];
+        }
+
+        public function id(): int
+        {
+            return $this->id;
+        }
+
+        public function getEnglishName(): string
+        {
+            return $this->englishName;
+        }
+
+        /** @return string[] */
+        public function getAliases(): array
+        {
+            return $this->aliases;
+        }
+
+        public function equals(self $other): bool
+        {
+            return $this->id === $other->id;
+        }
+
+        public function __toString(): string
+        {
+            return $this->englishName;
+        }
+    }
 
     class Player extends \pocketmine\entity\Human implements CommandSender
     {
@@ -590,15 +1372,21 @@ namespace pocketmine\player {
             return (int)round($this->ping / 50);
         }
 
-        public function getGamemode(): int
+        /** PM 5: `Player::getGamemode(): GameMode`. */
+        public function getGamemode(): GameMode
         {
-            return $this->gamemode;
+            return GameMode::fromId($this->gamemode) ?? GameMode::SURVIVAL();
         }
 
-        public function setGamemode(int $gamemode): void
+        /**
+         * PM 5 tipa `GameMode`; el puente acepta también el id numérico para
+         * no romper llamadas existentes.
+         */
+        public function setGamemode(int|GameMode $gamemode): void
         {
-            $this->gamemode = $gamemode;
-            $this->addAction('set_gamemode', ['target_player' => $this->name, 'gamemode' => $gamemode]);
+            $id = $gamemode instanceof GameMode ? $gamemode->id() : $gamemode;
+            $this->gamemode = $id;
+            $this->addAction('set_gamemode', ['target_player' => $this->name, 'gamemode' => $id]);
         }
 
         public function getX(): float
@@ -969,11 +1757,27 @@ namespace pocketmine\player {
          */
         public function sendForm(mixed $form): void
         {
-            // No-op stub: no se emite acción.
+            if (!$form instanceof \pocketmine\form\Form) {
+                return;
+            }
+            $id = \pocketmine\runtime\FormRegistry::nextId();
+            \pocketmine\runtime\FormRegistry::store($this->name, $id, $form);
+            $json = json_encode($form, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($json === false) {
+                return;
+            }
+            $this->addAction('send_form', [
+                'target_player' => $this->name,
+                'form_id' => $id,
+                'data' => $json,
+            ]);
         }
 
-        public function teleport(mixed $position): bool
+        public function teleport(mixed $position, ?float $yaw = null, ?float $pitch = null): bool
         {
+            // `Entity::teleport()` aporta la rotación opcional; `Location`
+            // expone `yaw`/`pitch` como privados, así que se leen por getter.
+            $hasRotation = $yaw !== null || $pitch !== null;
             if ($position instanceof Vector3) {
                 $this->x = $position->getX();
                 $this->y = $position->getY();
@@ -982,12 +1786,21 @@ namespace pocketmine\player {
                 if (is_string($world) && $world !== '') {
                     $this->worldName = $world;
                 }
-                if (property_exists($position, 'yaw')) {
-                    $this->yaw = (float)$position->yaw;
+                if ($yaw === null && method_exists($position, 'getYaw')) {
+                    $this->yaw = (float)$position->getYaw();
                 }
-                if (property_exists($position, 'pitch')) {
-                    $this->pitch = (float)$position->pitch;
+                if ($pitch === null && method_exists($position, 'getPitch')) {
+                    $this->pitch = (float)$position->getPitch();
                 }
+                $hasRotation = $hasRotation
+                    || method_exists($position, 'getYaw')
+                    || method_exists($position, 'getPitch');
+            }
+            if ($yaw !== null) {
+                $this->yaw = $yaw;
+            }
+            if ($pitch !== null) {
+                $this->pitch = $pitch;
             }
             $action = [
                 'target_player' => $this->name,
@@ -1000,7 +1813,7 @@ namespace pocketmine\player {
             // sin ellos el teleport de un plugin pierde la rotación en
             // Rust y el Java ve el giro viejo tras el salto (ver
             // `syncTeleport` + `tp_sync_test.php`).
-            if ($position instanceof Vector3 && (property_exists($position, 'yaw') || property_exists($position, 'pitch'))) {
+            if ($hasRotation) {
                 $action['yaw'] = $this->yaw;
                 $action['pitch'] = $this->pitch;
             }
@@ -1205,25 +2018,25 @@ namespace pocketmine\player {
         /** PM `Player::isSurvival(bool $literal = false)`. */
         public function isSurvival(bool $literal = false): bool
         {
-            return $this->gamemode === 0 || (!$literal && $this->gamemode === 2);
+            return $this->gamemode === GameMode::SURVIVAL || (!$literal && $this->gamemode === GameMode::ADVENTURE);
         }
 
         /** PM `Player::isCreative(bool $literal = false)`. */
         public function isCreative(bool $literal = false): bool
         {
-            return $this->gamemode === 1 || (!$literal && $this->gamemode === 3);
+            return $this->gamemode === GameMode::CREATIVE || (!$literal && $this->gamemode === GameMode::SPECTATOR);
         }
 
         /** PM `Player::isAdventure(bool $literal = false)`. */
         public function isAdventure(bool $literal = false): bool
         {
-            return $this->gamemode === 2 || (!$literal && $this->gamemode === 3);
+            return $this->gamemode === GameMode::ADVENTURE || (!$literal && $this->gamemode === GameMode::SPECTATOR);
         }
 
         /** PM `Player::isSpectator(): bool`. */
         public function isSpectator(): bool
         {
-            return $this->gamemode === 3;
+            return $this->gamemode === GameMode::SPECTATOR;
         }
 
         public function isSprinting(): bool
@@ -1707,87 +2520,219 @@ namespace pocketmine\inventory {
     {
         /** @var array<int, Item> */
         private array $items = [];
-
         private int $hotbarSize = 9;
         private int $size = 36;
+        /** Tick cuyo snapshot está en caché; `-1` = sin reloj del servidor. */
+        private int $loadedTick = -1;
+        private bool $loaded = false;
 
         public function __construct(private string $ownerName = '')
         {
         }
 
+        public function getOwnerName(): string
+        {
+            return $this->ownerName;
+        }
+
+        /**
+         * Recarga el snapshot desde el inventario autoritativo del servidor
+         * (`inventory.get`). Las lecturas ya lo refrescan una vez por tick.
+         */
+        public function refresh(): void
+        {
+            $this->items = [];
+            $this->loadedTick = $this->serverTick() ?? -1;
+            $this->loaded = true;
+            if ($this->ownerName === '' || str_contains($this->ownerName, '#')) {
+                // ender/cursor/crafting/creative: todavía sin host call.
+                return;
+            }
+            $result = \pocketmine\runtime\Bridge::hostCall('inventory.get', ['player' => $this->ownerName]);
+            if (!is_array($result) || empty($result['ok'])) {
+                return;
+            }
+            foreach (($result['windows'] ?? []) as $window) {
+                if ((int)($window['window'] ?? -1) !== 0) {
+                    continue;
+                }
+                foreach (($window['slots'] ?? []) as $index => $slot) {
+                    $item = self::itemFromArray($slot);
+                    if ($item !== null) {
+                        $this->items[(int)$index] = $item;
+                    }
+                }
+            }
+        }
+
+        private function serverTick(): ?int
+        {
+            if (!class_exists(\pocketmine\Server::class)) {
+                return null;
+            }
+            try {
+                return \pocketmine\Server::getInstance()->getTick();
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        private function ensureFresh(): void
+        {
+            if (!$this->loaded) {
+                $this->refresh();
+                return;
+            }
+            $tick = $this->serverTick();
+            if ($tick === null || $tick === $this->loadedTick) {
+                return;
+            }
+            $this->refresh();
+        }
+
+        private static function itemFromArray(mixed $data): ?Item
+        {
+            if (!is_array($data)) {
+                return null;
+            }
+            $count = (int)($data['count'] ?? 0);
+            if ($count <= 0) {
+                return null;
+            }
+            return Item::fromArray($data);
+        }
+
+        /** Empuja el slot al inventario autoritativo (`inventory.set_slot`). */
+        private function pushSlot(int $index): void
+        {
+            if ($this->ownerName === '' || str_contains($this->ownerName, '#')) {
+                return;
+            }
+            $item = $this->items[$index] ?? null;
+            $payload = null;
+            if ($item !== null && !$item->isNull() && $item->getCount() > 0) {
+                $payload = [
+                    'id' => $item->getId(),
+                    'meta' => $item->getMeta(),
+                    'count' => $item->getCount(),
+                ];
+            }
+            if (is_array($payload)) {
+                // El NBT (`ench`, `display`, ...) viaja con el stack: sin él un
+                // item encantado volvería sin encantamientos al leerlo.
+                $nbt = $item?->getNbtBytes() ?? '';
+                $payload['nbt'] = $nbt === '' ? null : bin2hex($nbt);
+            }
+            \pocketmine\runtime\Bridge::hostCall('inventory.set_slot', [
+                'player' => $this->ownerName,
+                'window' => 0,
+                'slot' => $index,
+                'item' => $payload,
+            ]);
+        }
+
         public function getItem(int $index): Item
         {
+            $this->ensureFresh();
             return $this->items[$index] ?? ItemFactory::get(0, 0, 0);
         }
 
         public function setItem(int $index, Item $item): void
         {
-            if ($item->isNull()) {
-                unset($this->items[$index]);
+            $this->ensureFresh();
+            if ($index < 0 || $index >= $this->size) {
                 return;
             }
-            $this->items[$index] = $item;
+            if ($item->isNull() || $item->getCount() <= 0) {
+                unset($this->items[$index]);
+            } else {
+                $this->items[$index] = $item;
+            }
+            $this->pushSlot($index);
         }
 
         public function addItem(Item ...$items): array
         {
+            $this->ensureFresh();
             $leftover = [];
+            $touched = [];
             foreach ($items as $item) {
-                if ($item->isNull()) {
+                if ($item->isNull() || $item->getCount() <= 0) {
                     continue;
                 }
-                $placed = false;
-                foreach ($this->items as $index => $existing) {
-                    if ($existing->getId() === $item->getId() && $existing->getMeta() === $item->getMeta()) {
-                        $existing->setCount($existing->getCount() + $item->getCount());
-                        $placed = true;
-                        break;
+                $remaining = $item->getCount();
+                // Primero apila en stacks existentes, como `addItem()` nativo.
+                for ($i = 0; $i < $this->size && $remaining > 0; $i++) {
+                    $existing = $this->items[$i] ?? null;
+                    if ($existing === null
+                        || $existing->getId() !== $item->getId()
+                        || $existing->getMeta() !== $item->getMeta()) {
+                        continue;
                     }
-                }
-                if (!$placed) {
-                    for ($i = 0; $i < $this->size; $i++) {
-                        if (!isset($this->items[$i])) {
-                            $this->items[$i] = $item;
-                            $placed = true;
-                            break;
-                        }
+                    $space = max(0, 64 - $existing->getCount());
+                    $take = min($space, $remaining);
+                    if ($take <= 0) {
+                        continue;
                     }
+                    $existing->setCount($existing->getCount() + $take);
+                    $remaining -= $take;
+                    $touched[$i] = true;
                 }
-                if (!$placed) {
-                    $leftover[] = $item;
+                // Luego los huecos libres.
+                for ($i = 0; $i < $this->size && $remaining > 0; $i++) {
+                    if (isset($this->items[$i])) {
+                        continue;
+                    }
+                    $take = min(64, $remaining);
+                    $this->items[$i] = ItemFactory::get($item->getId(), $item->getMeta(), $take);
+                    $remaining -= $take;
+                    $touched[$i] = true;
                 }
+                if ($remaining > 0) {
+                    $leftover[] = ItemFactory::get($item->getId(), $item->getMeta(), $remaining);
+                }
+            }
+            foreach (array_keys($touched) as $index) {
+                $this->pushSlot((int)$index);
             }
             return $leftover;
         }
 
         public function removeItem(Item ...$items): array
         {
+            $this->ensureFresh();
             $leftover = [];
+            $touched = [];
             foreach ($items as $item) {
                 $remaining = $item->getCount();
-                foreach ($this->items as $index => $existing) {
-                    if ($existing->getId() !== $item->getId() || $existing->getMeta() !== $item->getMeta()) {
+                for ($i = 0; $i < $this->size && $remaining > 0; $i++) {
+                    $existing = $this->items[$i] ?? null;
+                    if ($existing === null
+                        || $existing->getId() !== $item->getId()
+                        || $existing->getMeta() !== $item->getMeta()) {
                         continue;
                     }
                     $take = min($remaining, $existing->getCount());
                     $existing->setCount($existing->getCount() - $take);
                     $remaining -= $take;
                     if ($existing->getCount() <= 0) {
-                        unset($this->items[$index]);
+                        unset($this->items[$i]);
                     }
-                    if ($remaining <= 0) {
-                        break;
-                    }
+                    $touched[$i] = true;
                 }
                 if ($remaining > 0) {
                     $leftover[] = ItemFactory::get($item->getId(), $item->getMeta(), $remaining);
                 }
+            }
+            foreach (array_keys($touched) as $index) {
+                $this->pushSlot((int)$index);
             }
             return $leftover;
         }
 
         public function first(Item $item, bool $exact = false): int
         {
+            $this->ensureFresh();
             foreach ($this->items as $index => $existing) {
                 if ($existing->getId() === $item->getId()
                     && (!$exact || $existing->getMeta() === $item->getMeta())) {
@@ -1799,6 +2744,7 @@ namespace pocketmine\inventory {
 
         public function firstEmpty(): int
         {
+            $this->ensureFresh();
             for ($i = 0; $i < $this->size; $i++) {
                 if (!isset($this->items[$i])) {
                     return $i;
@@ -1810,6 +2756,7 @@ namespace pocketmine\inventory {
         /** @return array<int, Item> */
         public function getContents(bool $includeEmpty = false): array
         {
+            $this->ensureFresh();
             if ($includeEmpty) {
                 $contents = [];
                 for ($i = 0; $i < $this->size; $i++) {
@@ -1823,22 +2770,34 @@ namespace pocketmine\inventory {
         /** @param array<int, Item> $items */
         public function setContents(array $items): void
         {
-            $this->items = [];
+            $this->clearAll();
             foreach ($items as $index => $item) {
-                if ($item instanceof Item && !$item->isNull()) {
-                    $this->items[$index] = $item;
+                if (!($item instanceof Item) || $item->isNull() || $item->getCount() <= 0) {
+                    continue;
                 }
+                $index = (int)$index;
+                if ($index < 0 || $index >= $this->size) {
+                    continue;
+                }
+                $this->items[$index] = $item;
+                $this->pushSlot($index);
             }
         }
 
         public function clear(int $index): void
         {
+            $this->ensureFresh();
             unset($this->items[$index]);
+            $this->pushSlot($index);
         }
 
         public function clearAll(): void
         {
             $this->items = [];
+            $this->loaded = true;
+            if ($this->ownerName !== '' && !str_contains($this->ownerName, '#')) {
+                \pocketmine\runtime\Bridge::hostCall('inventory.clear', ['player' => $this->ownerName]);
+            }
         }
 
         public function getSize(): int
@@ -1851,6 +2810,7 @@ namespace pocketmine\inventory {
             return $this->hotbarSize;
         }
 
+        /** Slot 0 (la hotbar seleccionada aún no viaja al puente). */
         public function getItemInHand(): Item
         {
             return $this->getItem(0);

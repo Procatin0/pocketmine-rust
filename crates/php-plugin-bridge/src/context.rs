@@ -189,6 +189,15 @@ pub enum PluginAction {
         y: i32,
         z: i32,
     },
+    /// `Player::sendForm()`: `data` is `json_encode($form)` and `form_id`
+    /// the id the runtime keeps the form object under, so the response can be
+    /// routed back to `Form::handleResponse()`.
+    #[serde(rename = "send_form")]
+    SendForm {
+        target_player: String,
+        form_id: u32,
+        data: String,
+    },
 }
 
 /// Wire form of one per-player `DiverseBossBar` override (only set

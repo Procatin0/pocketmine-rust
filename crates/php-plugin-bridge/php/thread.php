@@ -122,20 +122,20 @@ namespace pocketmine\thread {
     use pmmp\thread\ThreadSafeArray;
     use pmmp\thread\Worker as NativeWorker;
 
-    class ThreadCrashInfoFrame
-    {
-        public function __construct(
-            private string $printableFrame
-        ) {
-        }
-
-        public function getPrintableFrame(): string
-        {
-            return $this->printableFrame;
-        }
-    }
-
     if (class_exists(ThreadSafe::class)) {
+        class ThreadCrashInfoFrame extends ThreadSafe
+        {
+            public function __construct(
+                private string $printableFrame
+            ) {
+            }
+
+            public function getPrintableFrame(): string
+            {
+                return $this->printableFrame;
+            }
+        }
+
         class ThreadCrashInfo extends ThreadSafe
         {
             /** @var ThreadSafeArray<int, ThreadCrashInfoFrame> */
@@ -305,6 +305,19 @@ namespace pocketmine\thread {
             }
         }
     } else {
+        class ThreadCrashInfoFrame
+        {
+            public function __construct(
+                private string $printableFrame
+            ) {
+            }
+
+            public function getPrintableFrame(): string
+            {
+                return $this->printableFrame;
+            }
+        }
+
         class ThreadCrashInfo
         {
             public function __construct(
@@ -507,6 +520,66 @@ namespace pocketmine\thread {
             }
         }
 
+        /**
+         * pthreads threads start with a fresh interpreter: classes, functions,
+         * constants, globals and autoloaders declared by the parent are not
+         * visible there (only the running thread class itself is copied). PM
+         * gets away with this because every PM class lives in its own file and
+         * is autoloaded on demand by the class loaders inherited by the thread;
+         * this bridge ships its API as a handful of monolithic files that are
+         * `require`d once, so the thread has to require them again.
+         *
+         * Without this, threaded plugins (EasyEdit, for example) lose the whole
+         * API in their thread and even the crash reporter below fails with
+         * `Class "pocketmine\thread\ThreadCrashInfo" not found`.
+         */
+        private function loadRuntimeForThread(): void
+        {
+            if (class_exists(ThreadCrashInfo::class, false) && class_exists(\pocketmine\Server::class, false)) {
+                // Same interpreter as the parent (non-pthreads fallback): already loaded.
+                return;
+            }
+
+            $manifest = __DIR__ . DIRECTORY_SEPARATOR . 'runtime_files.php';
+            if (!is_file($manifest)) {
+                return;
+            }
+
+            $files = require $manifest;
+            foreach ($files as $file) {
+                $path = __DIR__ . DIRECTORY_SEPARATOR . $file;
+                if (is_file($path)) {
+                    require $path;
+                }
+            }
+
+            $this->registerPluginAutoloadPaths();
+        }
+
+        /**
+         * The plugin class loaders are `ThreadSafe`, so the thread can still
+         * read their registered paths, but the thread-local `PluginAutoloader`
+         * registry is empty: mirror the paths into it so plugin classes (and
+         * their `src-namespace-prefix` layouts) resolve inside the thread.
+         */
+        private function registerPluginAutoloadPaths(): void
+        {
+            if (!class_exists(\pocketmine\runtime\PluginAutoloader::class, false)) {
+                return;
+            }
+
+            foreach ($this->getClassLoaders() ?? [] as $loader) {
+                if (!is_object($loader) || !method_exists($loader, 'getPrefixes')) {
+                    continue;
+                }
+                foreach ($loader->getPrefixes() as $prefix => $paths) {
+                    foreach ($paths as $path) {
+                        \pocketmine\runtime\PluginAutoloader::addPath((string)$prefix, (string)$path);
+                    }
+                }
+            }
+        }
+
         public function getCrashInfo(): ?ThreadCrashInfo
         {
             if (method_exists($this, 'isTerminated') && method_exists($this, 'isJoined')) {
@@ -538,6 +611,10 @@ namespace pocketmine\thread {
         final public function run(): void
         {
             error_reporting(-1);
+            // Child threads get a fresh interpreter: without this, PHP warnings
+            // go to stdout, which is the JSON IPC channel of the worker.
+            @ini_set('display_errors', 'stderr');
+            $this->loadRuntimeForThread();
             $this->registerClassLoaders();
 
             try {
@@ -565,8 +642,17 @@ namespace pocketmine\thread {
 
         protected function onUncaughtException(\Throwable $e): void
         {
-            $this->crashInfo = ThreadCrashInfo::fromThrowable($e, $this->getThreadName());
-            fwrite(STDERR, '[Thread/' . $this->getThreadName() . '] Uncaught exception: ' . $e->getMessage() . PHP_EOL);
+            if (class_exists(ThreadCrashInfo::class, false)) {
+                $this->crashInfo = ThreadCrashInfo::fromThrowable($e, $this->getThreadName());
+            }
+            // `STDERR` is defined by the CLI SAPI and is not inherited by
+            // pthreads threads, so open the stream explicitly.
+            $stderr = fopen('php://stderr', 'wb');
+            if ($stderr !== false) {
+                fwrite($stderr, '[Thread/' . $this->getThreadName() . '] Uncaught exception: ' . $e::class . ': ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine() . PHP_EOL);
+                fwrite($stderr, $e->getTraceAsString() . PHP_EOL);
+                fclose($stderr);
+            }
         }
 
         abstract protected function onRun(): void;
@@ -577,7 +663,11 @@ namespace pocketmine\thread {
         }
     }
 
-    if (class_exists(NativeThread::class)) {
+    if (class_exists(Thread::class, false)) {
+        // pthreads copies the running thread's class into the new thread, so
+        // re-including this file inside a thread (see
+        // CommonThreadPartsTrait::loadRuntimeForThread()) must not redeclare it.
+    } elseif (class_exists(NativeThread::class)) {
         abstract class Thread extends NativeThread
         {
             use CommonThreadPartsTrait;
@@ -636,7 +726,9 @@ namespace pocketmine\thread {
         }
     }
 
-    if (class_exists(NativeWorker::class)) {
+    if (class_exists(Worker::class, false)) {
+        // Already declared in this thread context (pthreads class copy).
+    } elseif (class_exists(NativeWorker::class)) {
         abstract class Worker extends NativeWorker
         {
             use CommonThreadPartsTrait;

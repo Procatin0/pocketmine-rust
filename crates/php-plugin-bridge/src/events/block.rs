@@ -282,6 +282,173 @@ impl Event for BlockPlaceEvent {
     }
 }
 
+/// `BlockSpreadEvent`: a block spread into another cell (water/lava flowing
+/// into a free cell, grass spreading to dirt). Cancellable.
+///
+/// Divergencia documentada: el puente no tiene `Player` ficticio ni objetos
+/// `Block` vivos en Rust, así que el evento lleva coordenadas e ids de estado
+/// en vez de `BlockEvent(Player|Block)`; los getters PHP reconstruyen los
+/// `Block` con `Block::fromStateId()`.
+pub struct BlockSpreadEvent {
+    pub world: String,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Block being replaced (`getBlockId()`).
+    pub block_id: u32,
+    /// Origin of the spread (`getSource()`).
+    pub source_id: u32,
+    /// Replacement state (`getNewState()`).
+    pub new_id: u32,
+    pub cancelled: bool,
+}
+
+impl BlockSpreadEvent {
+    pub fn new(
+        world: impl Into<String>,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        source_id: u32,
+        new_id: u32,
+    ) -> Self {
+        Self {
+            world: world.into(),
+            x,
+            y,
+            z,
+            block_id,
+            source_id,
+            new_id,
+            cancelled: false,
+        }
+    }
+}
+
+impl Event for BlockSpreadEvent {
+    fn name(&self) -> &str {
+        "BlockSpreadEvent"
+    }
+
+    fn is_cancellable(&self) -> bool {
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    fn set_cancelled(&mut self, cancel: bool) {
+        self.cancelled = cancel;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "world": self.world,
+            "x": self.x,
+            "y": self.y,
+            "z": self.z,
+            "block_id": self.block_id,
+            "source_id": self.source_id,
+            "new_id": self.new_id,
+            "cancelled": self.cancelled
+        })
+    }
+
+    fn apply_json(&mut self, value: &Value) {
+        apply_string(&mut self.world, value, "world");
+        apply_i32(&mut self.x, value, "x");
+        apply_i32(&mut self.y, value, "y");
+        apply_i32(&mut self.z, value, "z");
+        apply_u32(&mut self.block_id, value, "block_id");
+        apply_u32(&mut self.source_id, value, "source_id");
+        apply_u32(&mut self.new_id, value, "new_id");
+        apply_cancelled(&mut self.cancelled, value);
+    }
+}
+
+/// `BlockFormEvent`: a new block formed, e.g. lava hardening into cobblestone or
+/// obsidian when it touches water. Cancellable.
+pub struct BlockFormEvent {
+    pub world: String,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Block being replaced (`getBlockId()`).
+    pub block_id: u32,
+    /// Block that caused the change (`getCausingBlock()`).
+    pub causing_id: u32,
+    /// Replacement state (`getNewState()`).
+    pub new_id: u32,
+    pub cancelled: bool,
+}
+
+impl BlockFormEvent {
+    pub fn new(
+        world: impl Into<String>,
+        x: i32,
+        y: i32,
+        z: i32,
+        block_id: u32,
+        causing_id: u32,
+        new_id: u32,
+    ) -> Self {
+        Self {
+            world: world.into(),
+            x,
+            y,
+            z,
+            block_id,
+            causing_id,
+            new_id,
+            cancelled: false,
+        }
+    }
+}
+
+impl Event for BlockFormEvent {
+    fn name(&self) -> &str {
+        "BlockFormEvent"
+    }
+
+    fn is_cancellable(&self) -> bool {
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    fn set_cancelled(&mut self, cancel: bool) {
+        self.cancelled = cancel;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "world": self.world,
+            "x": self.x,
+            "y": self.y,
+            "z": self.z,
+            "block_id": self.block_id,
+            "causing_id": self.causing_id,
+            "new_id": self.new_id,
+            "cancelled": self.cancelled
+        })
+    }
+
+    fn apply_json(&mut self, value: &Value) {
+        apply_string(&mut self.world, value, "world");
+        apply_i32(&mut self.x, value, "x");
+        apply_i32(&mut self.y, value, "y");
+        apply_i32(&mut self.z, value, "z");
+        apply_u32(&mut self.block_id, value, "block_id");
+        apply_u32(&mut self.causing_id, value, "causing_id");
+        apply_u32(&mut self.new_id, value, "new_id");
+        apply_cancelled(&mut self.cancelled, value);
+    }
+}
+
 /// Fired when a player interacts with a block. Cancellable.
 pub struct PlayerInteractEvent {
     pub player: PlayerContext,

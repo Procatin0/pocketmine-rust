@@ -152,6 +152,16 @@ enum Rule {
     AnyFull,
     /// `SugarCane`: sand/dirt below or water beside it.
     SugarCane,
+    /// Redstone dust, repeaters, comparators, pressure plates: centred support
+    /// below (`onNearbyBlockChange()` breaks them when it disappears).
+    CenterBelow,
+    /// `Lever::onNearbyBlockChange()`: centred support on the side opposite
+    /// `lever_direction` (the lever points away from the block it hangs on).
+    Lever,
+    /// `Button::onNearbyBlockChange()`: centred support on the side opposite
+    /// `facing_direction`. `facing_direction` is the button's outward normal
+    /// (the face it points at), so the block it hangs on is behind it.
+    Button,
 }
 
 /// `BlockTypeTags::DIRT` (plus mud, which the reference also accepts).
@@ -222,7 +232,8 @@ const CROPS: &[&str] = &[
 fn rule_for(name: &str) -> Option<Rule> {
     if matches!(
         name,
-        "torch" | "soul_torch" | "copper_torch" | "underwater_torch"
+        "torch" | "soul_torch" | "copper_torch" | "underwater_torch" | "redstone_torch"
+            | "unlit_redstone_torch"
     ) {
         return Some(Rule::Torch);
     }
@@ -246,6 +257,24 @@ fn rule_for(name: &str) -> Option<Rule> {
     }
     if name.ends_with("_sign") || name.ends_with("_banner") {
         return Some(Rule::FullBelow);
+    }
+    if name == "redstone_wire"
+        || matches!(
+            name,
+            "repeater" | "unpowered_repeater" | "powered_repeater" | "comparator"
+                | "unpowered_comparator" | "powered_comparator"
+        )
+        || name.ends_with("_pressure_plate")
+    {
+        // `RedstoneWire`/`RedstoneDiode`/`PressurePlate`: the block they sit on
+        // is their support, so removing it drops them.
+        return Some(Rule::CenterBelow);
+    }
+    if name == "lever" {
+        return Some(Rule::Lever);
+    }
+    if name.ends_with("_button") {
+        return Some(Rule::Button);
     }
     if name == "rail" || name.ends_with("_rail") {
         // `BaseRail::onNearbyBlockChange()`: EDGE support below.
@@ -315,6 +344,273 @@ where
 ///
 /// `at(dx, dy, dz)` answers block ids relative to the target cell. Returns
 /// `None` when the reference would refuse the placement.
+/// `Yaw::getHorizontalFacing()`: the horizontal face a player looks at.
+///
+/// Bedrock yaw: 0 = south, 90 = west, 180 = north, 270 = east.
+pub fn horizontal_facing(yaw: f32) -> i32 {
+    let yaw = (yaw.round() as i32).rem_euclid(360);
+    match ((yaw + 45) / 90).rem_euclid(4) {
+        0 => SOUTH,
+        1 => WEST,
+        2 => NORTH,
+        _ => EAST,
+    }
+}
+
+/// `Axis::X` of the player's facing: `true` when they look east or west. A
+/// floor/ceiling lever uses it to pick its east-west vs north-south base.
+pub fn horizontal_axis_is_x(yaw: f32) -> bool {
+    matches!(horizontal_facing(yaw), WEST | EAST)
+}
+
+/// Face a `lever_direction` state points at (the lever points away from the
+/// block it is mounted on).
+fn lever_facing(id: u32) -> i32 {
+    match string_property(id, "lever_direction").unwrap_or("up_north_south") {
+        "down_east_west" | "down_north_south" => DOWN,
+        "north" => NORTH,
+        "south" => SOUTH,
+        "west" => WEST,
+        "east" => EAST,
+        _ => UP,
+    }
+}
+
+/// Face a button points at, from its `facing_direction` (`0..=5`, the same
+/// order as `Facing`).
+///
+/// `Button::place()` stores `$this->facing = $face`, the clicked face, which is
+/// the outward normal: a floor button is `UP` (1), a ceiling button `DOWN` (0),
+/// and the block it is mounted on is at `opposite(facing_direction)`.
+fn button_facing(id: u32) -> i32 {
+    match block_states::int_property(id, "facing_direction").unwrap_or(1) {
+        0 => DOWN,
+        2 => NORTH,
+        3 => SOUTH,
+        4 => WEST,
+        5 => EAST,
+        _ => UP,
+    }
+}
+
+fn facing_name(face: i32) -> Option<&'static str> {
+    match face {
+        NORTH => Some("north"),
+        SOUTH => Some("south"),
+        WEST => Some("west"),
+        EAST => Some("east"),
+        _ => None,
+    }
+}
+
+/// The 2-bit `direction` property used by trapdoors: the client reads it as
+/// `0 = south, 1 = west, 2 = north, 3 = east` (the order of the state's value
+/// list, same as `minecraft:cardinal_direction`).
+///
+/// PocketMine's `RuntimeDataDescriber::horizontalFacing` writes the mirrored
+/// order (`0 = north, ...`), which turned every placed trapdoor half a turn
+/// around.
+fn horizontal_facing_value(face: i32) -> Option<&'static str> {
+    match face {
+        SOUTH => Some("0"),
+        WEST => Some("1"),
+        NORTH => Some("2"),
+        EAST => Some("3"),
+        _ => None,
+    }
+}
+
+/// `weirdo_direction` (`Stairs`): the direction the stairs' full-block side
+/// faces, stored as `0 = east, 1 = west, 2 = south, 3 = north`.
+fn stairs_direction_value(face: i32) -> Option<&'static str> {
+    match face {
+        EAST => Some("0"),
+        WEST => Some("1"),
+        SOUTH => Some("2"),
+        NORTH => Some("3"),
+        _ => None,
+    }
+}
+
+/// `Door::place()`: adds the hinge side to a door state already oriented by
+/// [`state_for_placement_oriented`].
+///
+/// `$next->hasSameTypeId($this) || (!$next2->isTransparent() &&
+/// $next->isTransparent())`, where `$next` is the block on the left and
+/// `$next2` the one on the right (`isTransparent` mapped to !`is_full_cube`).
+/// `at(dx, dy, dz)` answers block ids relative to the door's lower half.
+pub fn orient_door<F>(state: u32, yaw: f32, at: F) -> Option<u32>
+where
+    F: Fn(i32, i32, i32) -> u32,
+{
+    let door_name = block_states::state_name(state)?;
+    let facing = horizontal_facing(yaw);
+    let side = |face: i32| {
+        let (dx, dy, dz) = offset(face);
+        let name = block_states::state_name(at(dx, dy, dz)).unwrap_or("air");
+        (name == door_name, !block_states::is_full_cube(name))
+    };
+    let (left_same, left_transparent) = side(rotate_y(facing, false));
+    let (_, right_transparent) = side(rotate_y(facing, true));
+    let hinge_right = left_same || (left_transparent && !right_transparent);
+    block_states::with_property(
+        state,
+        "door_hinge_bit",
+        if hinge_right { "true" } else { "false" },
+    )
+}
+
+/// `Facing::rotateY($face, $clockwise)`, used by `Door::place()` to pick the
+/// hinge side from the block on either hand of the player.
+pub fn rotate_y(face: i32, clockwise: bool) -> i32 {
+    match (face, clockwise) {
+        (NORTH, true) => EAST,
+        (NORTH, false) => WEST,
+        (EAST, true) => SOUTH,
+        (EAST, false) => NORTH,
+        (SOUTH, true) => WEST,
+        (SOUTH, false) => EAST,
+        (WEST, true) => NORTH,
+        (WEST, false) => SOUTH,
+        (other, _) => other,
+    }
+}
+
+/// [`state_for_placement`] with the player's yaw, needed by blocks whose
+/// placement depends on where the player looks (`Lever::place`).
+/// `Block::place()` refuses to place a block whose support would be missing
+/// (`Lever::place()`, `Button::place()`, `RedstoneDiode::place()` all return
+/// `false`), so the oriented state is only kept when it can stand.
+fn supported<F>(state: Option<u32>, at: &F) -> Option<u32>
+where
+    F: Fn(i32, i32, i32) -> u32,
+{
+    state.filter(|id| is_supported(*id, at))
+}
+
+pub fn state_for_placement_oriented<F>(
+    block_id: u32,
+    face: i32,
+    yaw: f32,
+    at: F,
+) -> Option<u32>
+where
+    F: Fn(i32, i32, i32) -> u32,
+{
+    if let Some(name) = block_states::state_name(block_id) {
+        if name == "lever" {
+            // `Lever::place()`: a wall lever takes the clicked face; a lever on
+            // the floor/ceiling picks its base axis from the player's facing.
+            let axis_x = horizontal_axis_is_x(yaw);
+            let value = match face {
+                UP if axis_x => "up_east_west",
+                UP => "up_north_south",
+                DOWN if axis_x => "down_east_west",
+                DOWN => "down_north_south",
+                NORTH => "north",
+                SOUTH => "south",
+                WEST => "west",
+                EAST => "east",
+                _ => return None,
+            };
+            return supported(
+                block_states::with_property(block_id, "lever_direction", value)
+                    .or(Some(block_id)),
+                &at,
+            );
+        }
+        if matches!(
+            name,
+            "repeater" | "unpowered_repeater" | "powered_repeater" | "comparator"
+                | "unpowered_comparator" | "powered_comparator"
+        ) {
+            // `RedstoneDiode::place()`: `facing = opposite(player facing)`, so
+            // the arrow points away from the player instead of always south.
+            let output = facing_name(opposite(horizontal_facing(yaw)))?;
+            return supported(
+                block_states::with_property(block_id, "cardinal_direction", output),
+                &at,
+            );
+        }
+        if matches!(name, "piston" | "sticky_piston" | "dispenser" | "dropper") {
+            // `FacingTrait::place()` of `Piston`/`Dispenser`: the block faces
+            // the face that was clicked.
+            return supported(
+                block_states::with_property(block_id, "facing_direction", &face.to_string()),
+                &at,
+            );
+        }
+        if name.ends_with("_button") {
+            // `Button::place()`: `facing = $face` (the clicked face, i.e. the
+            // outward normal), and the block it hangs on must be behind it.
+            return supported(
+                block_states::with_property(block_id, "facing_direction", &face.to_string()),
+                &at,
+            );
+        }
+        if name.ends_with("_door") {
+            // `Door::place()`: only on the top face, and the door faces where
+            // the player looks (`$player->getHorizontalFacing()`). Without
+            // this every door kept the fixed default direction, so all of
+            // them ended up facing south.
+            //
+            // Bedrock draws the door a quarter turn clockwise from the
+            // `minecraft:cardinal_direction` it carries, so the state has to
+            // be the facing turned a quarter turn counter-clockwise: with the
+            // raw facing every door came out as if the player had been
+            // looking from their own right side.
+            if face != UP {
+                return None;
+            }
+            let facing = facing_name(rotate_y(horizontal_facing(yaw), true))?;
+            return Some(
+                block_states::with_property(block_id, "minecraft:cardinal_direction", facing)?,
+            );
+        }
+        if name == "fence_gate" || name.ends_with("_fence_gate") {
+            // `FenceGate::place()`: `$this->facing = $player->getHorizontalFacing()`.
+            let facing = facing_name(horizontal_facing(yaw))?;
+            return Some(
+                block_states::with_property(block_id, "minecraft:cardinal_direction", facing)?,
+            );
+        }
+        if name.ends_with("_stairs") {
+            // `Stairs::place()`: `$this->facing = $player->getHorizontalFacing()`,
+            // stored in `weirdo_direction` (the full-block side faces the
+            // player). Without this every stair kept the default east side.
+            // The upper/lower half is resolved by the session, which knows the
+            // click position.
+            let value = stairs_direction_value(horizontal_facing(yaw))?;
+            let state = block_states::with_property(block_id, "weirdo_direction", value)?;
+            return Some(match face {
+                DOWN => block_states::with_property(state, "upside_down_bit", "true")
+                    .unwrap_or(state),
+                _ => state,
+            });
+        }
+        if name == "trapdoor" || name.ends_with("_trapdoor") {
+            // `Trapdoor::place()`: `facing = opposite($player->getHorizontalFacing())`,
+            // stored in the 2-bit `direction` property. The upper/lower half
+            // is resolved by the session, which knows the click position.
+            //
+            // The four `direction` values cover the four orientations, and in
+            // game the neighbours of the raw facing came out as a quarter turn
+            // to the right (raw), a quarter turn to the left (one turn
+            // clockwise) and half a turn (the mirrored table), so the half turn
+            // counter-clockwise is the one that lands on the facing.
+            let facing = rotate_y(opposite(horizontal_facing(yaw)), false);
+            let value = horizontal_facing_value(facing)?;
+            let state = block_states::with_property(block_id, "direction", value)?;
+            return Some(match face {
+                DOWN => block_states::with_property(state, "upside_down_bit", "true")
+                    .unwrap_or(state),
+                _ => state,
+            });
+        }
+    }
+    state_for_placement(block_id, face, at)
+}
+
 pub fn state_for_placement<F>(block_id: u32, face: i32, at: F) -> Option<u32>
 where
     F: Fn(i32, i32, i32) -> u32,
@@ -323,6 +619,16 @@ where
         // Custom/unknown block: keep the id the caller brought.
         return Some(block_id);
     };
+    if name.ends_with("_leaves") {
+        // `Leaves::place()`: leaves a player puts down are marked persistent,
+        // so a random tick does not decay them when no log is nearby. Without
+        // this, every leaf a builder places falls apart on its own.
+        let persistent =
+            block_states::with_property(block_id, "persistent_bit", "true").unwrap_or(block_id);
+        return Some(
+            block_states::with_property(persistent, "update_bit", "true").unwrap_or(persistent),
+        );
+    }
     if matches!(
         name,
         "torch" | "soul_torch" | "copper_torch" | "underwater_torch"
@@ -432,6 +738,12 @@ where
             };
             neighbour_supports(face, SupportType::Center, &at)
         }
+        Rule::CenterBelow => neighbour_supports(DOWN, SupportType::Center, &at),
+        Rule::Lever => {
+            let face = lever_facing(id);
+            neighbour_supports(opposite(face), SupportType::Center, &at)
+        }
+        Rule::Button => neighbour_supports(opposite(button_facing(id)), SupportType::Center, &at),
         Rule::DirtBelow => neighbour_name(DOWN, &at).is_some_and(|n| DIRT_LIKE.contains(&n)),
         Rule::SandBelow => neighbour_name(DOWN, &at).is_some_and(|n| SAND_LIKE.contains(&n)),
         Rule::FarmlandBelow => neighbour_name(DOWN, &at) == Some("farmland"),
@@ -889,5 +1201,153 @@ mod tests {
         assert!(resets_fall_distance("web"));
         assert!(resets_fall_distance("ladder"));
         assert!(!resets_fall_distance("stone"));
+    }
+}
+
+#[cfg(test)]
+mod lever_placement_tests {
+    use super::*;
+    use bedrock_world::block_states;
+
+    fn lever() -> u32 {
+        block_states::network_id("lever").unwrap()
+    }
+
+    fn direction(id: u32) -> &'static str {
+        block_states::string_property(id, "lever_direction").unwrap()
+    }
+
+    /// `Lever::place()`: wall levers take the clicked face, floor/ceiling
+    /// levers take their base axis from the player's facing (yaw 90 = west).
+    #[test]
+    fn levers_take_their_direction_from_the_clicked_face() {
+        let at = |_, _, _| block_states::network_id("stone").unwrap();
+        assert_eq!(direction(state_for_placement_oriented(lever(), NORTH, 0.0, at).unwrap()), "north");
+        assert_eq!(direction(state_for_placement_oriented(lever(), EAST, 0.0, at).unwrap()), "east");
+        assert_eq!(
+            direction(state_for_placement_oriented(lever(), UP, 90.0, at).unwrap()),
+            "up_east_west"
+        );
+        assert_eq!(
+            direction(state_for_placement_oriented(lever(), UP, 0.0, at).unwrap()),
+            "up_north_south"
+        );
+        assert_eq!(
+            direction(state_for_placement_oriented(lever(), DOWN, 270.0, at).unwrap()),
+            "down_east_west"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redstone_support_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use bedrock_world::block_id::AIR;
+    use bedrock_world::generator::flat::FlatGenerator;
+
+    use crate::world_state::WorldState;
+
+    fn world() -> WorldState {
+        WorldState::new("world", Arc::new(FlatGenerator::new()))
+    }
+
+    fn id(name: &str) -> u32 {
+        block_states::network_id(name).unwrap_or_else(|| panic!("no default state for {name}"))
+    }
+
+    fn cardinal(id: u32) -> &'static str {
+        block_states::string_property(id, "cardinal_direction").unwrap()
+    }
+
+    /// Every redstone component sits on its support block; removing the
+    /// support must drop the component (PM `onNearbyBlockChange()` ->
+    /// `useBreakOn()`), instead of leaving it floating.
+    #[test]
+    fn redstone_components_break_with_their_support() {
+        let world = world();
+        let cases: [(&str, Option<(&str, &str)>); 6] = [
+            ("redstone_wire", None),
+            ("unpowered_repeater", None),
+            ("unpowered_comparator", None),
+            ("wooden_pressure_plate", None),
+            ("lever", Some(("lever_direction", "up_north_south"))),
+            ("stone_button", Some(("facing_direction", "1"))),
+        ];
+        for (index, (name, property)) in cases.into_iter().enumerate() {
+            let x = index as i32 * 2;
+            let support = (x, 4, 0);
+            let above = (x, 5, 0);
+            world.set_block(support.0, support.1, support.2, id("stone"));
+            let mut component = id(name);
+            if let Some((key, value)) = property {
+                component = block_states::with_property(component, key, value).unwrap();
+            }
+            world.set_block(above.0, above.1, above.2, component);
+            assert_eq!(
+                world.block_at(above.0, above.1, above.2),
+                component,
+                "{name} was placed"
+            );
+
+            world.set_block(support.0, support.1, support.2, AIR);
+            assert_eq!(
+                world.block_at(above.0, above.1, above.2),
+                AIR,
+                "{name} must break with its support"
+            );
+        }
+    }
+
+    /// `facing_direction` is the button's outward normal, so the only accepted
+    /// support is the block behind it: a ceiling button cannot hang off the
+    /// floor block below it.
+    #[test]
+    fn a_button_hangs_only_off_the_block_behind_it() {
+        let world = world();
+        let ceiling =
+            block_states::with_property(id("stone_button"), "facing_direction", "0").unwrap();
+        world.set_block(0, 4, 0, id("stone"));
+        world.set_block(0, 5, 0, ceiling);
+        assert_eq!(
+            world.block_at(0, 5, 0),
+            AIR,
+            "a downward button needs a block above it"
+        );
+
+        world.set_block(0, 6, 0, id("stone"));
+        world.set_block(0, 5, 0, ceiling);
+        assert_eq!(world.block_at(0, 5, 0), ceiling);
+
+        // PM `Button::place()` returns false instead of placing it unsupported.
+        let at = |_, _, _| AIR;
+        assert_eq!(state_for_placement_oriented(id("stone_button"), UP, 0.0, at), None);
+    }
+
+    /// Repeaters/comparators face away from the player (`RedstoneDiode::place`)
+    /// and buttons take the clicked face, instead of always facing south/down.
+    #[test]
+    fn diodes_and_buttons_take_the_player_facing() {
+        let at = |_, _, _| id("stone");
+        let repeater = id("unpowered_repeater");
+        // yaw 0 = facing south -> the diode points north.
+        assert_eq!(cardinal(state_for_placement_oriented(repeater, UP, 0.0, at).unwrap()), "north");
+        assert_eq!(cardinal(state_for_placement_oriented(repeater, UP, 180.0, at).unwrap()), "south");
+        assert_eq!(cardinal(state_for_placement_oriented(repeater, UP, 90.0, at).unwrap()), "east");
+        assert_eq!(cardinal(state_for_placement_oriented(repeater, UP, 270.0, at).unwrap()), "west");
+
+        // Pistons and dispensers face the clicked face as well.
+        let piston = id("piston");
+        let placed = state_for_placement_oriented(piston, EAST, 0.0, at).unwrap();
+        assert_eq!(block_states::int_property(placed, "facing_direction"), Some(5));
+        let placed = state_for_placement_oriented(piston, UP, 0.0, at).unwrap();
+        assert_eq!(block_states::int_property(placed, "facing_direction"), Some(1));
+
+        let button = id("stone_button");
+        let placed = state_for_placement_oriented(button, NORTH, 0.0, at).unwrap();
+        assert_eq!(block_states::int_property(placed, "facing_direction"), Some(2));
+        let placed = state_for_placement_oriented(button, UP, 0.0, at).unwrap();
+        assert_eq!(block_states::int_property(placed, "facing_direction"), Some(1));
     }
 }

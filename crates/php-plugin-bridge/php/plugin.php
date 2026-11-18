@@ -970,6 +970,13 @@ namespace pocketmine\plugin {
 
         public function getFile(): string
         {
+            // PM's contract: the plugin path with a trailing separator, which
+            // plugins concatenate (`getFile() . "resources"`, e.g. EasyEdit's
+            // `getResourcePathLegacy()`). Folder loaders hand us the main
+            // class file, so rebuild the path from the plugin root.
+            if ($this->root !== '' && !str_starts_with($this->root, 'phar://')) {
+                return $this->root . DIRECTORY_SEPARATOR;
+            }
             return $this->file;
         }
 

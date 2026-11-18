@@ -82,12 +82,29 @@ pub const fn action_inner_type(action_type: u32) -> u8 {
 /// before touching an inventory (see `crafting::container_slot`).
 pub const UI_ANVIL_INPUT: u8 = 0;
 pub const UI_ARMOR: u8 = 6;
+/// Chests, dispensers, droppers and hoppers address their slots with this id
+/// (PocketMine `ContainerUIIds::LEVEL_ENTITY`).
+pub const UI_LEVEL_ENTITY: u8 = 7;
+pub const UI_BREWING_STAND_INPUT: u8 = 9;
+pub const UI_BREWING_STAND_RESULT: u8 = 10;
+pub const UI_BREWING_STAND_FUEL: u8 = 11;
 pub const UI_COMBINED_HOTBAR_AND_INVENTORY: u8 = 12;
 pub const UI_CRAFTING_INPUT: u8 = 13;
 pub const UI_CRAFTING_OUTPUT_PREVIEW: u8 = 14;
+pub const UI_FURNACE_FUEL: u8 = 24;
+pub const UI_FURNACE_INGREDIENT: u8 = 25;
+pub const UI_FURNACE_RESULT: u8 = 26;
 pub const UI_HOTBAR: u8 = 28;
 pub const UI_INVENTORY: u8 = 29;
+pub const UI_SHULKER_BOX: u8 = 30;
+pub const UI_ARMOR_ALT: u8 = 31;
+pub const UI_OFFHAND_ALT: u8 = 32;
+pub const UI_INVENTORY_ALT: u8 = 33;
 pub const UI_OFFHAND: u8 = 34;
+pub const UI_HOTBAR_ALT: u8 = 36;
+pub const UI_BLAST_FURNACE_INGREDIENT: u8 = 45;
+pub const UI_SMOKER_INGREDIENT: u8 = 46;
+pub const UI_BARREL: u8 = 58;
 pub const UI_CURSOR: u8 = 59;
 pub const UI_CREATED_OUTPUT: u8 = 60;
 /// Only slot of [`UI_CREATED_OUTPUT`]: the crafted/creative "created item".

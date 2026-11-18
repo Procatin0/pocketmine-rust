@@ -160,6 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Session manager + ops/bans/whitelist (silent; PM logs nothing for these).
     let world_generator = config.create_world_generator();
+    // `level-type` picks between the generators (`create_generator`), and that
+    // choice is the difference between the BDS-style terrain and the classic
+    // PocketMine one. Log it once so a run can be identified from its log.
+    info!(
+        "World generator: level-type {}, seed {}",
+        config.level_type,
+        world_generator.seed()
+    );
     let session_manager = Arc::new(SessionManager::with_generator_gamemode_and_view_distance(
         world_generator,
         config.gamemode,
@@ -374,9 +382,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let manager = Arc::clone(&session_manager);
         let java_server = Arc::clone(&java_server);
-        let radius = config.view_distance.clamp(2, 12);
+        // Same radius the Java session announces in JoinGame and asks for in
+        // `request_chunks`. A narrower warm area (this used to be clamped to 12)
+        // left the outer ring permanently cold: `stream_chunks` then stalled on
+        // it and eventually generated it inline on the tick, which is why Java
+        // chunks appeared under a fast-flying player.
+        let radius = config.view_distance.clamp(2, 32);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            // 48 cold columns per pass (see `PREFETCH_COLD_BUDGET`) every
+            // ~100 ms matches the Bedrock pipeline's 24 prefetch/tick, so both
+            // platforms warm the same radius at the same rate. A finished pass
+            // is followed almost immediately instead of waiting half a second.
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
             let mut running: Option<tokio::task::JoinHandle<usize>> = None;
             loop {
                 interval.tick().await;
@@ -417,11 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let columns: Vec<(i32, i32)> = columns.into_iter().map(|(c, _)| c).collect();
                 // Pass the whole sorted list: `prefetch_blocking` skips
                 // warm columns with cache lookups and generates at most
-                // a bounded number of cold ones per pass, so each
-                // 500 ms pass progresses to the next batch. (The old
-                // `truncate(32)` here re-warmed the same nearest 32
-                // columns forever; outer columns stayed cold and the
-                // Java tick paid ~18 ms per column for the whole load.)
+                // a bounded number of cold ones per pass, so each pass
+                // progresses to the next batch. (The old `truncate(32)`
+                // here re-warmed the same nearest 32 columns forever;
+                // outer columns stayed cold and the Java tick paid
+                // ~18 ms per column for the whole load.)
                 // Converted bytes are warmed only for the protocols
                 // actually connected — all five used to cost ~5x.
                 let hooks = Arc::clone(&core_hooks);
@@ -659,7 +676,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
 
-                    session_manager.lag().tick_body.record(started.elapsed());
+                    let tick_body = started.elapsed();
+                    session_manager.lag().tick_body.record(tick_body);
+                    // MSPT for `/tpsbar` (Purpur's `getAverageTickTime()`).
+                    session_manager.metrics().record_tick_time(tick_body);
+                    // `/profiler` sessions: one sample per tick, after every scope
+                    // of this tick closed (see `server_core::profiler`).
+                    server_core::profiler::global().record_tick(tick, tick_body);
                     // One `[lag]` line per second: avg/max per stage, enough to
                     // see which one eats a slow tick (see `metrics::LagProbe`).
                     if tick % 20 == 0 {
@@ -819,6 +842,15 @@ async fn shutdown_sequence(context: impl Into<ShutdownContextAlias>) {
 
             // `NetworkSessionManager::close("Server closed")`.
             close_sessions(&ctx.session_manager, &ctx.config.shutdown_message);
+
+            // `World::unload()` saves the world before it leaves memory, so a
+            // Ctrl+C or `/stop` never has to wait for the 6000-tick autosave
+            // to fire. `save_all` writes `world.json` (block edits plus
+            // time/weather/difficulty/spawn/seed); the base terrain itself is
+            // not stored, it is regenerated from the seed.
+            if let Err(error) = ctx.session_manager.save_all() {
+                warn!("Could not save the world: {}", error);
+            }
 
             debug!("Unloading all worlds");
             info!(

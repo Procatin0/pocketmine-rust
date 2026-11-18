@@ -265,6 +265,32 @@ namespace pocketmine\event {
             return $data;
         }
 
+        /** Snapshot de entidad para eventos: mismo formato que `entity_json()`. */
+        public static function entityToArray(\pocketmine\entity\Entity $entity): array
+        {
+            $location = $entity->getLocation();
+            return [
+                'unique_id' => $entity->getNativeId() ?? 0,
+                'type' => $entity->getInstanceTypeId(),
+                'x' => $location->x,
+                'y' => $location->y,
+                'z' => $location->z,
+                'yaw' => $location->getYaw(),
+                'pitch' => $location->getPitch(),
+                'name_tag' => $entity->getNameTag(),
+                'alive' => $entity->isAlive(),
+            ];
+        }
+
+        /** Hidrata una entidad (o un jugador) desde el snapshot de Rust. */
+        public static function entityFromArray(mixed $raw): \pocketmine\entity\Entity
+        {
+            if ($raw instanceof \pocketmine\entity\Entity) {
+                return $raw;
+            }
+            return \pocketmine\entity\EntityDataHelper::entityFromArray(is_array($raw) ? $raw : []);
+        }
+
         public static function worldName(mixed $world): string
         {
             if (is_string($world)) {
@@ -595,6 +621,21 @@ namespace pocketmine\event {
             'PlayerInteractEvent' => \pocketmine\event\player\PlayerInteractEvent::class,
             'BlockBreakEvent' => \pocketmine\event\block\BlockBreakEvent::class,
             'BlockPlaceEvent' => \pocketmine\event\block\BlockPlaceEvent::class,
+            'WorldSaveEvent' => \pocketmine\event\world\WorldSaveEvent::class,
+            'SpawnChangeEvent' => \pocketmine\event\world\SpawnChangeEvent::class,
+            'WorldDifficultyChangeEvent' => \pocketmine\event\world\WorldDifficultyChangeEvent::class,
+            'ChunkLoadEvent' => \pocketmine\event\world\ChunkLoadEvent::class,
+            'WorldSoundEvent' => \pocketmine\event\world\WorldSoundEvent::class,
+            'WorldParticleEvent' => \pocketmine\event\world\WorldParticleEvent::class,
+            'BlockSpreadEvent' => \pocketmine\event\block\BlockSpreadEvent::class,
+            'BlockFormEvent' => \pocketmine\event\block\BlockFormEvent::class,
+            'EntityExplodeEvent' => \pocketmine\event\entity\EntityExplodeEvent::class,
+            'EntitySpawnEvent' => \pocketmine\event\entity\EntitySpawnEvent::class,
+            'EntityDespawnEvent' => \pocketmine\event\entity\EntityDespawnEvent::class,
+            'EntityDamageEvent' => \pocketmine\event\entity\EntityDamageEvent::class,
+            'EntityDamageByEntityEvent' => \pocketmine\event\entity\EntityDamageByEntityEvent::class,
+            'EntityDamageByChildEntityEvent' => \pocketmine\event\entity\EntityDamageByChildEntityEvent::class,
+            'EntityDeathEvent' => \pocketmine\event\entity\EntityDeathEvent::class,
             'ServerCommandEvent' => \pocketmine\event\server\ServerCommandEvent::class,
             'CommandEvent' => \pocketmine\event\server\CommandEvent::class,
         ];
@@ -1513,6 +1554,21 @@ namespace pocketmine\event\entity {
             $this->entity = $entity;
         }
 
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(\pocketmine\event\EventData::entityFromArray($data['entity'] ?? []));
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'entity' => \pocketmine\event\EventData::entityToArray($this->entity),
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+
         public function getEntity(): Entity
         {
             return $this->entity;
@@ -1546,6 +1602,43 @@ namespace pocketmine\event\entity {
         public function getXpDropAmount(): int
         {
             return $this->xp;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $drops = [];
+            foreach (($data['drops'] ?? []) as $drop) {
+                if ($drop instanceof \pocketmine\item\Item) {
+                    $drops[] = $drop;
+                } elseif (is_array($drop)) {
+                    $drops[] = \pocketmine\item\ItemFactory::get(
+                        (int)($drop['id'] ?? 0),
+                        0,
+                        (int)($drop['count'] ?? 1)
+                    );
+                }
+            }
+            $event = new static(
+                \pocketmine\event\EventData::entityFromArray($data['entity'] ?? []),
+                $drops,
+                (int)($data['xp'] ?? 0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            $drops = [];
+            foreach ($this->drops as $item) {
+                $drops[] = ['id' => $item->getId(), 'count' => $item->getCount()];
+            }
+            return [
+                'entity' => \pocketmine\event\EventData::entityToArray($this->entity),
+                'drops' => $drops,
+                'xp' => $this->xp,
+                'cancelled' => $this->isCancelled(),
+            ];
         }
 
         public function setXpDropAmount(int $xp): void
@@ -1598,6 +1691,30 @@ namespace pocketmine\event\entity {
             $this->baseDamage = $damage;
         }
 
+        public static function fromArray(array $data): Event
+        {
+            // `final_damage` gana cuando viene: es el daño ya ajustado por los
+            // modificadores, y el puente no modela modificadores aparte.
+            $event = new static(
+                \pocketmine\event\EventData::entityFromArray($data['entity'] ?? []),
+                (int)($data['cause'] ?? self::CAUSE_CUSTOM),
+                (float)($data['final_damage'] ?? $data['base_damage'] ?? 0.0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'entity' => \pocketmine\event\EventData::entityToArray($this->entity),
+                'cause' => $this->cause,
+                'base_damage' => $this->baseDamage,
+                'final_damage' => $this->getFinalDamage(),
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+
         public function getFinalDamage(): float
         {
             return $this->baseDamage;
@@ -1614,6 +1731,30 @@ namespace pocketmine\event\entity {
             $this->damager = $damager;
         }
 
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                \pocketmine\event\EventData::entityFromArray($data['damager'] ?? []),
+                \pocketmine\event\EventData::entityFromArray($data['entity'] ?? []),
+                (int)($data['cause'] ?? self::CAUSE_ENTITY_ATTACK),
+                (float)($data['final_damage'] ?? $data['base_damage'] ?? 0.0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'entity' => \pocketmine\event\EventData::entityToArray($this->entity),
+                'damager' => \pocketmine\event\EventData::entityToArray($this->damager),
+                'cause' => $this->cause,
+                'base_damage' => $this->baseDamage,
+                'final_damage' => $this->getFinalDamage(),
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+
         public function getDamager(): Entity
         {
             return $this->damager;
@@ -1628,6 +1769,26 @@ namespace pocketmine\event\entity {
         {
             parent::__construct($damager, $entity, $cause, $baseDamage);
             $this->child = $child;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                \pocketmine\event\EventData::entityFromArray($data['damager'] ?? []),
+                \pocketmine\event\EventData::entityFromArray($data['child'] ?? []),
+                \pocketmine\event\EventData::entityFromArray($data['entity'] ?? []),
+                (int)($data['cause'] ?? self::CAUSE_PROJECTILE),
+                (float)($data['final_damage'] ?? $data['base_damage'] ?? 0.0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return parent::toArray() + [
+                'child' => \pocketmine\event\EventData::entityToArray($this->child),
+            ];
         }
 
         public function getChild(): Entity
@@ -1737,6 +1898,817 @@ namespace pocketmine\event\entity {
         public function getEntityHit(): Entity
         {
             return $this->entityHit;
+        }
+    }
+}
+
+namespace pocketmine\event\world {
+    use pocketmine\event\Cancellable;
+    use pocketmine\event\Event;
+    use pocketmine\math\Vector3;
+    use pocketmine\player\Player;
+    use pocketmine\world\particle\Particle;
+    use pocketmine\world\particle\ParticleBase;
+    use pocketmine\world\particle\WireParticle;
+    use pocketmine\world\Position;
+    use pocketmine\world\sound\Sound;
+    use pocketmine\world\sound\SoundBase;
+    use pocketmine\world\sound\WireSound;
+    use pocketmine\world\World;
+
+    /**
+     * PM `WorldEvent`: todo evento de mundo lleva su `World`.
+     *
+     * PM los dispara dentro de `World`; aquí los encola el mundo nativo
+     * (`world_state.rs`) y los despacha `SessionManager` en el tick siguiente,
+     * porque el `WorldState` no conoce el gestor de plugins.
+     */
+    abstract class WorldEvent extends Event
+    {
+        protected World $world;
+
+        public function __construct(World $world)
+        {
+            $this->world = $world;
+        }
+
+        public function getWorld(): World
+        {
+            return $this->world;
+        }
+
+        /**
+         * `World` por nombre, sin exigir un `Server` inicializado (pruebas de
+         * arranque): si no hay servidor utilizable se usa un `World` local con
+         * ese nombre.
+         */
+        protected static function worldFromArray(array $data): World
+        {
+            $name = (string)($data['world'] ?? '');
+            if ($name === '') {
+                $name = 'world';
+            }
+            if (class_exists(\pocketmine\Server::class, false)) {
+                try {
+                    $world = \pocketmine\Server::getInstance()->getWorldManager()->getWorldByName($name);
+                    if ($world instanceof World) {
+                        return $world;
+                    }
+                } catch (\Throwable) {
+                    // Sin servidor: se hidrata con un `World` local.
+                }
+            }
+            return new World($name);
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'world' => $this->world->getName(),
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+    }
+
+    /** PM `WorldSaveEvent`: `World::save()` (manual o autoguardado). */
+    class WorldSaveEvent extends WorldEvent
+    {
+        public static function fromArray(array $data): Event
+        {
+            return new static(self::worldFromArray($data));
+        }
+    }
+
+    /**
+     * PM `SpawnChangeEvent`: el spawn del mundo cambió; lleva el anterior.
+     */
+    class SpawnChangeEvent extends WorldEvent
+    {
+        private Position $previousSpawn;
+
+        public function __construct(World $world, Position $previousSpawn)
+        {
+            parent::__construct($world);
+            $this->previousSpawn = $previousSpawn;
+        }
+
+        public function getPreviousSpawn(): Position
+        {
+            return $this->previousSpawn;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $world = self::worldFromArray($data);
+            return new static($world, new Position(
+                (float)($data['previous_x'] ?? 0.0),
+                (float)($data['previous_y'] ?? 0.0),
+                (float)($data['previous_z'] ?? 0.0),
+                $world->getName()
+            ));
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'world' => $this->world->getName(),
+                'previous_x' => $this->previousSpawn->x,
+                'previous_y' => $this->previousSpawn->y,
+                'previous_z' => $this->previousSpawn->z,
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+    }
+
+    /** PM `WorldDifficultyChangeEvent`: dificultad anterior y nueva. */
+    final class WorldDifficultyChangeEvent extends WorldEvent
+    {
+        public function __construct(
+            World $world,
+            private int $oldDifficulty,
+            private int $newDifficulty
+        ) {
+            parent::__construct($world);
+        }
+
+        public function getOldDifficulty(): int
+        {
+            return $this->oldDifficulty;
+        }
+
+        public function getNewDifficulty(): int
+        {
+            return $this->newDifficulty;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            return new static(
+                self::worldFromArray($data),
+                (int)($data['old_difficulty'] ?? 0),
+                (int)($data['new_difficulty'] ?? 0)
+            );
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'world' => $this->world->getName(),
+                'old_difficulty' => $this->oldDifficulty,
+                'new_difficulty' => $this->newDifficulty,
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+    }
+
+    /**
+     * PM `ChunkEvent`: eventos de columna. `getChunk()` devuelve la columna real
+     * (`World::getChunk()`); sin host (pruebas) cae a una columna vacía.
+     */
+    abstract class ChunkEvent extends WorldEvent
+    {
+        private ?\pocketmine\world\Chunk $chunk = null;
+
+        public function __construct(
+            World $world,
+            protected int $chunkX,
+            protected int $chunkZ,
+            ?\pocketmine\world\Chunk $chunk = null
+        ) {
+            parent::__construct($world);
+            $this->chunk = $chunk;
+        }
+
+        public function getChunkX(): int
+        {
+            return $this->chunkX;
+        }
+
+        public function getChunkZ(): int
+        {
+            return $this->chunkZ;
+        }
+
+        public function getChunk(): \pocketmine\world\format\Chunk
+        {
+            return $this->chunk ??= $this->world->getChunk($this->chunkX, $this->chunkZ)
+                ?? new \pocketmine\world\format\Chunk();
+        }
+    }
+
+    /**
+     * PM `ChunkLoadEvent`: la columna entró en memoria (o la generó el generador).
+     * No cancelable.
+     */
+    class ChunkLoadEvent extends ChunkEvent
+    {
+        public function __construct(
+            World $world,
+            int $chunkX,
+            int $chunkZ,
+            ?\pocketmine\world\Chunk $chunk = null,
+            private bool $newChunk = true
+        ) {
+            parent::__construct($world, $chunkX, $chunkZ, $chunk);
+        }
+
+        /** ¿La generó el generador (en vez de cargarla del disco)? */
+        public function isNewChunk(): bool
+        {
+            return $this->newChunk;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            return new static(
+                self::worldFromArray($data),
+                (int)($data['chunk_x'] ?? 0),
+                (int)($data['chunk_z'] ?? 0),
+                null,
+                (bool)($data['new_chunk'] ?? true)
+            );
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'world' => $this->world->getName(),
+                'chunk_x' => $this->chunkX,
+                'chunk_z' => $this->chunkZ,
+                'new_chunk' => $this->newChunk,
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+    }
+
+    /**
+     * PM `WorldSoundEvent`: un sonido está por reproducirse en el mundo.
+     *
+     * Igual que los eventos de bloque, el PHP no puede despacharlo desde
+     * `World::addSound()` (ya está dentro de una host call): el efecto se
+     * encola en Rust y `SessionManager` dispara el evento en el tick siguiente.
+     * Cancelarlo evita el packet; `setSound()`/`setRecipients()` cambian lo que
+     * se envía. El `Sound` es un `WireSound` (nombre de `LevelSoundEvent` o id
+     * de `LevelEvent`) porque el objeto original no cruza el IPC.
+     */
+    class WorldSoundEvent extends WorldEvent implements Cancellable
+    {
+        private Sound $sound;
+        private Vector3 $position;
+
+        /** @var string[] nombres en minúsculas */
+        private array $recipientNames;
+
+        /**
+         * @param Player[] $recipients
+         */
+        public function __construct(
+            World $world,
+            Sound $sound,
+            Vector3 $position,
+            array $recipients = []
+        ) {
+            parent::__construct($world);
+            $this->sound = $sound;
+            $this->position = $position;
+            $this->recipientNames = self::namesOf($recipients);
+        }
+
+        public function getSound(): Sound
+        {
+            return $this->sound;
+        }
+
+        public function setSound(Sound $sound): void
+        {
+            $this->sound = $sound;
+        }
+
+        public function getPosition(): Vector3
+        {
+            return $this->position;
+        }
+
+        /**
+         * PM devuelve `Player[]`; aquí se resuelven los nombres guardados. Un
+         * jugador que ya no está conectado se omite (documentado en §4.18).
+         *
+         * @return Player[]
+         */
+        public function getRecipients(): array
+        {
+            $players = [];
+            if (class_exists(\pocketmine\Server::class, false)) {
+                try {
+                    $server = \pocketmine\Server::getInstance();
+                    foreach ($this->recipientNames as $name) {
+                        $player = $server->getPlayerExact($name);
+                        if ($player instanceof Player) {
+                            $players[] = $player;
+                        }
+                    }
+                } catch (\Throwable) {
+                    // Sin servidor inicializado no hay jugadores que resolver.
+                }
+            }
+            return $players;
+        }
+
+        /**
+         * @param Player[] $recipients
+         */
+        public function setRecipients(array $recipients): void
+        {
+            $this->recipientNames = self::namesOf($recipients);
+        }
+
+        /** @param array<int, mixed> $recipients */
+        private static function namesOf(array $recipients): array
+        {
+            $names = [];
+            foreach ($recipients as $recipient) {
+                if ($recipient instanceof Player) {
+                    $names[] = strtolower($recipient->getName());
+                } elseif (is_string($recipient) && $recipient !== '') {
+                    $names[] = strtolower($recipient);
+                }
+            }
+            return $names;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                self::worldFromArray($data),
+                new WireSound(
+                    isset($data['sound']) && is_string($data['sound']) ? $data['sound'] : null,
+                    isset($data['event_id']) ? (int)$data['event_id'] : null,
+                    (int)($data['extra_data'] ?? 0)
+                ),
+                new Vector3(
+                    (float)($data['x'] ?? 0.0),
+                    (float)($data['y'] ?? 0.0),
+                    (float)($data['z'] ?? 0.0)
+                ),
+                is_array($data['recipients'] ?? null) ? $data['recipients'] : []
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            $data = parent::toArray();
+            $data['x'] = $this->position->getX();
+            $data['y'] = $this->position->getY();
+            $data['z'] = $this->position->getZ();
+            if ($this->sound instanceof SoundBase) {
+                $data['sound'] = $this->sound->getSoundName();
+                $data['event_id'] = $this->sound->getEventId();
+                $data['extra_data'] = $this->sound->getExtraData();
+            }
+            $data['recipients'] = $this->recipientNames;
+            $data['cancelled'] = $this->isCancelled();
+            return $data;
+        }
+    }
+
+    /**
+     * PM `WorldParticleEvent`: partículas a punto de aparecer.
+     *
+     * Mismo diferido que `WorldSoundEvent`: el efecto se encola en Rust y el
+     * evento se dispara en el tick siguiente. Cancelarlo evita el
+     * `LevelEventPacket`; `setParticle()` acepta cualquier `ParticleBase` del
+     * bridge. `event_id = 0` significa "no emitir".
+     */
+    class WorldParticleEvent extends WorldEvent implements Cancellable
+    {
+        private Particle $particle;
+        private Vector3 $position;
+
+        /** @var string[] nombres en minúsculas */
+        private array $recipientNames;
+
+        /**
+         * @param Player[] $recipients
+         */
+        public function __construct(
+            World $world,
+            Particle $particle,
+            Vector3 $position,
+            array $recipients = []
+        ) {
+            parent::__construct($world);
+            $this->particle = $particle;
+            $this->position = $position;
+            $this->recipientNames = self::namesOf($recipients);
+        }
+
+        public function getParticle(): Particle
+        {
+            return $this->particle;
+        }
+
+        public function setParticle(Particle $particle): void
+        {
+            $this->particle = $particle;
+        }
+
+        public function getPosition(): Vector3
+        {
+            return $this->position;
+        }
+
+        /** @return Player[] */
+        public function getRecipients(): array
+        {
+            $players = [];
+            if (class_exists(\pocketmine\Server::class, false)) {
+                try {
+                    $server = \pocketmine\Server::getInstance();
+                    foreach ($this->recipientNames as $name) {
+                        $player = $server->getPlayerExact($name);
+                        if ($player instanceof Player) {
+                            $players[] = $player;
+                        }
+                    }
+                } catch (\Throwable) {
+                    // Sin servidor inicializado no hay jugadores que resolver.
+                }
+            }
+            return $players;
+        }
+
+        /** @param Player[] $recipients */
+        public function setRecipients(array $recipients): void
+        {
+            $this->recipientNames = self::namesOf($recipients);
+        }
+
+        /** @param array<int, mixed> $recipients */
+        private static function namesOf(array $recipients): array
+        {
+            $names = [];
+            foreach ($recipients as $recipient) {
+                if ($recipient instanceof Player) {
+                    $names[] = strtolower($recipient->getName());
+                } elseif (is_string($recipient) && $recipient !== '') {
+                    $names[] = strtolower($recipient);
+                }
+            }
+            return $names;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                self::worldFromArray($data),
+                new WireParticle(
+                    (int)($data['event_id'] ?? 0),
+                    (int)($data['event_data'] ?? 0)
+                ),
+                new Vector3(
+                    (float)($data['x'] ?? 0.0),
+                    (float)($data['y'] ?? 0.0),
+                    (float)($data['z'] ?? 0.0)
+                ),
+                is_array($data['recipients'] ?? null) ? $data['recipients'] : []
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            $data = parent::toArray();
+            $data['x'] = $this->position->getX();
+            $data['y'] = $this->position->getY();
+            $data['z'] = $this->position->getZ();
+            if ($this->particle instanceof ParticleBase) {
+                $data['event_id'] = $this->particle->getPacketEvent();
+                $data['event_data'] = $this->particle->encodeData();
+            }
+            $data['recipients'] = $this->recipientNames;
+            $data['cancelled'] = $this->isCancelled();
+            return $data;
+        }
+    }
+}
+
+namespace pocketmine\event\block {
+    use pocketmine\block\Block;
+    use pocketmine\event\Cancellable;
+    use pocketmine\event\Event;
+    use pocketmine\world\World;
+
+    /**
+     * Base de los eventos de cambio de bloque sin jugador.
+     *
+     * Divergencia documentada: el puente no tiene un `Player` real en el tick
+     * del mundo, así que estos eventos extienden `Event` con coordenadas en vez
+     * de `BlockEvent(Player|Block)`; los getters reconstruyen los `Block`.
+     */
+    abstract class WorldBlockChangeEvent extends Event implements Cancellable
+    {
+        protected function __construct(
+            protected string $worldName,
+            protected int $x,
+            protected int $y,
+            protected int $z,
+            protected int $blockId,
+            protected int $newStateId
+        ) {
+        }
+
+        public function getWorld(): World
+        {
+            $name = $this->worldName === '' ? 'world' : $this->worldName;
+            if (class_exists(\pocketmine\Server::class, false)) {
+                try {
+                    $world = \pocketmine\Server::getInstance()->getWorldManager()->getWorldByName($name);
+                    if ($world instanceof World) {
+                        return $world;
+                    }
+                } catch (\Throwable) {
+                    // Sin servidor: `World` local.
+                }
+            }
+            return new World($name);
+        }
+
+        public function getX(): int
+        {
+            return $this->x;
+        }
+
+        public function getY(): int
+        {
+            return $this->y;
+        }
+
+        public function getZ(): int
+        {
+            return $this->z;
+        }
+
+        /** Id de estado del bloque reemplazado (`getBlockId()`). */
+        public function getBlockId(): int
+        {
+            return $this->blockId;
+        }
+
+        public function getBlock(): Block
+        {
+            return Block::fromStateId($this->blockId, $this->worldName, $this->x, $this->y, $this->z);
+        }
+
+        /** Estado destino (`BaseBlockChangeEvent::getNewState()`). */
+        public function getNewState(): Block
+        {
+            return Block::fromStateId($this->newStateId, $this->worldName, $this->x, $this->y, $this->z);
+        }
+
+        public function toArray(): array
+        {
+            return [
+                'world' => $this->worldName,
+                'x' => $this->x,
+                'y' => $this->y,
+                'z' => $this->z,
+                'block_id' => $this->blockId,
+                'new_id' => $this->newStateId,
+                'cancelled' => $this->isCancelled(),
+            ];
+        }
+    }
+
+    /**
+     * PM `BlockSpreadEvent`: un bloque se propaga a otra celda (agua/lava que
+     * fluyen, hierba sobre tierra). Cancelable.
+     */
+    class BlockSpreadEvent extends WorldBlockChangeEvent
+    {
+        public function __construct(
+            string $worldName,
+            int $x,
+            int $y,
+            int $z,
+            int $blockId,
+            private int $sourceId,
+            int $newStateId
+        ) {
+            parent::__construct($worldName, $x, $y, $z, $blockId, $newStateId);
+        }
+
+        /** Bloque que origina la propagación (`getSource()`). */
+        public function getSource(): Block
+        {
+            return Block::fromStateId($this->sourceId, $this->worldName, $this->x, $this->y, $this->z);
+        }
+
+        public function getSourceId(): int
+        {
+            return $this->sourceId;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                (string)($data['world'] ?? 'world'),
+                (int)($data['x'] ?? 0),
+                (int)($data['y'] ?? 0),
+                (int)($data['z'] ?? 0),
+                (int)($data['block_id'] ?? 0),
+                (int)($data['source_id'] ?? 0),
+                (int)($data['new_id'] ?? 0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return ['source_id' => $this->sourceId] + parent::toArray();
+        }
+    }
+
+    /**
+     * PM `BlockFormEvent`: un bloque nuevo se forma (lava que endurece al tocar
+     * agua: piedra, cobblestone, obsidiana). Cancelable.
+     */
+    class BlockFormEvent extends WorldBlockChangeEvent
+    {
+        public function __construct(
+            string $worldName,
+            int $x,
+            int $y,
+            int $z,
+            int $blockId,
+            private int $causingId,
+            int $newStateId
+        ) {
+            parent::__construct($worldName, $x, $y, $z, $blockId, $newStateId);
+        }
+
+        /** Bloque que provocó el cambio (`getCausingBlock()`). */
+        public function getCausingBlock(): Block
+        {
+            return Block::fromStateId($this->causingId, $this->worldName, $this->x, $this->y, $this->z);
+        }
+
+        public function getCausingBlockId(): int
+        {
+            return $this->causingId;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $event = new static(
+                (string)($data['world'] ?? 'world'),
+                (int)($data['x'] ?? 0),
+                (int)($data['y'] ?? 0),
+                (int)($data['z'] ?? 0),
+                (int)($data['block_id'] ?? 0),
+                (int)($data['causing_id'] ?? 0),
+                (int)($data['new_id'] ?? 0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            return ['causing_id' => $this->causingId] + parent::toArray();
+        }
+    }
+}
+
+namespace pocketmine\event\entity {
+    use pocketmine\block\Block;
+    use pocketmine\event\Cancellable;
+    use pocketmine\event\Event;
+    use pocketmine\event\EventData;
+    use pocketmine\world\Position;
+
+    /**
+     * PM `EntityExplodeEvent`: el impacto ya se calculó y los bloques todavía
+     * no se destruyeron, así que cancelar evita el daño y la destrucción.
+     */
+    class EntityExplodeEvent extends EntityEvent implements Cancellable
+    {
+        /** @var Block[] */
+        private array $blockList;
+        /** @var Block[] */
+        private array $ignitions;
+
+        public function __construct(
+            \pocketmine\entity\Entity $entity,
+            private Position $position,
+            array $blockList,
+            private float $yield,
+            array $ignitions = []
+        ) {
+            parent::__construct($entity);
+            $this->blockList = $blockList;
+            $this->yield = $yield;
+            $this->ignitions = $ignitions;
+        }
+
+        public function getPosition(): Position
+        {
+            return $this->position;
+        }
+
+        /** @return Block[] */
+        public function getBlockList(): array
+        {
+            return $this->blockList;
+        }
+
+        /** @param Block[] $blockList */
+        public function setBlockList(array $blockList): void
+        {
+            $this->blockList = $blockList;
+        }
+
+        /** Probabilidad de drop por bloque, 0-100. */
+        public function getYield(): float
+        {
+            return $this->yield;
+        }
+
+        public function setYield(float $yield): void
+        {
+            if ($yield < 0.0 || $yield > 100.0) {
+                throw new \InvalidArgumentException('Yield must be in range 0.0 - 100.0');
+            }
+            $this->yield = $yield;
+        }
+
+        /** @return Block[] */
+        public function getIgnitions(): array
+        {
+            return $this->ignitions;
+        }
+
+        /** @param Block[] $ignitions */
+        public function setIgnitions(array $ignitions): void
+        {
+            $this->ignitions = $ignitions;
+        }
+
+        public static function fromArray(array $data): Event
+        {
+            $worldName = (string)($data['world'] ?? 'world');
+            $blocks = [];
+            foreach (($data['blocks'] ?? []) as $block) {
+                if (!is_array($block)) {
+                    continue;
+                }
+                $blocks[] = Block::fromStateId(
+                    (int)($block['block_id'] ?? 0),
+                    $worldName,
+                    (int)($block['x'] ?? 0),
+                    (int)($block['y'] ?? 0),
+                    (int)($block['z'] ?? 0)
+                );
+            }
+            $event = new static(
+                EventData::entityFromArray($data['entity'] ?? []),
+                new Position(
+                    (float)($data['x'] ?? 0.0),
+                    (float)($data['y'] ?? 0.0),
+                    (float)($data['z'] ?? 0.0),
+                    $worldName
+                ),
+                $blocks,
+                (float)($data['yield'] ?? 100.0)
+            );
+            $event->applyCancelled($data);
+            return $event;
+        }
+
+        public function toArray(): array
+        {
+            $blocks = [];
+            foreach ($this->blockList as $block) {
+                $blocks[] = [
+                    'x' => $block->getX(),
+                    'y' => $block->getY(),
+                    'z' => $block->getZ(),
+                    'block_id' => $block->getStateId(),
+                ];
+            }
+            return [
+                'entity' => EventData::entityToArray($this->entity),
+                'world' => $this->position->getWorldName(),
+                'x' => $this->position->x,
+                'y' => $this->position->y,
+                'z' => $this->position->z,
+                'yield' => $this->yield,
+                'blocks' => $blocks,
+                'cancelled' => $this->isCancelled(),
+            ];
         }
     }
 }

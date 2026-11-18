@@ -81,7 +81,7 @@ impl NormalGenerator {
         random.set_seed(seed);
         let selector = BiomeSelector::new(&mut random);
 
-        let ground_cover = GroundCoverPopulator::new();
+        let ground_cover = GroundCoverPopulator::new(seed as u64);
         let ore_populator = OrePopulator::new_overworld();
         let emerald_ore = OrePopulator::new_emerald();
 

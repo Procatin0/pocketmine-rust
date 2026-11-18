@@ -22,6 +22,9 @@ pub struct TickMetrics {
     /// Instant when the first tick was recorded, used to avoid diluting TPS
     /// at startup when fewer than `seconds` of samples exist.
     start_time: Mutex<Option<Instant>>,
+    /// `(Instant, microseconds)` per tick body, for MSPT: Paper's
+    /// `Bukkit.getAverageTickTime()` and the `/tpsbar` boss bar.
+    tick_times: Mutex<VecDeque<(Instant, u64)>>,
 }
 
 impl Default for TickMetrics {
@@ -35,6 +38,7 @@ impl TickMetrics {
         Self {
             ticks: Mutex::new(VecDeque::with_capacity(CAPACITY)),
             start_time: Mutex::new(None),
+            tick_times: Mutex::new(VecDeque::with_capacity(CAPACITY)),
         }
     }
 
@@ -96,6 +100,52 @@ impl TickMetrics {
     /// `(1m, 5m, 15m)` right now.
     pub fn current(&self) -> (f64, f64, f64) {
         self.snapshot(Instant::now())
+    }
+
+    /// Records the processing time of one tick body.
+    pub fn record_tick_time(&self, duration: Duration) {
+        self.record_tick_time_at(duration, Instant::now());
+    }
+
+    /// Records a tick body at `instant`, dropping samples older than 15 minutes.
+    pub fn record_tick_time_at(&self, duration: Duration, instant: Instant) {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        let mut times = self.tick_times.lock();
+        times.push_back((instant, micros));
+        if let Some(cutoff) = instant.checked_sub(MAX_WINDOW) {
+            while times.front().is_some_and(|(when, _)| *when < cutoff) {
+                times.pop_front();
+            }
+        }
+        while times.len() > CAPACITY {
+            times.pop_front();
+        }
+    }
+
+    /// Mean tick body over the last `seconds`, in milliseconds; `0.0` when the
+    /// window holds no sample (nothing measured yet).
+    pub fn mspt(&self, seconds: u64, now: Instant) -> f64 {
+        let times = self.tick_times.lock();
+        let Some(cutoff) = now.checked_sub(Duration::from_secs(seconds)) else {
+            return 0.0;
+        };
+        let mut samples = 0u64;
+        let mut total_us = 0u64;
+        for (when, micros) in times.iter() {
+            if *when >= cutoff {
+                samples += 1;
+                total_us += *micros;
+            }
+        }
+        if samples == 0 {
+            return 0.0;
+        }
+        total_us as f64 / samples as f64 / 1000.0
+    }
+
+    /// `Bukkit.getAverageTickTime()`: the mean tick body over the last minute.
+    pub fn average_tick_time(&self) -> f64 {
+        self.mspt(60, Instant::now())
     }
 }
 
@@ -270,6 +320,30 @@ mod tests {
             busy.record_at(start + Duration::from_millis(i * 25));
         }
         assert_eq!(busy.tps(60, now), 20.0);
+    }
+
+    #[test]
+    fn mspt_averages_the_tick_bodies_of_the_window() {
+        let metrics = TickMetrics::new();
+        let start = Instant::now();
+        // A 30 ms outlier at startup, then a steady 2 ms per tick from t=10s.
+        metrics.record_tick_time_at(Duration::from_millis(30), start);
+        for i in 0..200u64 {
+            metrics.record_tick_time_at(
+                Duration::from_millis(2),
+                start + Duration::from_secs(10) + Duration::from_millis(i * 50),
+            );
+        }
+
+        // At t=70s the 1m window only sees the steady 2 ms ticks.
+        let one_minute = metrics.mspt(60, start + Duration::from_secs(70));
+        assert!((one_minute - 2.0).abs() < 0.001, "1m mspt was {one_minute}");
+        // ...while the 15m window mixes in the 30 ms outlier.
+        let fifteen = metrics.mspt(900, start + Duration::from_secs(70));
+        assert!(fifteen > 2.0 && fifteen < 3.0, "15m mspt was {fifteen}");
+
+        // An empty sampler reports no load rather than a division by zero.
+        assert_eq!(TickMetrics::new().mspt(60, start), 0.0);
     }
 
     #[test]

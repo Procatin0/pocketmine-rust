@@ -23,9 +23,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::hooks::{ChatOutcome, PlayerSnapshot, ServerHooks};
+use bytes::{Buf, BytesMut};
+
+use crate::hooks::{ChatOutcome, LegacyChunk, ModernChunkData, PlayerSnapshot, ServerHooks};
 use crate::profile;
 use crate::wire;
 
@@ -35,6 +38,11 @@ pub const TIMEOUT_SECONDS: f64 = 30.0;
 pub const CHUNK_BUDGET: Duration = Duration::from_millis(12);
 /// Columns per batch (`CHUNKS_PER_BATCH`).
 pub const CHUNKS_PER_BATCH: usize = 64;
+/// Ticks without a single streamed column before the tick pays one generating
+/// build. Cold columns never block the queue in the meantime (they rotate to
+/// the back and the warm ones keep flowing), so this only bounds the "prefetch
+/// is dead" case: 100 ticks ≈ 5 s.
+pub const COLD_WAIT_TICKS: u32 = 100;
 /// Pause streaming when more than this is queued (`CHUNK_BACKPRESSURE`).
 pub const CHUNK_BACKPRESSURE: usize = 262_144;
 pub const WORLD_NAME: &str = "minecraft:overworld";
@@ -100,6 +108,44 @@ pub struct TabTarget {
     pub ping: i32,
 }
 
+/// One non-player entity an observer should see (`server::actor_targets_for`):
+/// a Bedrock actor translated to the Java wire, with its entity-type registry
+/// id already resolved for the observer's protocol.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorTarget {
+    /// Bedrock runtime id; the key this session diff's seen actors by.
+    pub runtime_id: u64,
+    /// Java entity id ([`ServerHooks::actor_entity_id`]).
+    pub entity: i32,
+    /// Java `minecraft:entity_type` registry id for the observer's protocol.
+    pub entity_type: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    /// Java yaw/pitch/head yaw (wire convention).
+    pub yaw: f64,
+    pub pitch: f64,
+    pub head_yaw: f64,
+    /// `Entity::getNameTag()`; empty means no custom name.
+    pub name_tag: String,
+    /// `spawn_entity` `data` field: the Java global block state a falling
+    /// block imitates, 0 for every other type.
+    pub block_state: i32,
+}
+
+/// An actor already spawned for this client (`seenActors`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenActor {
+    pub entity: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f64,
+    pub pitch: f64,
+    pub head_yaw: f64,
+    pub name_tag: String,
+}
+
 pub struct JavaSession {
     pub session_id: u64,
     pub peer: SocketAddr,
@@ -125,13 +171,18 @@ pub struct JavaSession {
     /// Java inventory slot -> item id. The client never reports which item it
     /// is placing, so this is the only source for `place_block`.
     pub creative_slots: HashMap<i16, i32>,
+    /// Stack sizes of [`Self::creative_slots`] (same slot keys): a `drop_all`
+    /// throws the whole stack, a plain drop only one item.
+    pub creative_counts: HashMap<i16, i32>,
     /// Selected hotbar index from `held_item_slot` (0..=8).
     pub held_slot: i16,
     pub health: f32,
     /// Chunks already sent (`sentChunks`).
     pub sent_chunks: HashSet<(i32, i32)>,
     pub pending_chunks: VecDeque<(i32, i32)>,
-    pub pending_attempts: HashMap<(i32, i32), u32>,
+    /// Consecutive ticks that streamed no column because everything left was
+    /// still generating (`stream_chunks`). Drives the liveness fallback.
+    pub cold_stall_ticks: u32,
     pub last_chunk: Option<(i32, i32)>,
     pub chunks_per_tick: Option<f32>,
     pub view_announced: bool,
@@ -148,13 +199,15 @@ pub struct JavaSession {
     pub api_joined: bool,
     /// Entities this client has spawned (`seenEntities`).
     pub seen_entities: HashMap<String, SeenEntity>,
+    /// Non-player entities this client has spawned, by Bedrock runtime id.
+    pub seen_actors: HashMap<u64, SeenActor>,
     /// Players announced in this client's TAB (`tabListed`).
     pub tab_listed: HashMap<String, TabEntry>,
     /// Play packet ids seen but not handled yet: logged once each so parity
     /// gaps (e.g. a `block_dig` id mismatch) are visible in `server.log`
     /// instead of silently dropped.
     pub unhandled_ids: HashSet<i32>,
-    in_buf: Vec<u8>,
+    in_buf: BytesMut,
     out_buf: Vec<u8>,
     pub closed: bool,
     pub playing: bool,
@@ -180,11 +233,12 @@ impl JavaSession {
             is_sprinting: false,
             gamemode: 0,
             creative_slots: HashMap::new(),
+            creative_counts: HashMap::new(),
             held_slot: 0,
             health: 20.0,
             sent_chunks: HashSet::new(),
             pending_chunks: VecDeque::new(),
-            pending_attempts: HashMap::new(),
+            cold_stall_ticks: 0,
             last_chunk: None,
             chunks_per_tick: None,
             view_announced: false,
@@ -198,9 +252,10 @@ impl JavaSession {
             own_entity_id: None,
             api_joined: false,
             seen_entities: HashMap::new(),
+            seen_actors: HashMap::new(),
             tab_listed: HashMap::new(),
             unhandled_ids: HashSet::new(),
-            in_buf: Vec::new(),
+            in_buf: BytesMut::new(),
             out_buf: Vec::new(),
             closed: false,
             playing: false,
@@ -233,6 +288,18 @@ impl JavaSession {
         std::mem::take(&mut self.out_buf)
     }
 
+    /// Drain the outgoing buffer into `dst` (which must be empty) and keep the
+    /// capacity for the next flush.
+    ///
+    /// `take_out` hands the `Vec` away, so `out_buf` restarts at capacity 0 and
+    /// grows again on every 20 ms flush — during chunk streaming that is several
+    /// reallocations + copies per tick and a large `free` per connection. The
+    /// swap rotates buffers instead: whatever capacity `dst` had stays usable.
+    pub fn take_out_into(&mut self, dst: &mut Vec<u8>) {
+        std::mem::swap(&mut self.out_buf, dst);
+        self.out_buf.clear();
+    }
+
     /// Feed raw socket bytes; returns false when the connection must close.
     pub fn poll_bytes(&mut self, hooks: &dyn ServerHooks, data: &[u8]) -> bool {
         if self.closed {
@@ -246,7 +313,7 @@ impl JavaSession {
             let Some((packet_id, payload, consumed)) = wire::try_split_frame(&self.in_buf) else {
                 break;
             };
-            self.in_buf.drain(..consumed);
+            self.in_buf.advance(consumed);
             self.handle_packet(hooks, packet_id, &payload);
         }
         !self.closed
@@ -297,7 +364,9 @@ impl JavaSession {
         // Diagnostic: log every Java packet once per (state, id) to see where
         // the client gets stuck (e.g. never reaching Play).
         if self.unhandled_ids.insert(10000 + self.state as i32 * 1000 + packet_id) {
-            tracing::info!(
+            // Per-(state, id) diagnostic: debug so a busy proxy cannot fill
+            // `server.log` with one line per packet id per connection.
+            tracing::debug!(
                 "Java {}: state={:?} packet_id={} len={}",
                 self.peer, self.state, packet_id, payload.len()
             );
@@ -541,7 +610,11 @@ impl JavaSession {
         health_payload.extend_from_slice(&wire::varint(health.round() as i32));
         health_payload.extend_from_slice(&wire::float(5.0));
         self.send(wire::S2C_UPDATE_HEALTH, &health_payload);
-        self.send_time(hooks.world_time(), hooks.world_time_running());
+        self.send_time(
+            hooks.world_age(),
+            hooks.world_time(),
+            hooks.world_time_running(),
+        );
         self.send_position(true);
         self.join_api(hooks);
         self.deliver_bossbar_frames(hooks);
@@ -588,7 +661,11 @@ impl JavaSession {
         join.extend_from_slice(&wire::boolean(false));
         let id = profile::packet_id(self.protocol, "join_game").unwrap_or(44);
         self.send(id, &join);
-        self.send_time(hooks.world_time(), hooks.world_time_running());
+        self.send_time(
+            hooks.world_age(),
+            hooks.world_time(),
+            hooks.world_time_running(),
+        );
         self.send_position(true);
         let gsc = profile::packet_id(self.protocol, "game_state_change").unwrap_or(35);
         self.send(gsc, &[13u8, 0, 0, 0, 0]);
@@ -891,7 +968,14 @@ impl JavaSession {
             return;
         };
         // Java `PlayerAction` statuses: 0 = START_DESTROY_BLOCK,
-        // 1 = ABORT_DESTROY_BLOCK, 2 = STOP_DESTROY_BLOCK.
+        // 1 = ABORT_DESTROY_BLOCK, 2 = STOP_DESTROY_BLOCK,
+        // 3 = DROP_ALL_ITEMS, 4 = DROP_ITEM (1.12 and 1.20+ use the same
+        // order). Dropping is not a block edit: the held stack leaves the
+        // hand as an item entity, exactly like the Bedrock Q key.
+        if status == 3 || status == 4 {
+            self.drop_held_item(hooks, status == 3);
+            return;
+        }
         // Creative breaks on the *start* action (the block disappears
         // instantly and the client never sends STOP), so requiring status 2
         // silently dropped every creative break. Survival completes on
@@ -933,6 +1017,32 @@ impl JavaSession {
         }
     }
 
+    /// `Player::dropItem()` for a Java client: throws the held creative
+    /// stack as an item entity through [`ServerHooks::drop_item`], so blocks
+    /// can be dropped here exactly like on Bedrock (`drop_all` throws the
+    /// whole stack, a plain drop one item).
+    fn drop_held_item(&mut self, hooks: &dyn ServerHooks, drop_all: bool) {
+        let slot = 36 + self.held_slot.clamp(0, 8);
+        let Some(item_id) = self.creative_slots.get(&slot).copied() else {
+            return;
+        };
+        let count = if drop_all {
+            self.creative_counts.get(&slot).copied().unwrap_or(1)
+        } else {
+            1
+        };
+        hooks.drop_item(
+            self.protocol,
+            item_id,
+            count.max(1),
+            self.x,
+            self.y,
+            self.z,
+            self.yaw as f32,
+            self.pitch as f32,
+        );
+    }
+
     fn handle_block_place(&mut self, hooks: &dyn ServerHooks, payload: &[u8], legacy: bool) {
         let mut r = wire::Reader::new(payload);
         let (position, face, block_id) = if !legacy {
@@ -950,11 +1060,8 @@ impl JavaSession {
             r.pos += 1;
             let Some(item_id) = r.read_u16() else { return };
             let item_id = item_id as i16 as i32;
-            let block_id = if item_id <= 0 {
-                hooks.stone_network_id()
-            } else {
-                item_id as u32
-            };
+            // A negative/zero item id is an empty hand, which places nothing.
+            let block_id = (item_id > 0).then_some(item_id as u32);
             (pos, face_byte as i32, block_id)
         };
         // PM `World::useItemOn()`: the clicked block's `onInteract()` runs
@@ -969,6 +1076,13 @@ impl JavaSession {
         if hooks.interact_block(cx, cy, cz) {
             return;
         }
+        // An empty hand (or an item that is not a block) places nothing:
+        // `World::useItemOn()` only reaches `Block::place()` when the held
+        // item has a block. Inventing a fallback here made every right click
+        // with an empty hand drop a stone block.
+        let Some(block_id) = block_id else {
+            return;
+        };
         if self.gamemode != 1 {
             self.send_chat(
                 "Colocar bloques desde Java solo está disponible en modo creativo por ahora (sin inventario). Usa /gamemode creative.",
@@ -994,7 +1108,10 @@ impl JavaSession {
         if legacy {
             ty -= 64;
         }
-        if !hooks.place_block(tx, ty, tz, block_id) {
+        // The clicked face and the yaw decide the state of doors, trapdoors,
+        // fence gates and pistons (`Block::place()`); a door also occupies the
+        // cell above.
+        if !hooks.place_block_oriented(tx, ty, tz, block_id, face, self.yaw as f32) {
             self.send_block_change(hooks, tx, ty, tz, "", None);
         }
     }
@@ -1014,8 +1131,10 @@ impl JavaSession {
         };
         if item == 0 {
             self.creative_slots.remove(&slot);
+            self.creative_counts.remove(&slot);
         } else {
             self.creative_slots.insert(slot, item);
+            self.creative_counts.insert(slot, count);
         }
     }
 
@@ -1023,9 +1142,9 @@ impl JavaSession {
     ///
     /// Java inventory slots 36..=44 are the hotbar, so the selected
     /// `held_item_slot` index picks the creative item that was set there; the
-    /// hook translates that item id into a Bedrock block. Until the client has
-    /// reported the slot the old fallback (stone) is used.
-    fn held_block_network_id(&self, hooks: &dyn ServerHooks) -> u32 {
+    /// hook translates that item id into a Bedrock block. `None` (empty hand,
+    /// or an item without a block) means the click places nothing.
+    fn held_block_network_id(&self, hooks: &dyn ServerHooks) -> Option<u32> {
         let index = self.held_slot.clamp(0, 8) as i16;
         let item = self
             .creative_slots
@@ -1033,7 +1152,6 @@ impl JavaSession {
             .or_else(|| self.creative_slots.get(&(36 + self.held_slot)))
             .copied();
         item.and_then(|item_id| hooks.block_network_id_for_item(self.protocol, item_id))
-            .unwrap_or_else(|| hooks.stone_network_id())
     }
 
     // ------------------------------------------------------------------
@@ -1243,13 +1361,18 @@ impl JavaSession {
         self.send(wire::S2C_POSITION, &payload);
     }
 
-    pub fn send_time(&mut self, time: i64, tick_day_time: bool) {
+    /// `set_time`: world age + time of day + whether the day cycle runs.
+    ///
+    /// The world age must keep growing: the client draws the clouds from it
+    /// (`CloudRenderer`), so a fixed `0` made the cloud layer snap back to its
+    /// origin on every broadcast — it drifted one way and teleported the other.
+    pub fn send_time(&mut self, world_age: i64, time: i64, tick_day_time: bool) {
         if !self.is_playing() {
             return;
         }
         if self.is_modern() {
             let payload = if self.protocol >= 775 {
-                let mut p = wire::long(0);
+                let mut p = wire::long(world_age);
                 p.extend_from_slice(&wire::varint(1));
                 p.extend_from_slice(&wire::varint(0));
                 p.extend_from_slice(&wire::var_long(time));
@@ -1257,7 +1380,7 @@ impl JavaSession {
                 p.extend_from_slice(&wire::float(if tick_day_time { 1.0 } else { 0.0 }));
                 p
             } else {
-                let mut p = wire::long(0);
+                let mut p = wire::long(world_age);
                 p.extend_from_slice(&wire::long(time));
                 p.extend_from_slice(&wire::boolean(tick_day_time));
                 p
@@ -1265,7 +1388,7 @@ impl JavaSession {
             let id = self.pid("update_time");
             self.send(id, &payload);
         } else {
-            let mut p = wire::long(0);
+            let mut p = wire::long(world_age);
             p.extend_from_slice(&wire::long(time));
             self.send(wire::S2C_UPDATE_TIME, &p);
         }
@@ -1401,30 +1524,44 @@ impl JavaSession {
     /// Diff `targets` against `tab_listed` (modern_test: add uses
     /// `player_info_update` 0x01+0x04+0x08+0x10, gamemode change uses the
     /// 0x04-only form; removals use `player_remove` / legacy action 4).
+    ///
+    /// Normalizes once and delegates to [`Self::sync_tab_normalized`]; the tick
+    /// path passes a list already normalized once per tick.
     pub fn sync_tab(&mut self, targets: &[TabTarget]) {
+        let normalized: Vec<(String, TabEntry)> = targets
+            .iter()
+            .map(|target| {
+                (
+                    lower(&target.name),
+                    TabEntry {
+                        name: target.name.clone(),
+                        gamemode: target.gamemode.clamp(0, 3),
+                        ping: target.ping.max(0),
+                    },
+                )
+            })
+            .collect();
+        self.sync_tab_normalized(&normalized);
+    }
+
+    /// [`Self::sync_tab`] over a target list normalized once per tick.
+    ///
+    /// Every session used to rebuild the `HashMap` and clone every
+    /// `TabEntry`/lowercased name, so P players cost P² allocations per tick.
+    pub fn sync_tab_normalized(&mut self, normalized: &[(String, TabEntry)]) {
         if !self.is_playing() {
             return;
         }
-        let mut normalized: HashMap<String, TabEntry> = HashMap::new();
-        for target in targets {
-            normalized.insert(
-                lower(&target.name),
-                TabEntry {
-                    name: target.name.clone(),
-                    gamemode: target.gamemode.clamp(0, 3),
-                    ping: target.ping.max(0),
-                },
-            );
-        }
-        let removed: Vec<TabEntry> = self
-            .tab_listed
-            .keys()
-            .filter(|key| !normalized.contains_key(*key))
-            .map(|key| self.tab_listed[key].clone())
-            .collect();
-        for entry in &removed {
-            self.tab_listed.remove(&lower(&entry.name));
-        }
+        let wanted: HashSet<&str> = normalized.iter().map(|(key, _)| key.as_str()).collect();
+        let mut removed: Vec<TabEntry> = Vec::new();
+        self.tab_listed.retain(|key, entry| {
+            if wanted.contains(key.as_str()) {
+                true
+            } else {
+                removed.push(entry.clone());
+                false
+            }
+        });
         if !removed.is_empty() {
             if self.is_modern() {
                 let mut payload = wire::varint(removed.len() as i32);
@@ -1443,18 +1580,20 @@ impl JavaSession {
             }
         }
         let mut added: Vec<TabEntry> = Vec::new();
+        let mut added_keys: Vec<String> = Vec::new();
         let mut gamemode_changed: Vec<TabEntry> = Vec::new();
-        for (key, target) in &normalized {
-            match self.tab_listed.get(key) {
-                None => added.push(target.clone()),
+        for (key, target) in normalized {
+            match self.tab_listed.get_mut(key) {
+                None => {
+                    added.push(target.clone());
+                    added_keys.push(key.clone());
+                }
                 Some(current) => {
                     if current.gamemode != target.gamemode {
                         gamemode_changed.push(target.clone());
                     }
-                    if let Some(entry) = self.tab_listed.get_mut(key) {
-                        entry.gamemode = target.gamemode;
-                        entry.ping = target.ping;
-                    }
+                    current.gamemode = target.gamemode;
+                    current.ping = target.ping;
                 }
             }
         }
@@ -1468,8 +1607,8 @@ impl JavaSession {
                     &Self::legacy_player_info_add_batch(&added),
                 );
             }
-            for entry in &added {
-                self.tab_listed.insert(lower(&entry.name), entry.clone());
+            for (key, entry) in added_keys.into_iter().zip(added.iter()) {
+                self.tab_listed.insert(key, entry.clone());
             }
         }
         if !gamemode_changed.is_empty() {
@@ -1495,7 +1634,7 @@ impl JavaSession {
     fn reset_chunk_streaming(&mut self) {
         self.sent_chunks.clear();
         self.pending_chunks.clear();
-        self.pending_attempts.clear();
+        self.cold_stall_ticks = 0;
         self.last_chunk = None;
         self.view_announced = false;
         self.spawn_chunks_at = Instant::now();
@@ -1580,18 +1719,23 @@ impl JavaSession {
     /// shared `deadline` from `JavaServer::tick`), backpressure, or the
     /// client ceiling (`chunk_batch_received`) is hit. A modern batch is
     /// opened lazily so a `chunk_batch_start` never lacks its
-    /// `chunk_batch_finished`; a column that cannot be built after 20
-    /// attempts rotates to the end of the queue instead of blocking it.
+    /// `chunk_batch_finished`.
     ///
     /// The tick path only ever consumes cache-warmed payloads
     /// ([`ServerHooks::try_modern_chunk`] / `try_legacy_chunk`): a cold
-    /// column costs the generator (~18 ms), which used to land inside
-    /// this loop and produced the persistent "17 ms Java tick" during
-    /// the whole initial load. A not-yet-warm column is requeued at the
-    /// front and retried next tick while the background prefetch warms
-    /// it; only after 20 such waits (~1 s, e.g. a dead prefetch task)
-    /// does the tick fall back to one generating build so the player
-    /// can never stall forever on an unwarmable column.
+    /// column costs the generator (~18-150 ms), which must never run inside
+    /// this loop. A cold column is therefore rotated to the back of the queue
+    /// and the warm columns behind it keep streaming: behind the front of the
+    /// queue are exactly the columns already warm from the previous center,
+    /// and during fast flight the nearest column is the one still being
+    /// generated. The old code requeued it at the *front* and `break`ed, so a
+    /// single cold column stalled the whole batch until the prefetch caught up
+    /// — the terrain appeared under the player.
+    ///
+    /// Only after [`COLD_WAIT_TICKS`] consecutive ticks without streaming a
+    /// single column (~5 s, e.g. a dead prefetch task) does the tick fall back
+    /// to one generating build, so the player can never stall forever on an
+    /// unwarmable column.
     pub fn stream_chunks(&mut self, hooks: &dyn ServerHooks, deadline: Option<Instant>) {
         if self.last_chunk.is_none() {
             self.request_chunks(hooks);
@@ -1607,6 +1751,11 @@ impl JavaSession {
         let deadline = deadline.unwrap_or_else(|| Instant::now() + CHUNK_BUDGET);
         let mut sent = 0usize;
         let mut batch_open = false;
+        // Bounds how many queued columns one tick may inspect when they are all
+        // cold, so the loop cannot spin.
+        let queue_len = self.pending_chunks.len();
+        let mut cold_skipped = 0usize;
+        let mut hit_cold = false;
         while let Some((cx, cz)) = self.pending_chunks.pop_front() {
             if self.pending_bytes() > CHUNK_BACKPRESSURE {
                 self.pending_chunks.push_front((cx, cz));
@@ -1617,25 +1766,18 @@ impl JavaSession {
                 break;
             }
             if self.sent_chunks.contains(&(cx, cz)) {
-                self.pending_attempts.remove(&(cx, cz));
                 continue;
             }
             let built = match self.build_chunk_cached_only(hooks, cx, cz) {
                 Some(built) => built,
                 None => {
-                    let attempts = self
-                        .pending_attempts
-                        .get(&(cx, cz))
-                        .copied()
-                        .unwrap_or(0)
-                        + 1;
-                    if attempts >= 20 {
-                        // Liveness fallback: the prefetch never warmed
-                        // this column in ~1 s; pay one generating build
-                        // here (the old behaviour) rather than stalling
-                        // the player forever. Rotates to the back on
-                        // failure.
-                        self.pending_attempts.insert((cx, cz), 0);
+                    hit_cold = true;
+                    if self.cold_stall_ticks >= COLD_WAIT_TICKS {
+                        // Liveness fallback: no column warmed for ~5 s
+                        // (e.g. a dead prefetch task). Pay one generating
+                        // build instead of leaving the view empty forever;
+                        // it rotates to the back on failure.
+                        self.cold_stall_ticks = 0;
                         match self.build_chunk(hooks, cx, cz) {
                             Some(built) => built,
                             None => {
@@ -1644,37 +1786,26 @@ impl JavaSession {
                             }
                         }
                     } else {
-                        self.pending_chunks.push_front((cx, cz));
-                        self.pending_attempts.insert((cx, cz), attempts);
-                        break;
+                        // Not warm yet: let the columns behind it stream and
+                        // retry this one on a later tick (never at the head).
+                        self.pending_chunks.push_back((cx, cz));
+                        cold_skipped += 1;
+                        if cold_skipped >= queue_len {
+                            break;
+                        }
+                        continue;
                     }
                 }
             };
-            self.pending_attempts.remove(&(cx, cz));
             if self.is_modern() {
                 if !batch_open {
                     let id = self.pid("chunk_batch_start");
                     self.send(id, &[]);
                     batch_open = true;
                 }
-                let id = self.pid("map_chunk");
-                let mut payload = (cx as u32).to_be_bytes().to_vec();
-                payload.extend_from_slice(&(cz as u32).to_be_bytes());
-                payload.extend_from_slice(&built.heightmaps);
-                payload.extend_from_slice(&wire::varint(built.data.len() as i32));
-                payload.extend_from_slice(&built.data);
-                payload.extend_from_slice(&wire::varint(0));
-                payload.extend_from_slice(&built.light);
-                self.send(id, &payload);
+                self.send_modern_chunk(cx, cz, &built);
             } else {
-                let mut payload = (cx as u32).to_be_bytes().to_vec();
-                payload.extend_from_slice(&(cz as u32).to_be_bytes());
-                payload.extend_from_slice(&wire::boolean(true));
-                payload.extend_from_slice(&wire::varint(built.bitmap));
-                payload.extend_from_slice(&wire::varint(built.data.len() as i32));
-                payload.extend_from_slice(&built.data);
-                payload.extend_from_slice(&wire::varint(0));
-                self.send(wire::S2C_MAP_CHUNK, &payload);
+                self.send_legacy_chunk(cx, cz, &built);
             }
             self.sent_chunks.insert((cx, cz));
             sent += 1;
@@ -1685,6 +1816,14 @@ impl JavaSession {
         }
         if !self.spawn_chunks_logged && self.pending_chunks.is_empty() {
             self.spawn_chunks_logged = true;
+        }
+        // A tick that sent nothing because everything left is still generating
+        // is a stall tick; sending anything proves the prefetch is alive and
+        // resets the fallback timer.
+        if sent == 0 && hit_cold {
+            self.cold_stall_ticks = self.cold_stall_ticks.saturating_add(1);
+        } else {
+            self.cold_stall_ticks = 0;
         }
     }
 
@@ -1698,21 +1837,11 @@ impl JavaSession {
         cz: i32,
     ) -> Option<BuiltChunk> {
         if self.is_modern() {
-            let data = hooks.try_modern_chunk(self.protocol, cx, cz)?;
-            Some(BuiltChunk {
-                bitmap: 0,
-                data: data.data,
-                heightmaps: data.heightmaps,
-                light: data.light,
-            })
+            let data = hooks.try_modern_chunk_shared(self.protocol, cx, cz)?;
+            Some(BuiltChunk::Modern(data))
         } else {
-            let chunk = hooks.try_legacy_chunk(cx, cz)?;
-            Some(BuiltChunk {
-                bitmap: chunk.bitmap,
-                data: chunk.data,
-                heightmaps: Vec::new(),
-                light: Vec::new(),
-            })
+            let chunk = hooks.try_legacy_chunk_shared(cx, cz)?;
+            Some(BuiltChunk::Legacy(chunk))
         }
     }
 
@@ -1721,20 +1850,10 @@ impl JavaSession {
     fn build_chunk(&self, hooks: &dyn ServerHooks, cx: i32, cz: i32) -> Option<BuiltChunk> {
         if self.is_modern() {
             let data = hooks.modern_chunk(self.protocol, cx, cz)?;
-            Some(BuiltChunk {
-                bitmap: 0,
-                data: data.data,
-                heightmaps: data.heightmaps,
-                light: data.light,
-            })
+            Some(BuiltChunk::Modern(Arc::new(data)))
         } else {
             let chunk = hooks.legacy_chunk(cx, cz)?;
-            Some(BuiltChunk {
-                bitmap: chunk.bitmap,
-                data: chunk.data,
-                heightmaps: Vec::new(),
-                light: Vec::new(),
-            })
+            Some(BuiltChunk::Legacy(Arc::new(chunk)))
         }
     }
 
@@ -1825,7 +1944,12 @@ impl JavaSession {
             (target.yaw - prev.yaw).abs() > 0.01 || (target.pitch - prev.pitch).abs() > 0.01;
         if dist > 8.0 {
             let id = self.pid("entity_teleport");
-            self.send(id, &modern_teleport_payload(entity, target));
+            self.send(
+                id,
+                &modern_teleport_payload(
+                    entity, target.x, target.y, target.z, target.yaw, target.pitch,
+                ),
+            );
         } else if dist > 0.0001 {
             let (dx, dy, dz) = (
                 wire::rel_delta(target.x - prev.x),
@@ -1834,14 +1958,17 @@ impl JavaSession {
             );
             if rot_changed {
                 let id = self.pid("entity_move_look");
-                self.send(id, &move_look_payload(entity, dx, dy, dz, target));
+                self.send(
+                    id,
+                    &move_look_payload(entity, dx, dy, dz, target.yaw, target.pitch),
+                );
             } else {
                 let id = self.pid("rel_entity_move");
                 self.send(id, &rel_move_payload(entity, dx, dy, dz));
             }
         } else if rot_changed {
             let id = self.pid("entity_look");
-            self.send(id, &look_payload(entity, target));
+            self.send(id, &look_payload(entity, target.yaw, target.pitch));
         }
         if (target.yaw - prev.yaw).abs() > 0.01
             || (target.head_yaw - prev.head_yaw).abs() > 0.01
@@ -1930,7 +2057,7 @@ impl JavaSession {
             if rot_changed {
                 self.send(
                     wire::S2C_ENTITY_MOVE_LOOK,
-                    &move_look_payload(entity, dx, dy, dz, target),
+                    &move_look_payload(entity, dx, dy, dz, target.yaw, target.pitch),
                 );
             } else {
                 self.send(
@@ -1939,7 +2066,10 @@ impl JavaSession {
                 );
             }
         } else if rot_changed {
-            self.send(wire::S2C_ENTITY_LOOK, &look_payload(entity, target));
+            self.send(
+                wire::S2C_ENTITY_LOOK,
+                &look_payload(entity, target.yaw, target.pitch),
+            );
         }
         if (target.yaw - prev.yaw).abs() > 0.01
             || (target.head_yaw - prev.head_yaw).abs() > 0.01
@@ -1969,6 +2099,137 @@ impl JavaSession {
                 gamemode: target.gamemode,
             },
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Actors (non-player entities: falling blocks, mobs, items, ...)
+    // ------------------------------------------------------------------
+
+    /// Spawn / move / destroy the non-player entities the server reports, the
+    /// actor half of [`Self::sync_entities`] (which only handles players).
+    ///
+    /// Java entity ids are allocated by the server
+    /// ([`ServerHooks::actor_entity_id`]) so every observer of the same actor
+    /// uses the same id, and `spawn_entity.entity_type` is the per-protocol
+    /// `minecraft:entity_type` registry id resolved by
+    /// [`crate::entity_ids`]. Legacy (340) clients keep their old behaviour:
+    /// mobs there use `spawn_mob`, which this listener does not frame.
+    pub fn sync_actors(&mut self, targets: &[ActorTarget]) {
+        if !self.is_modern() {
+            return;
+        }
+        let wanted: HashSet<u64> = targets.iter().map(|t| t.runtime_id).collect();
+        let stale: Vec<u64> = self
+            .seen_actors
+            .keys()
+            .filter(|runtime_id| !wanted.contains(*runtime_id))
+            .copied()
+            .collect();
+        for runtime_id in stale {
+            self.despawn_actor(runtime_id);
+        }
+        for target in targets {
+            let seen = match self.seen_actors.get(&target.runtime_id) {
+                None => {
+                    self.spawn_actor(target);
+                    continue;
+                }
+                Some(seen) => seen.clone(),
+            };
+            self.move_actor(target, &seen);
+        }
+    }
+
+    fn spawn_actor(&mut self, target: &ActorTarget) {
+        let uuid = wire::offline_uuid(&format!("actor/{}", target.runtime_id));
+        let id = self.pid("spawn_entity");
+        self.send(id, &actor_spawn_payload(self.protocol, target, &uuid));
+        if !target.name_tag.is_empty() {
+            let id = self.pid("entity_metadata");
+            self.send(id, &modern_nametag_payload(target.entity, &target.name_tag));
+        }
+        self.seen_actors.insert(
+            target.runtime_id,
+            SeenActor {
+                entity: target.entity,
+                x: target.x,
+                y: target.y,
+                z: target.z,
+                yaw: target.yaw,
+                pitch: target.pitch,
+                head_yaw: target.head_yaw,
+                name_tag: target.name_tag.clone(),
+            },
+        );
+    }
+
+    fn move_actor(&mut self, target: &ActorTarget, prev: &SeenActor) {
+        let entity = target.entity;
+        let dist =
+            (target.x - prev.x).abs() + (target.y - prev.y).abs() + (target.z - prev.z).abs();
+        let rot_changed =
+            (target.yaw - prev.yaw).abs() > 0.01 || (target.pitch - prev.pitch).abs() > 0.01;
+        if dist > 8.0 {
+            let id = self.pid("entity_teleport");
+            self.send(
+                id,
+                &modern_teleport_payload(
+                    entity, target.x, target.y, target.z, target.yaw, target.pitch,
+                ),
+            );
+        } else if dist > 0.0001 {
+            let (dx, dy, dz) = (
+                wire::rel_delta(target.x - prev.x),
+                wire::rel_delta(target.y - prev.y),
+                wire::rel_delta(target.z - prev.z),
+            );
+            if rot_changed {
+                let id = self.pid("entity_move_look");
+                self.send(
+                    id,
+                    &move_look_payload(entity, dx, dy, dz, target.yaw, target.pitch),
+                );
+            } else {
+                let id = self.pid("rel_entity_move");
+                self.send(id, &rel_move_payload(entity, dx, dy, dz));
+            }
+        } else if rot_changed {
+            let id = self.pid("entity_look");
+            self.send(id, &look_payload(entity, target.yaw, target.pitch));
+        }
+        if (target.head_yaw - prev.head_yaw).abs() > 0.01 {
+            let id = self.pid("entity_head_rotation");
+            let mut payload = wire::varint(entity);
+            payload.push(wire::angle(target.head_yaw) as u8);
+            self.send(id, &payload);
+        }
+        if target.name_tag != prev.name_tag {
+            let id = self.pid("entity_metadata");
+            self.send(id, &modern_nametag_payload(entity, &target.name_tag));
+        }
+        self.seen_actors.insert(
+            target.runtime_id,
+            SeenActor {
+                entity,
+                x: target.x,
+                y: target.y,
+                z: target.z,
+                yaw: target.yaw,
+                pitch: target.pitch,
+                head_yaw: target.head_yaw,
+                name_tag: target.name_tag.clone(),
+            },
+        );
+    }
+
+    fn despawn_actor(&mut self, runtime_id: u64) {
+        let Some(seen) = self.seen_actors.remove(&runtime_id) else {
+            return;
+        };
+        let id = self.pid("entity_destroy");
+        let mut payload = wire::varint(1);
+        payload.extend_from_slice(&wire::varint(seen.entity));
+        self.send(id, &payload);
     }
 
     fn despawn_entity(&mut self, hooks: &dyn ServerHooks, key: &str) {
@@ -2182,20 +2443,111 @@ impl JavaSession {
         self.playing = false;
     }
 
+    /// Frame `packet_id` + `payload` straight into `out_buf`.
+    ///
+    /// `wire::frame` allocated a `body` and a `frame` `Vec` and then copied the
+    /// result into `out_buf`: three copies of every payload (a chunk column is
+    /// ~80 KB) and two short-lived allocations per packet.
     fn send(&mut self, packet_id: i32, payload: &[u8]) {
         if self.closed {
             return;
         }
-        self.out_buf
-            .extend_from_slice(&wire::frame(packet_id, payload));
+        let body_len = wire::varint_len(packet_id) + payload.len();
+        wire::write_varint(&mut self.out_buf, body_len as i32);
+        wire::write_varint(&mut self.out_buf, packet_id);
+        self.out_buf.extend_from_slice(payload);
+    }
+
+    /// `map_chunk` for modern clients, written directly into `out_buf` (the
+    /// header, the data length and the payload used to be five small `Vec`s).
+    fn send_modern_chunk(&mut self, cx: i32, cz: i32, built: &BuiltChunk) {
+        if self.closed {
+            return;
+        }
+        let id = self.pid("map_chunk");
+        let data = built.data();
+        let heightmaps = built.heightmaps();
+        let light = built.light();
+        let body_len = wire::varint_len(id)
+            + 8
+            + heightmaps.len()
+            + wire::varint_len(data.len() as i32)
+            + data.len()
+            + 1
+            + light.len();
+        wire::write_varint(&mut self.out_buf, body_len as i32);
+        wire::write_varint(&mut self.out_buf, id);
+        self.out_buf.extend_from_slice(&(cx as u32).to_be_bytes());
+        self.out_buf.extend_from_slice(&(cz as u32).to_be_bytes());
+        self.out_buf.extend_from_slice(heightmaps);
+        wire::write_varint(&mut self.out_buf, data.len() as i32);
+        self.out_buf.extend_from_slice(data);
+        self.out_buf.push(0); // varint(0): no block entities
+        self.out_buf.extend_from_slice(light);
+    }
+
+    /// `map_chunk` (1.12.2 layout) written directly into `out_buf`.
+    fn send_legacy_chunk(&mut self, cx: i32, cz: i32, built: &BuiltChunk) {
+        if self.closed {
+            return;
+        }
+        let id = wire::S2C_MAP_CHUNK;
+        let data = built.data();
+        let bitmap = built.bitmap();
+        let body_len = wire::varint_len(id)
+            + 8
+            + 1
+            + wire::varint_len(bitmap)
+            + wire::varint_len(data.len() as i32)
+            + data.len()
+            + 1;
+        wire::write_varint(&mut self.out_buf, body_len as i32);
+        wire::write_varint(&mut self.out_buf, id);
+        self.out_buf.extend_from_slice(&(cx as u32).to_be_bytes());
+        self.out_buf.extend_from_slice(&(cz as u32).to_be_bytes());
+        self.out_buf.push(1); // ground-up continuous
+        wire::write_varint(&mut self.out_buf, bitmap);
+        wire::write_varint(&mut self.out_buf, data.len() as i32);
+        self.out_buf.extend_from_slice(data);
+        self.out_buf.push(0);
     }
 }
 
-struct BuiltChunk {
-    bitmap: i32,
-    data: Vec<u8>,
-    heightmaps: Vec<u8>,
-    light: Vec<u8>,
+/// One column ready to stream, sharing the converted payload when the cache
+/// supplied it (`try_*_chunk_shared`).
+enum BuiltChunk {
+    Modern(Arc<ModernChunkData>),
+    Legacy(Arc<LegacyChunk>),
+}
+
+impl BuiltChunk {
+    fn data(&self) -> &[u8] {
+        match self {
+            Self::Modern(chunk) => &chunk.data,
+            Self::Legacy(chunk) => &chunk.data,
+        }
+    }
+
+    fn heightmaps(&self) -> &[u8] {
+        match self {
+            Self::Modern(chunk) => &chunk.heightmaps,
+            Self::Legacy(_) => &[],
+        }
+    }
+
+    fn light(&self) -> &[u8] {
+        match self {
+            Self::Modern(chunk) => &chunk.light,
+            Self::Legacy(_) => &[],
+        }
+    }
+
+    fn bitmap(&self) -> i32 {
+        match self {
+            Self::Modern(_) => 0,
+            Self::Legacy(chunk) => chunk.bitmap,
+        }
+    }
 }
 
 fn lower(name: &str) -> String {
@@ -2226,33 +2578,64 @@ fn rel_move_payload(entity: i32, dx: i32, dy: i32, dz: i32) -> Vec<u8> {
     payload
 }
 
-fn move_look_payload(entity: i32, dx: i32, dy: i32, dz: i32, target: &EntityTarget) -> Vec<u8> {
+fn move_look_payload(entity: i32, dx: i32, dy: i32, dz: i32, yaw: f64, pitch: f64) -> Vec<u8> {
     let mut payload = rel_move_payload(entity, dx, dy, dz);
     // rel_move ends with on_ground; move_look inserts angles before it.
     payload.truncate(payload.len() - 1);
-    payload.push(wire::angle(target.yaw) as u8);
-    payload.push(wire::angle(target.pitch) as u8);
+    payload.push(wire::angle(yaw) as u8);
+    payload.push(wire::angle(pitch) as u8);
     payload.extend_from_slice(&wire::boolean(false));
     payload
 }
 
-fn look_payload(entity: i32, target: &EntityTarget) -> Vec<u8> {
+fn look_payload(entity: i32, yaw: f64, pitch: f64) -> Vec<u8> {
     let mut payload = wire::varint(entity);
-    payload.push(wire::angle(target.yaw) as u8);
-    payload.push(wire::angle(target.pitch) as u8);
+    payload.push(wire::angle(yaw) as u8);
+    payload.push(wire::angle(pitch) as u8);
     payload.extend_from_slice(&wire::boolean(false));
     payload
 }
 
-fn modern_teleport_payload(entity: i32, target: &EntityTarget) -> Vec<u8> {
+fn modern_teleport_payload(entity: i32, x: f64, y: f64, z: f64, yaw: f64, pitch: f64) -> Vec<u8> {
     let mut payload = wire::varint(entity);
-    for v in [target.x, target.y, target.z, 0.0, 0.0, 0.0] {
+    for v in [x, y, z, 0.0, 0.0, 0.0] {
         payload.extend_from_slice(&wire::double(v));
     }
-    payload.extend_from_slice(&wire::float(target.yaw as f32));
-    payload.extend_from_slice(&wire::float(target.pitch as f32));
+    payload.extend_from_slice(&wire::float(yaw as f32));
+    payload.extend_from_slice(&wire::float(pitch as f32));
     payload.extend_from_slice(&0u32.to_be_bytes());
     payload.extend_from_slice(&wire::boolean(false));
+    payload
+}
+
+/// `spawn_entity` for a non-player entity: same layout as the player spawn
+/// (`modern_spawn_payload`), but the type comes from the resolved Java
+/// registry id and the trailing `data` field carries the falling block's
+/// block state (`FallingBlockEntity::getAddEntityPacket` sends
+/// `Block.getId(blockState)` there; every other type sends 0).
+fn actor_spawn_payload(protocol: i32, target: &ActorTarget, uuid: &[u8; 16]) -> Vec<u8> {
+    let mut payload = wire::varint(target.entity);
+    payload.extend_from_slice(uuid);
+    payload.extend_from_slice(&wire::varint(target.entity_type));
+    for v in [target.x, target.y, target.z] {
+        payload.extend_from_slice(&wire::double(v));
+    }
+    let angles = [
+        wire::angle(target.pitch) as u8,
+        wire::angle(target.yaw) as u8,
+        wire::angle(target.head_yaw) as u8,
+    ];
+    if profile::spawn_velocity_is_lp_vec3(protocol) {
+        payload.extend_from_slice(&wire::lp_vec3(0.0, 0.0, 0.0));
+        payload.extend_from_slice(&angles);
+        payload.extend_from_slice(&wire::varint(target.block_state));
+    } else {
+        payload.extend_from_slice(&angles);
+        payload.extend_from_slice(&wire::varint(target.block_state));
+        for _ in 0..3 {
+            payload.extend_from_slice(&wire::short(0));
+        }
+    }
     payload
 }
 
@@ -2349,6 +2732,11 @@ mod tests {
         fn snapshots(&self) -> Vec<PlayerSnapshot> {
             self.snapshots.clone()
         }
+        fn block_network_id_for_item(&self, _protocol: i32, item_id: i32) -> Option<u32> {
+            // Any creative item id doubles as a block id here; the real hooks
+            // translate the Java item registry.
+            (item_id > 0).then_some(item_id as u32)
+        }
     }
 
     fn modern_session(protocol: i32) -> JavaSession {
@@ -2369,6 +2757,35 @@ mod tests {
             rest = &rest[consumed..];
         }
         out
+    }
+
+    /// `World::useItemOn()` only reaches `Block::place()` with a block in
+    /// hand: an empty right click must not drop the old stone fallback.
+    #[test]
+    fn an_empty_hand_places_no_block() {
+        let hooks = StubHooks { snapshots: vec![] };
+        let mut session = modern_session(769);
+        session.gamemode = 1;
+        let mut payload = Vec::new();
+        wire::write_varint(&mut payload, 0); // hand
+        wire::write_position(&mut payload, 0, 4, 0);
+        wire::write_varint(&mut payload, 1); // face up
+        let _ = frames(&mut session);
+
+        session.handle_block_place(&hooks, &payload, false);
+        assert!(
+            frames(&mut session).is_empty(),
+            "an empty hand must not place a block"
+        );
+
+        // Creative hotbar slot 0 is inventory slot 36: with a block there the
+        // same click still places it.
+        session.creative_slots.insert(36, 1);
+        session.handle_block_place(&hooks, &payload, false);
+        assert!(
+            !frames(&mut session).is_empty(),
+            "the held block is still placed"
+        );
     }
 
     #[test]
@@ -2405,6 +2822,70 @@ mod tests {
                 assert!(payload.ends_with(&[0, 0, 0, 0, 0, 0]), "vec3i16 tail");
             }
         }
+    }
+
+    /// A falling block reaches the Java client as `falling_block` with its
+    /// block state in the spawn `data` field, then moves and despawns.
+    #[test]
+    fn falling_block_spawns_with_block_state_then_moves_and_despawns() {
+        let mut session = modern_session(775);
+        let target = ActorTarget {
+            runtime_id: 42,
+            entity: 2_000_000,
+            entity_type: crate::entity_ids::entity_type_id(775, "minecraft:falling_block")
+                .expect("falling_block id"),
+            x: 1.5,
+            y: 64.0,
+            z: 2.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            name_tag: String::new(),
+            block_state: 12,
+        };
+        session.sync_actors(std::slice::from_ref(&target));
+        let sent = frames(&mut session);
+        assert_eq!(sent.len(), 1, "one spawn, no nametag: {sent:?}");
+        assert_eq!(
+            sent[0].0,
+            profile::packet_id(775, "spawn_entity").expect("spawn_entity")
+        );
+        let mut r = Reader::new(&sent[0].1);
+        assert_eq!(r.read_varint(), Some(2_000_000), "java entity id");
+        r.pos += 16; // uuid
+        assert_eq!(r.read_varint(), Some(51), "falling_block registry id on 26.1");
+        r.pos += 24; // x/y/z doubles
+        r.pos += 1; // lpVec3(0,0,0) is a single 0x00 byte (773+)
+        r.pos += 3; // pitch, yaw, head yaw
+        assert_eq!(r.read_varint(), Some(12), "block state in spawn data");
+        assert_eq!(session.seen_actors.len(), 1);
+
+        // Falling one block is a relative move, not a teleport.
+        session.sync_actors(&[ActorTarget {
+            y: 63.0,
+            ..target.clone()
+        }]);
+        let sent = frames(&mut session);
+        assert_eq!(
+            sent[0].0,
+            profile::packet_id(775, "rel_entity_move").expect("rel_entity_move")
+        );
+
+        // Gone from the world: one entity_destroy for it.
+        session.sync_actors(&[]);
+        let sent = frames(&mut session);
+        assert_eq!(
+            sent[0].0,
+            profile::packet_id(775, "entity_destroy").expect("entity_destroy")
+        );
+        assert!(session.seen_actors.is_empty());
+        // A legacy client is never sent actor packets (spawn_mob is not framed).
+        let mut legacy = JavaSession::new(2, "127.0.0.1:25565".parse().unwrap());
+        legacy.protocol = 340;
+        legacy.state = SessionState::Play;
+        legacy.playing = true;
+        legacy.sync_actors(std::slice::from_ref(&target));
+        assert!(legacy.take_out().is_empty());
     }
 
     #[test]
@@ -2508,6 +2989,8 @@ mod tests {
         snapshots: Vec<PlayerSnapshot>,
         recorded: std::sync::Mutex<Vec<(String, f64, f64, f64)>>,
         generating: std::sync::Mutex<usize>,
+        /// Columns the fake prefetch already warmed.
+        warm: std::sync::Mutex<HashSet<(i32, i32)>>,
     }
 
     impl ServerHooks for RecordingHooks {
@@ -2550,10 +3033,18 @@ mod tests {
         fn try_modern_chunk(
             &self,
             _protocol: i32,
-            _cx: i32,
-            _cz: i32,
+            cx: i32,
+            cz: i32,
         ) -> Option<crate::hooks::ModernChunkData> {
-            None
+            self.warm
+                .lock()
+                .unwrap()
+                .contains(&(cx, cz))
+                .then(|| crate::hooks::ModernChunkData {
+                    data: vec![2u8; 8],
+                    heightmaps: Vec::new(),
+                    light: Vec::new(),
+                })
         }
     }
 
@@ -2578,6 +3069,7 @@ mod tests {
             }],
             recorded: Default::default(),
             generating: Default::default(),
+            warm: Default::default(),
         };
         let mut session = modern_session(775);
         session.api_joined = true;
@@ -2598,6 +3090,7 @@ mod tests {
             snapshots: vec![],
             recorded: Default::default(),
             generating: Default::default(),
+            warm: Default::default(),
         };
         let mut session = modern_session(775);
         session.api_joined = true;
@@ -2612,13 +3105,45 @@ mod tests {
             Some(&(1, 1)),
             "cold column stays queued for the prefetch"
         );
-        // Liveness: after ~20 waits (~1 s of ticks) the session falls
-        // back to one generating build instead of stalling forever.
-        for _ in 0..25 {
+        // Liveness: after `COLD_WAIT_TICKS` waits the session falls back to one
+        // generating build instead of stalling forever.
+        for _ in 0..COLD_WAIT_TICKS + 5 {
             session.stream_chunks(&hooks, Some(Instant::now() + Duration::from_millis(10)));
         }
         assert_eq!(*hooks.generating.lock().unwrap(), 1);
         assert!(session.sent_chunks.contains(&(1, 1)));
+    }
+
+    /// Fast flight makes the nearest column the cold one (it is the terrain the
+    /// player is flying into). It must not hold back the warm columns behind
+    /// it: the old code requeued it at the head and `break`ed, so the whole
+    /// batch waited for the prefetch and terrain appeared under the player.
+    #[test]
+    fn a_cold_column_does_not_block_the_warm_columns_behind_it() {
+        let hooks = RecordingHooks {
+            snapshots: vec![],
+            recorded: Default::default(),
+            generating: Default::default(),
+            warm: Default::default(),
+        };
+        hooks.warm.lock().unwrap().insert((1, 0));
+        let mut session = modern_session(775);
+        session.api_joined = true;
+        session.last_chunk = Some((0, 0));
+        session.pending_chunks.push_back((0, 0)); // cold, nearest
+        session.pending_chunks.push_back((1, 0)); // warm, behind it
+        session.stream_chunks(&hooks, Some(Instant::now() + Duration::from_millis(50)));
+        assert_eq!(*hooks.generating.lock().unwrap(), 0, "no generation on tick");
+        assert!(
+            session.sent_chunks.contains(&(1, 0)),
+            "the warm column behind the cold one is streamed"
+        );
+        assert!(!session.sent_chunks.contains(&(0, 0)));
+        assert_eq!(
+            session.pending_chunks.front(),
+            Some(&(0, 0)),
+            "the cold column is retried on a later tick"
+        );
     }
 
     #[test]
@@ -2933,6 +3458,64 @@ mod tests {
         session.handle_block_place(&hooks, &place, false);
 
         assert_eq!(*hooks.placed.lock().unwrap(), vec![0xC0F6_8F2A]);
+    }
+
+    /// Q in Java (`PlayerAction` `DROP_ALL_ITEMS` / `DROP_ITEM`): the held
+    /// creative stack leaves the hand through the hook, which spawns the
+    /// shared item entity, so Java players throw blocks exactly like Bedrock.
+    #[test]
+    fn drop_action_throws_the_held_block() {
+        struct DropHooks {
+            dropped: std::sync::Mutex<Vec<(i32, i32)>>,
+        }
+        impl ServerHooks for DropHooks {
+            fn view_distance(&self) -> i32 {
+                1
+            }
+            fn spawn(&self) -> (f64, f64, f64) {
+                (0.5, 5.62, 0.5)
+            }
+            fn snapshots(&self) -> Vec<PlayerSnapshot> {
+                vec![]
+            }
+            fn drop_item(
+                &self,
+                _protocol: i32,
+                item_id: i32,
+                count: i32,
+                _x: f64,
+                _y: f64,
+                _z: f64,
+                _yaw: f32,
+                _pitch: f32,
+            ) -> bool {
+                self.dropped.lock().unwrap().push((item_id, count));
+                true
+            }
+        }
+        let hooks = DropHooks {
+            dropped: Default::default(),
+        };
+        let mut session = modern_session(775);
+        session.gamemode = 1;
+
+        // set_creative_slot: hotbar slot 36, a stack of three items, id 5.
+        let mut creative = wire::short(36);
+        creative.extend_from_slice(&wire::varint(3));
+        creative.extend_from_slice(&wire::varint(5));
+        session.handle_creative_slot(&creative);
+        session.held_slot = 0;
+
+        // block_dig: status 3 (DROP_ALL_ITEMS) then 4 (DROP_ITEM).
+        for status in [3, 4] {
+            let mut drop = wire::varint(status);
+            drop.extend_from_slice(&wire::position(0, 0, 0));
+            drop.push(0);
+            session.handle_block_dig(&hooks, &drop, false);
+        }
+
+        assert_eq!(*hooks.dropped.lock().unwrap(), vec![(5, 3), (5, 1)]);
+        assert!(session.creative_slots.contains_key(&36));
     }
 
     /// Vanilla creative breaking sends `START_DESTROY_BLOCK` (status 0) and

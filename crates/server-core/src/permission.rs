@@ -115,6 +115,8 @@ pub const COMMAND_SAVE_PERFORM: &str = "pocketmine.command.save.perform";
 pub const COMMAND_SAVE_ENABLE: &str = "pocketmine.command.save.enable";
 pub const COMMAND_SAVE_DISABLE: &str = "pocketmine.command.save.disable";
 pub const COMMAND_TPS: &str = "pocketmine.command.tps";
+pub const COMMAND_TPSBAR: &str = "pocketmine.command.tpsbar";
+pub const COMMAND_TPSBAR_OTHER: &str = "pocketmine.command.tpsbar.other";
 pub const COMMAND_EFFECT_SELF: &str = "pocketmine.command.effect.self";
 pub const COMMAND_EFFECT_OTHER: &str = "pocketmine.command.effect.other";
 pub const COMMAND_ENCHANT_SELF: &str = "pocketmine.command.enchant.self";
@@ -125,6 +127,7 @@ pub const COMMAND_PARTICLE: &str = "pocketmine.command.particle";
 pub const COMMAND_STATUS: &str = "pocketmine.command.status";
 pub const COMMAND_GC: &str = "pocketmine.command.gc";
 pub const COMMAND_TIMINGS: &str = "pocketmine.command.timings";
+pub const COMMAND_PROFILER: &str = "pocketmine.command.profiler";
 pub const COMMAND_DUMPMEMORY: &str = "pocketmine.command.dumpmemory";
 pub const BROADCAST_ADMIN: &str = "pocketmine.broadcast.admin";
 pub const BROADCAST_USER: &str = "pocketmine.broadcast.user";
@@ -262,6 +265,8 @@ impl PermissionManager {
         self.register(COMMAND_SAVE_ENABLE, Op, &[]);
         self.register(COMMAND_SAVE_DISABLE, Op, &[]);
         self.register(COMMAND_TPS, Op, &[]);
+        self.register(COMMAND_TPSBAR, Op, &[]);
+        self.register(COMMAND_TPSBAR_OTHER, Op, &[]);
         self.register(COMMAND_EFFECT_SELF, Op, &[]);
         self.register(COMMAND_EFFECT_OTHER, Op, &[]);
         self.register(COMMAND_ENCHANT_SELF, Op, &[]);
@@ -272,6 +277,7 @@ impl PermissionManager {
         self.register(COMMAND_STATUS, Op, &[]);
         self.register(COMMAND_GC, Op, &[]);
         self.register(COMMAND_TIMINGS, Op, &[]);
+        self.register(COMMAND_PROFILER, Op, &[]);
         // PM grants dumpmemory from the console root only. `has()` has no
         // console flag, so operators keep it here (`Op`) to avoid breaking
         // console tests; the tree below still records the console edge.
@@ -325,6 +331,7 @@ impl PermissionManager {
             COMMAND_TIME_START,
             COMMAND_TIME_STOP,
             COMMAND_TIMINGS,
+            COMMAND_PROFILER,
             COMMAND_TITLE_OTHER,
             COMMAND_TITLE_SELF,
             COMMAND_SCOREBOARD_OTHER,
@@ -341,6 +348,8 @@ impl PermissionManager {
             COMMAND_XP_OTHER,
             COMMAND_XP_SELF,
             COMMAND_TPS,
+            COMMAND_TPSBAR,
+            COMMAND_TPSBAR_OTHER,
         ];
         let user_perms: &[&str] = &[
             COMMAND_KILL_SELF,

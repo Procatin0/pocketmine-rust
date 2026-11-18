@@ -61,6 +61,30 @@ impl Chunk {
         }
     }
 
+    /// Fills `y_start..=y_end` of column `(x, z)` with `id`.
+    ///
+    /// Same result as [`Self::set_block`] per cell, but resolves the palette
+    /// entry once per subchunk instead of once per block; the terrain
+    /// generator fills whole columns (stone up to the surface, then water), so
+    /// this is the hot fill path.
+    pub fn fill_column(&mut self, x: usize, z: usize, y_start: i32, y_end: i32, id: u32) {
+        let mut y = y_start;
+        while y <= y_end {
+            let Some(sc_idx) = Self::subchunk_index(y) else {
+                y = (y & !15) + 16;
+                continue;
+            };
+            let by = (y & 15) as usize;
+            let last = if (y_end >> 4) == (y >> 4) {
+                (y_end & 15) as usize
+            } else {
+                15
+            };
+            self.subchunks[sc_idx].fill_column(x, z, by, last, 0, id);
+            y = (y & !15) + 16;
+        }
+    }
+
     pub fn get_highest_block_at(&self, x: usize, z: usize) -> Option<i32> {
         for sc_idx in (0..TOTAL_SUBCHUNKS).rev() {
             if self.subchunks[sc_idx].is_empty() {
@@ -149,6 +173,39 @@ mod tests {
         assert_eq!(count, 0);
         // 24 * (header byte + var_i32 biome) + 1 border byte.
         assert_eq!(payload.len(), 24 * 2 + 1 + 1);
+    }
+
+    /// [`Chunk::fill_column`] must land exactly the same blocks as the
+    /// per-block `set_block` loop it replaced, across subchunk borders and
+    /// layers.
+    #[test]
+    fn fill_column_matches_set_block() {
+        let mut filled = Chunk::new(1);
+        let mut reference = Chunk::new(1);
+        for x in 0..16usize {
+            for z in 0..16usize {
+                let top = 40 + (x * 7 + z * 3) as i32;
+                filled.fill_column(x, z, 1, top, block_id::STONE);
+                for y in 1..=top {
+                    reference.set_block(x, y, z, block_id::STONE);
+                }
+            }
+        }
+        filled.fill_column(3, 5, 41, 80, block_id::WATER);
+        for y in 41..=80 {
+            reference.set_block(3, y, 5, block_id::WATER);
+        }
+        for x in 0..16usize {
+            for z in 0..16usize {
+                for y in 0..96 {
+                    assert_eq!(
+                        filled.get_block(x, y, z),
+                        reference.get_block(x, y, z),
+                        "block at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

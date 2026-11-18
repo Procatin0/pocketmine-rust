@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 
+use bedrock_world::block_id;
 use bedrock_world::block_id::AIR;
 use bedrock_world::block_states;
 
@@ -153,9 +154,21 @@ pub fn can_flow_into(world: &WorldState, x: i32, y: i32, z: i32) -> bool {
 }
 
 /// `$block->canBeFlowedInto()`: `Flowable` blocks (air, liquids, plants, ...)
-/// can be replaced by a liquid.
+/// can be replaced by a liquid — except the water plants, which are the water
+/// block they were generated in.
 pub fn can_be_flowed_into(id: u32) -> bool {
-    block_states::state_name(id).is_some_and(physics::is_replaceable)
+    !holds_water(id) && block_states::state_name(id).is_some_and(physics::is_replaceable)
+}
+
+/// Whether the block is a water plant (seagrass, kelp, sea pickle) and therefore
+/// still holds the water it was generated in.
+///
+/// Bedrock has no `waterlogged` property for these: the plant block *is* the
+/// water cell. Treating it as dry ground had two consequences, both seen in
+/// game: a water update next to a plant counted the plant as replaceable and
+/// erased it, and the flow around it thinned out as if the cell were empty.
+fn holds_water(id: u32) -> bool {
+    block_id::is_water_plant(id)
 }
 
 /// `$block->isSolid()` (the reference keeps the default `true` for everything
@@ -167,6 +180,11 @@ fn is_solid(id: u32) -> bool {
 /// `Liquid::getEffectiveFlowDecay($block)`: a falling column counts as a
 /// source, anything that is not the same liquid as `-1`.
 fn effective_flow_decay(world: &WorldState, x: i32, y: i32, z: i32, water: bool) -> i32 {
+    // A water plant keeps its cell at source level; a column flowing down over
+    // one must not thin out.
+    if water && holds_water(world.block_at(x, y, z)) {
+        return 0;
+    }
     match Liquid::from_state(world.block_at(x, y, z)) {
         Some(liquid) if liquid.water == water => {
             if liquid.falling {
@@ -190,6 +208,12 @@ fn smallest_flow_decay(
     adjacent_sources: &mut i32,
     water: bool,
 ) -> i32 {
+    // The neighbouring water plant is a full water cell, so it feeds like a
+    // source on the same level.
+    if water && holds_water(world.block_at(x, y, z)) {
+        *adjacent_sources += 1;
+        return 0;
+    }
     let Some(block) = Liquid::from_state(world.block_at(x, y, z)) else {
         return decay;
     };
@@ -272,17 +296,28 @@ pub fn on_scheduled_update(world: &WorldState, x: i32, y: i32, z: i32) {
         return;
     };
     let multiplier = liquid.flow_decay_per_block();
+    // `BlockSpreadEvent::getSource()`: the liquid cell that spreads.
+    let source_id = liquid.state();
 
     // `$this->flowIntoBlock($bottomBlock, 0, true)`: always try straight down.
     let below = world.block_at(x, y - 1, z);
-    flow_into(world, x, y - 1, z, 0, true, liquid.water);
+    flow_into(world, x, y - 1, z, 0, true, liquid.water, source_id);
 
     if liquid.is_source() || !can_be_flowed_into(below) {
         let adjacent_decay = if liquid.falling { 1 } else { liquid.decay + multiplier };
         if adjacent_decay <= MAX_DECAY {
             for face in optimal_flow_directions(world, x, y, z, liquid.water) {
                 let (dx, _, dz) = physics::offset(face);
-                flow_into(world, x + dx, y, z + dz, adjacent_decay, false, liquid.water);
+                flow_into(
+                    world,
+                    x + dx,
+                    y,
+                    z + dz,
+                    adjacent_decay,
+                    false,
+                    liquid.water,
+                    source_id,
+                );
             }
         }
     }
@@ -303,6 +338,7 @@ fn flow_into(
     new_flow_decay: i32,
     falling: bool,
     water: bool,
+    source_id: u32,
 ) {
     // `Lava::flowIntoBlock()`: lava flowing into water turns that water into
     // stone instead of being blocked by it (the cell keeps the lava, the water
@@ -328,10 +364,17 @@ fn flow_into(
         // exists at `liquid_depth` 0.
         still: true,
     };
+    // `BlockSpreadEvent`: PM fires it before the cell is replaced and skips the
+    // spread when a listener cancels (`Liquid::flowIntoBlock()`).
+    let state = new.state();
+    let previous = world.block_at(x, y, z);
+    if !world.allow_spread(x, y, z, previous, source_id, state) {
+        return;
+    }
     // PM runs `World::useBreakOn()` on a replaceable non-air block first (so a
     // flower in the way drops); the drop is not modelled here, the cell is
     // simply replaced.
-    world.set_block(x, y, z, new.state());
+    world.set_block(x, y, z, state);
 }
 
 /// `Liquid::liquidCollide()`: `BlockEventHelper::form()` replaces the cell and
@@ -340,6 +383,12 @@ fn liquid_collide(world: &WorldState, x: i32, y: i32, z: i32, result: &str) {
     let Some(state) = block_states::network_id(result) else {
         return;
     };
+    // `BlockFormEvent`: PM fires it from `BlockEventHelper::form()`; cancelling
+    // keeps the colliding liquid in place.
+    let previous = world.block_at(x, y, z);
+    if !world.allow_form(x, y, z, previous, previous, state) {
+        return;
+    }
     world.set_block(x, y, z, state);
     world.add_sound(
         bedrock_protocol::packets::level_sound_event::LEVEL_SOUND_FIZZ,
@@ -688,6 +737,61 @@ mod tests {
         );
     }
 
+    /// `BlockSpreadEvent`: cancelling the spread leaves the target cell alone,
+    /// so the flow never starts (`Liquid::flowIntoBlock()`).
+    #[test]
+    fn a_cancelled_spread_event_stops_the_flow() {
+        struct DenySpread;
+        impl crate::world_state::BlockEventHook for DenySpread {
+            fn spread(&self, _: i32, _: i32, _: i32, _: u32, _: u32, _: u32) -> bool {
+                false
+            }
+            fn form(&self, _: i32, _: i32, _: i32, _: u32, _: u32, _: u32) -> bool {
+                true
+            }
+        }
+
+        let world = world();
+        for y in 0..4 {
+            world.set_block(0, y, 0, AIR);
+        }
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block_event_hook(Some(std::sync::Arc::new(DenySpread)));
+
+        tick(&world, 5);
+        assert_eq!(
+            world.block_at(0, 3, 0),
+            AIR,
+            "a cancelled spread must not place the flowing water"
+        );
+    }
+
+    /// `BlockFormEvent`: cancelling keeps the lava/water collision from
+    /// hardening the cell.
+    #[test]
+    fn a_cancelled_form_event_keeps_the_liquid_in_place() {
+        struct DenyForm;
+        impl crate::world_state::BlockEventHook for DenyForm {
+            fn spread(&self, _: i32, _: i32, _: i32, _: u32, _: u32, _: u32) -> bool {
+                true
+            }
+            fn form(&self, _: i32, _: i32, _: i32, _: u32, _: u32, _: u32) -> bool {
+                false
+            }
+        }
+
+        let world = world();
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block(0, 5, 0, lava(0, false));
+        world.set_block_event_hook(Some(std::sync::Arc::new(DenyForm)));
+
+        tick(&world, 40);
+        assert!(
+            Liquid::from_state(world.block_at(0, 4, 0)).is_some_and(|liquid| liquid.water),
+            "the water must survive a cancelled form event"
+        );
+    }
+
     #[test]
     fn lava_flowing_into_water_turns_the_water_into_stone() {
         let world = world();
@@ -744,6 +848,106 @@ mod tests {
             stone,
             "water must never overwrite a solid block, not even when the cell\n             around it becomes a source"
         );
+    }
+
+    #[test]
+    fn water_never_flows_over_a_water_plant() {
+        let world = world();
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block(1, 4, 0, block_id::SEAGRASS);
+        tick(&world, 160);
+        assert_eq!(
+            world.block_at(1, 4, 0),
+            block_id::SEAGRASS,
+            "una planta acuatica ocupa su bloque de agua: el agua no puede sustituirla"
+        );
+    }
+
+    #[test]
+    fn a_water_plant_keeps_the_flow_next_to_it_from_drying_up() {
+        let world = world();
+        let kelp = block_id::kelp(0);
+        world.set_block(0, 4, 0, water(0, false));
+        world.set_block(2, 4, 0, kelp);
+        tick(&world, 40);
+        assert!(Liquid::from_state(world.block_at(1, 4, 0)).is_some());
+
+        // The only liquid left beside the flowing cell is the plant itself, and
+        // the plant still holds its water, so the cell must stay wet.
+        world.set_block(0, 4, 0, AIR);
+        tick(&world, 120);
+        assert!(
+            Liquid::from_state(world.block_at(1, 4, 0)).is_some(),
+            "el agua de la planta tiene que alimentar la celda de al lado"
+        );
+        assert_eq!(world.block_at(2, 4, 0), kelp, "el alga sigue ahi");
+    }
+
+    /// A 5x5 basin with stone walls, water from `floor` up to `top` and a water
+    /// plant on every inner cell of the bottom layer.
+    fn planted_basin(
+        world: &WorldState,
+        floor: i32,
+        top: i32,
+        plant: u32,
+        dry: (i32, i32),
+    ) -> Vec<(i32, i32, i32)> {
+        let stone = block_states::network_id("stone").expect("stone");
+        for x in -2..=2 {
+            for z in -2..=2 {
+                let wall = x == -2 || x == 2 || z == -2 || z == 2;
+                for y in floor..=top + 1 {
+                    world.set_block(x, y, z, if wall { stone } else { water(0, false) });
+                }
+            }
+        }
+        let mut plants = Vec::new();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                if (x, z) == dry {
+                    continue; // stays water, so the test can break it
+                }
+                world.set_block(x, floor, z, plant);
+                plants.push((x, floor, z));
+            }
+        }
+        plants
+    }
+
+    /// Regression: breaking the water block next to a water plant used to feed
+    /// the plant cell to the flow, which replaced the plant with flowing water;
+    /// that flow then dried up and left air where the sea was.
+    #[test]
+    fn breaking_the_water_next_to_a_plant_neither_erases_it_nor_the_sea() {
+        let world = world();
+        let plant = block_id::kelp(0);
+        let plants = planted_basin(&world, 4, 7, plant, (1, 0));
+
+        // The water block the player breaks, right beside the plant at (0, 4, 0).
+        world.set_block(1, 4, 0, AIR);
+        tick(&world, 400);
+
+        for (x, y, z) in &plants {
+            assert!(
+                block_id::is_water_plant(world.block_at(*x, *y, *z)),
+                "la planta de ({x}, {y}, {z}) desaparecio"
+            );
+        }
+        assert!(
+            Liquid::from_state(world.block_at(1, 4, 0)).is_some(),
+            "el hueco abierto se tiene que volver a llenar de agua"
+        );
+        for x in -1..=1 {
+            for z in -1..=1 {
+                for y in 4..=7 {
+                    assert_ne!(
+                        world.block_at(x, y, z),
+                        AIR,
+                        "quedo aire donde habia agua en ({x}, {y}, {z})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

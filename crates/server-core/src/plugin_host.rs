@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use php_plugin_bridge::{PlayerContext, PluginHost};
 use serde_json::{json, Value};
+
+use bedrock_protocol::types::Vector3f;
 
 use crate::world_state::WorldState;
 
@@ -22,6 +24,11 @@ pub struct PlayerRegistry {
     /// manager; virtual players (Java bridge) have no session, so their
     /// lines wait here until `player.take_messages` drains them.
     inboxes: RwLock<HashMap<String, Vec<String>>>,
+    /// Inventory snapshot per lowercase player name, published by
+    /// `SessionManager` (`json!([{ "window": 0, "slots": [...] }, ...])`).
+    inventories: RwLock<HashMap<String, Value>>,
+    /// Edits queued by plugins, drained by `SessionManager` each tick.
+    inventory_edits: Mutex<Vec<InventoryEdit>>,
 }
 
 impl PlayerRegistry {
@@ -43,6 +50,40 @@ impl PlayerRegistry {
         let key = name.to_lowercase();
         self.players.write().remove(&key);
         self.inboxes.write().remove(&key);
+        self.inventories.write().remove(&key);
+        self.inventory_edits
+            .lock()
+            .retain(|edit| match edit {
+                InventoryEdit::SetSlot { player, .. } | InventoryEdit::Clear { player } => {
+                    player != &key
+                }
+            });
+    }
+
+    /// Replaces the inventory snapshot PHP reads through `inventory.get`.
+    pub fn publish_inventory(&self, name: &str, windows: Value) {
+        self.inventories
+            .write()
+            .insert(name.to_lowercase(), windows);
+    }
+
+    /// Latest published snapshot, or an empty window list for unknown players.
+    pub fn inventory(&self, name: &str) -> Value {
+        self.inventories
+            .read()
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()))
+    }
+
+    /// Queues an edit for the next tick of the session manager.
+    pub fn push_inventory_edit(&self, edit: InventoryEdit) {
+        self.inventory_edits.lock().push(edit);
+    }
+
+    /// Drains the edits queued since the last tick.
+    pub fn take_inventory_edits(&self) -> Vec<InventoryEdit> {
+        std::mem::take(&mut *self.inventory_edits.lock())
     }
 
     /// Removes the entry only if it is a virtual (Java bridge) player.
@@ -101,6 +142,76 @@ impl PlayerRegistry {
             .remove(&name.to_lowercase())
             .unwrap_or_default()
     }
+}
+
+/// Window ids of the player containers, mirroring [`crate::inventory`].
+pub const INV_WINDOW_INVENTORY: u32 = 0;
+pub const INV_WINDOW_OFFHAND: u32 = 119;
+pub const INV_WINDOW_ARMOR: u32 = 120;
+pub const INV_WINDOW_CURSOR: u32 = 124;
+
+/// An inventory edit queued by a plugin (`inventory.set_slot`,
+/// `inventory.clear`).
+///
+/// `SessionManager` applies it to the authoritative `PlayerInventory` on the
+/// next tick and resends the affected windows, so PHP never touches the
+/// session map while the host call is running.
+#[derive(Debug, Clone)]
+pub enum InventoryEdit {
+    SetSlot {
+        /// Lowercase player name.
+        player: String,
+        window: u32,
+        slot: u32,
+        item: bedrock_protocol::ItemStack,
+    },
+    Clear {
+        player: String,
+    },
+}
+
+/// Slot size of a player window, or `None` when the id is not a player window.
+pub fn inventory_window_size(window: u32) -> Option<u32> {
+    match window {
+        INV_WINDOW_INVENTORY => Some(crate::inventory::INVENTORY_SIZE as u32),
+        INV_WINDOW_ARMOR => Some(crate::inventory::ARMOR_SIZE as u32),
+        INV_WINDOW_OFFHAND => Some(1),
+        INV_WINDOW_CURSOR => Some(crate::inventory::UI_SIZE as u32),
+        _ => None,
+    }
+}
+
+/// Decodes the lowercase hex NBT sent by `php/item.php` (`Item::getNbtBytes()`).
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
+/// `ItemStack` as JSON for `PlayerInventory`. `null` is an empty slot.
+///
+/// NBT travels as lowercase hex both ways: `inventory.get` sends it and the
+/// PHP `Item` parses it (`ench`, `display.Name`, ...); `inventory.set_slot`
+/// accepts it back so enchantments and custom names reach the authoritative
+/// stack.
+pub fn item_json(item: &bedrock_protocol::ItemStack) -> Value {
+    if item.is_empty() || item.count == 0 {
+        return Value::Null;
+    }
+    json!({
+        "id": item.network_id,
+        "count": item.count,
+        "meta": item.meta,
+        "nbt": item.nbt.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+    })
 }
 
 /// Host bridge backed by the live world and player registry.
@@ -352,6 +463,225 @@ impl ServerPluginHost {
     }
 }
 
+/// `entity.get` / `entity.list`: the JSON shape the PHP `Entity` hydrates from
+/// (`Entity::applyNativeSnapshot()` in `php/player.php`).
+pub(crate) fn entity_json(entity: &crate::entity::Entity) -> Value {
+    let size = entity.size();
+    json!({
+        "unique_id": entity.unique_id,
+        "runtime_id": entity.runtime_id,
+        "type": entity.network_type_id(),
+        "x": entity.position.x,
+        "y": entity.position.y,
+        "z": entity.position.z,
+        "yaw": entity.yaw,
+        "pitch": entity.pitch,
+        "head_yaw": entity.head_yaw,
+        "motion_x": entity.motion.x,
+        "motion_y": entity.motion.y,
+        "motion_z": entity.motion.z,
+        "name_tag": entity.name_tag,
+        "health": entity.health(),
+        "max_health": entity.max_health(),
+        "alive": entity.is_alive(),
+        "on_ground": entity.on_ground,
+        "height": size.height,
+        "width": size.width,
+        "eye_height": size.eye_height(),
+        "ticks_lived": entity.ticks_lived,
+    })
+}
+
+/// Optional float parameter with a PocketMine-style default.
+/// `World::addSound($pos, $sound, $players)`: the PHP side sends player names
+/// (lower-case); an empty list means every viewer of the block's chunk, like
+/// PM's `getViewersForPosition()` default.
+fn player_names(params: &Value) -> Vec<String> {
+    params
+        .get("players")
+        .and_then(Value::as_array)
+        .map(|players| {
+            players
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `AxisAlignedBB` payload used by the collision host calls.
+fn aabb_param(params: &Value) -> crate::entity::Aabb {
+    crate::entity::Aabb::new(
+        float_param(params, "min_x", 0.0),
+        float_param(params, "min_y", 0.0),
+        float_param(params, "min_z", 0.0),
+        float_param(params, "max_x", 0.0),
+        float_param(params, "max_y", 0.0),
+        float_param(params, "max_z", 0.0),
+    )
+}
+
+fn float_param(params: &Value, key: &str, default: f32) -> f32 {
+    params
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(default)
+}
+
+/// `block.state` payload: the Bedrock name and properties of a block state id.
+///
+/// Kept as a free function so the translation can be unit tested without a
+/// running server.
+fn block_state_json(id: u32) -> Option<serde_json::Value> {
+    let name = bedrock_world::block_states::state_name(id)?;
+    let mut properties = serde_json::Map::new();
+    if let Some(states) = bedrock_world::block_states::state_properties(id) {
+        for (key, value) in states {
+            let value = match value {
+                bedrock_world::block_states::Value::String(value) => Value::String(value.clone()),
+                bedrock_world::block_states::Value::Byte(value) => json!(*value),
+                bedrock_world::block_states::Value::Short(value) => json!(*value),
+                bedrock_world::block_states::Value::Int(value) => json!(*value),
+                bedrock_world::block_states::Value::Long(value) => json!(*value),
+                bedrock_world::block_states::Value::Float(value) => json!(*value),
+                bedrock_world::block_states::Value::Double(value) => json!(*value),
+                // Nested compounds are not block properties PM exposes.
+                bedrock_world::block_states::Value::Compound(_) => continue,
+            };
+            properties.insert(key.clone(), value);
+        }
+    }
+    Some(json!({
+        "id": id,
+        "name": format!("minecraft:{}", name),
+        "properties": properties,
+        // `Block::getMeta()`: `null` cuando BDS no tiene meta legacy (`-1`) o
+        // el estado no está en la paleta.
+        "meta": crate::legacy_meta::legacy_meta(id),
+        // `Block::isSolid()`: `has_collision` es la misma tabla que usa el
+        // mundo al colocar entidades.
+        "solid": bedrock_world::block_states::has_collision(name),
+    }))
+}
+
+/// `EffectInstance` JSON used by `entity.effects` / `entity.add_effect`
+/// (`pocketmine\entity\effect\EffectInstance` in `php/effect.php`).
+fn effect_json(effect: &crate::world_state::ActiveEffect) -> Value {
+    json!({
+        "id": effect.id,
+        "amplifier": effect.amplifier,
+        "duration": effect.duration,
+        "visible": effect.visible,
+        "ambient": effect.ambient,
+        "infinite": effect.infinite,
+    })
+}
+
+/// `RecipeIngredient` JSON (`pocketmine\crafting\RecipeIngredient`).
+fn ingredient_json(ingredient: &crate::crafting::RecipeIngredient) -> Value {
+    use crate::crafting::RecipeIngredient;
+    match ingredient {
+        RecipeIngredient::Exact { network_id, meta } => {
+            json!({ "type": "exact", "id": network_id, "meta": meta })
+        }
+        RecipeIngredient::MetaWildcard { network_id } => {
+            json!({ "type": "meta", "id": network_id })
+        }
+        RecipeIngredient::TagWildcard { tag } => json!({ "type": "tag", "tag": tag }),
+    }
+}
+
+/// Parses a `RecipeIngredient` sent by PHP (`crafting.register_*`).
+fn parse_ingredient(value: &Value) -> Option<crate::crafting::RecipeIngredient> {
+    use crate::crafting::RecipeIngredient;
+    match value.get("type").and_then(Value::as_str).unwrap_or("exact") {
+        "tag" => Some(RecipeIngredient::TagWildcard {
+            tag: value.get("tag")?.as_str()?.to_string(),
+        }),
+        "meta" | "meta_wildcard" => Some(RecipeIngredient::MetaWildcard {
+            network_id: value.get("id")?.as_i64()? as i16,
+        }),
+        _ => Some(RecipeIngredient::Exact {
+            network_id: value.get("id")?.as_i64()? as i16,
+            meta: value.get("meta").and_then(Value::as_u64).unwrap_or(0) as u32,
+        }),
+    }
+}
+
+/// Parses an `ItemStack` sent by PHP (item JSON, `count` defaults to 1).
+fn parse_item_stack(value: &Value) -> Option<bedrock_protocol::ItemStack> {
+    let count = value.get("count").and_then(Value::as_u64).unwrap_or(1);
+    if count == 0 {
+        return None;
+    }
+    Some(bedrock_protocol::ItemStack {
+        network_id: value.get("id").and_then(Value::as_i64)? as i16,
+        count: count.min(u64::from(u16::MAX)) as u16,
+        meta: value.get("meta").and_then(Value::as_u64).unwrap_or(0) as u32,
+        ..bedrock_protocol::ItemStack::empty()
+    })
+}
+
+/// One recipe in the `crafting.recipes` index (`pocketmine\crafting`:
+/// `ShapedRecipe` / `ShapelessRecipe` / `FurnaceRecipe`).
+fn crafting_recipe_json(index: u32, kind: &crate::crafting::CraftingRecipeKind) -> Value {
+    use crate::crafting::CraftingRecipeKind;
+    match kind {
+        CraftingRecipeKind::Shaped(recipe) => {
+            let height = recipe.shape.len();
+            let width = recipe.shape.first().map(Vec::len).unwrap_or(0);
+            let cells: Vec<Value> = recipe
+                .shape
+                .iter()
+                .flatten()
+                .map(|cell| cell.as_ref().map(ingredient_json).unwrap_or(Value::Null))
+                .collect();
+            json!({
+                "index": index,
+                "kind": "shaped",
+                "id": recipe.id,
+                "result": item_json(&recipe.result),
+                "height": height,
+                "width": width,
+                "cells": cells,
+                "priority": recipe.priority,
+            })
+        }
+        CraftingRecipeKind::Shapeless(recipe) => json!({
+            "index": index,
+            "kind": "shapeless",
+            "id": recipe.id,
+            "result": item_json(&recipe.result),
+            "ingredients": recipe
+                .ingredients
+                .iter()
+                .map(ingredient_json)
+                .collect::<Vec<_>>(),
+            "priority": recipe.priority,
+        }),
+        CraftingRecipeKind::Furnace(recipe) => json!({
+            "index": index,
+            "kind": "furnace",
+            "id": recipe.id,
+            "block": recipe.block,
+            "result": item_json(&recipe.output),
+            "ingredients": [ingredient_json(&recipe.input)],
+            "ticks": crate::crafting::CraftingManager::furnace_cook_ticks(&recipe.block),
+        }),
+    }
+}
+
+/// Index of the first runtime recipe in the `crafting.recipes` list
+/// (vanilla shaped, shapeless and furnace recipes come first).
+fn dynamic_recipe_offset() -> u32 {
+    let manager = crate::crafting::manager();
+    (manager.shaped_recipes().len()
+        + manager.shapeless_recipes().len()
+        + manager.furnace_recipes().len()) as u32
+}
+
 impl PluginHost for ServerPluginHost {
     fn call(&self, method: &str, params: &Value) -> Result<Value, String> {
         let int = |key: &str| -> Result<i32, String> {
@@ -363,9 +693,288 @@ impl PluginHost for ServerPluginHost {
         };
 
         match method {
+            // ---- Registro de bloques (PHP `Block`/`VanillaBlocks`) ----
+            //
+            // request:  {"name": "minecraft:stone", "states": {"axis": "y"}}
+            // response: {"id": <u32>}   (mismo id de estado que devuelve
+            //            `world.get_block` y acepta `world.set_block`)
+            //
+            // El PHP no lleva una copia de la paleta: los ids salen de
+            // `bedrock_world::block_states`, la misma tabla que usa el mundo,
+            // así que cualquier bloque vanilla funciona sin listas en PHP.
+            "block.network_id" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string parameter 'name'".to_string())?;
+                let mut block_id = bedrock_world::block_states::network_id(name)
+                    .ok_or_else(|| format!("unknown block '{}'", name))?;
+                if let Some(states) = params.get("states").and_then(Value::as_object) {
+                    for (key, value) in states {
+                        let value = match value {
+                            Value::String(value) => value.clone(),
+                            Value::Bool(value) => if *value { "true" } else { "false" }.to_string(),
+                            other => other.to_string(),
+                        };
+                        block_id = bedrock_world::block_states::with_property(block_id, key, &value)
+                            .ok_or_else(|| {
+                                format!("block '{}' has no state '{}={}'", name, key, value)
+                            })?;
+                    }
+                }
+                Ok(json!({ "id": block_id }))
+            }
+            // ---- Estado de un bloque (PHP `BlockStateSerializer`) ----
+            //
+            // request:  {"id": <u32>}
+            // response: {"name": "minecraft:stone", "properties": {...}}
+            //
+            // `properties` sale de la misma tabla que `block.network_id`, así
+            // que serializar y deserializar un estado es ida y vuelta exacta.
+            "block.state" => {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "missing unsigned parameter 'id'".to_string())? as u32;
+                block_state_json(id).ok_or_else(|| format!("unknown block state id {}", id))
+            }
+            // ---- Break info (PHP `BlockBreakInfo`) ----
+            //
+            // request:  {"id": <u32>}  o  {"name": "minecraft:stone"}
+            // response: {"breakable": true, "hardness": f32, "instant": bool,
+            //            "bare_hand": bool, "seconds": f32}
+            //
+            // `breakable: false` es lo que PM llama `isBreakable() === false`
+            // (aire, bedrock, agua).
+            "block.break_info" => {
+                let block_id = if let Some(id) = params.get("id").and_then(Value::as_u64) {
+                    id as u32
+                } else {
+                    let name = params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "missing id or name".to_string())?;
+                    bedrock_world::block_states::network_id(name)
+                        .ok_or_else(|| format!("unknown block '{}'", name))?
+                };
+                Ok(match crate::block_info::break_info(block_id) {
+                    Some(info) => json!({
+                        "breakable": true,
+                        "hardness": info.hardness,
+                        "instant": info.instant,
+                        "bare_hand": info.bare_hand_compatible,
+                        "seconds": info.seconds,
+                    }),
+                    None => json!({ "breakable": false }),
+                })
+            }
             "world.get_block" => {
                 let (x, y, z) = (int("x")?, int("y")?, int("z")?);
                 Ok(json!({ "id": self.world.block_at(x, y, z) }))
+            }
+            // ---- Fase 15: sonido, partículas y biomas (PHP `World`) ----
+            // `World::addSound()`: the PHP `Sound` resolves to a level sound
+            // name plus its extra data; the tick broadcasts one
+            // `LevelSoundEventPacket` at the exact position the plugin passed
+            // (no block-centre offset, unlike the core's block sounds).
+            "world.add_sound" => {
+                let extra_data = params
+                    .get("extra_data")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32;
+                let (x, y, z) = (
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 0.0),
+                    float_param(params, "z", 0.0),
+                );
+                let recipients = player_names(params);
+                // PM `Sound::encode()` devuelve `LevelSoundEventPacket` o
+                // `LevelEventPacket`: el PHP elige una de las dos vías.
+                if let Some(event_id) = params.get("event_id").and_then(Value::as_i64) {
+                    self.world.queue_world_effect(
+                        crate::world_state::PendingWorldEffect::Sound {
+                            sound: None,
+                            event_id: Some(event_id as i32),
+                            extra_data,
+                            x,
+                            y,
+                            z,
+                            recipients,
+                        },
+                    );
+                    return Ok(json!({ "ok": true, "kind": "level_event" }));
+                }
+                let sound = params
+                    .get("sound")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing sound or event_id".to_string())?
+                    .to_string();
+                self.world
+                    .queue_world_effect(crate::world_state::PendingWorldEffect::Sound {
+                        sound: Some(sound),
+                        event_id: None,
+                        extra_data,
+                        x,
+                        y,
+                        z,
+                        recipients,
+                    });
+                Ok(json!({ "ok": true, "kind": "level_sound" }))
+            }
+            // `World::addParticle()`: a `LevelEventPacket` (eventId, position,
+            // eventData) queued for the tick, matching PM's packet shape.
+            "world.add_particle" => {
+                let event_id = params
+                    .get("event_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing event_id".to_string())? as i32;
+                let event_data = params
+                    .get("event_data")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32;
+                let (x, y, z) = (
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 0.0),
+                    float_param(params, "z", 0.0),
+                );
+                self.world
+                    .queue_world_effect(crate::world_state::PendingWorldEffect::Particle {
+                        event_id,
+                        event_data,
+                        x,
+                        y,
+                        z,
+                        recipients: player_names(params),
+                    });
+                                Ok(json!({ "ok": true }))
+            }
+            // ---- Fase 19: `pocketmine\world\Explosion` ----
+            // `Explosion::explodeA()` asks the core for the blast list; the
+            // plugin can edit `$affectedBlocks` before `explodeB()`.
+            "world.explosion_blocks" => {
+                let radius = float_param(params, "radius", 0.0);
+                if !(radius > 0.0) {
+                    return Err("radius must be greater than 0".to_string());
+                }
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 0.0),
+                    float_param(params, "z", 0.0),
+                );
+                let blocks = self.world.explosion_blocks(position, radius);
+                Ok(json!({
+                    "blocks": blocks
+                        .iter()
+                        .map(|&(x, y, z, state_id)| json!({
+                            "x": x, "y": y, "z": z, "state_id": state_id
+                        }))
+                        .collect::<Vec<_>>()
+                }))
+            }
+            // `Explosion::explodeB()`: queues the blast for the tick, which
+            // fires `EntityExplodeEvent` (only with an entity source) and
+            // applies the surviving block list plus player damage.
+            "world.explode" => {
+                let radius = float_param(params, "radius", 0.0);
+                if !(radius > 0.0) {
+                    return Err("radius must be greater than 0".to_string());
+                }
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 0.0),
+                    float_param(params, "z", 0.0),
+                );
+                let blocks = params.get("blocks").and_then(Value::as_array).map(|list| {
+                    list.iter()
+                        .filter_map(|block| {
+                            Some((
+                                block.get("x")?.as_i64()? as i32,
+                                block.get("y")?.as_i64()? as i32,
+                                block.get("z")?.as_i64()? as i32,
+                                block.get("state_id")?.as_u64()? as u32,
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let entity = params
+                    .get("entity_id")
+                    .and_then(Value::as_i64)
+                    .and_then(|id| {
+                        self.world
+                            .entities_snapshot()
+                            .into_iter()
+                            .find(|entity| entity.unique_id as i64 == id)
+                    })
+                    .map(|entity| entity_json(&entity));
+                let count = self.world.queue_explosion(position, radius, entity, blocks);
+                Ok(json!({ "ok": true, "count": count }))
+            }
+            // `World::getCollisionBlocks()`/`getBlockCollisionBoxes()`: the
+            // core's cube collision model for the blocks inside an AABB.
+            "world.collision_blocks" => {
+                let bb = aabb_param(params);
+                let blocks = self.world.collision_blocks(&bb);
+                Ok(json!({
+                    "blocks": blocks
+                        .iter()
+                        .map(|&(x, y, z, state_id)| json!({
+                            "x": x, "y": y, "z": z, "state_id": state_id
+                        }))
+                        .collect::<Vec<_>>()
+                }))
+            }
+            "world.collision_boxes" => {
+                let bb = aabb_param(params);
+                let boxes = self.world.collision_boxes(&bb);
+                Ok(json!({
+                    "boxes": boxes
+                        .iter()
+                        .map(|b| json!({
+                            "min_x": b.min_x,
+                            "min_y": b.min_y,
+                            "min_z": b.min_z,
+                            "max_x": b.max_x,
+                            "max_y": b.max_y,
+                            "max_z": b.max_z
+                        }))
+                        .collect::<Vec<_>>()
+                }))
+            }
+            // `World::scheduleDelayedBlockUpdate()`: re-set the current block
+            // after `delay` ticks through the core's scheduled queue.
+            "world.schedule_block_update" => {
+                let (x, y, z) = (int("x")?, int("y")?, int("z")?);
+                let delay = params
+                    .get("delay")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1) as i32;
+                let block_id = self.world.block_at(x, y, z);
+                self.world
+                    .schedule_delayed_block_update(x, y, z, block_id, delay, None);
+                Ok(json!({ "ok": true, "block_id": block_id }))
+            }
+            // `World::notifyNeighbourBlockUpdate()`: neighbour cascade without
+            // changing the block (connections, falling blocks, fluids).
+            "world.notify_neighbour" => {
+                let (x, y, z) = (int("x")?, int("y")?, int("z")?);
+                self.world.notify_neighbour_block_update(x, y, z);
+                Ok(json!({ "ok": true }))
+            }
+            // `World::getBiomeId()`: override or the generator's column biome.
+            "world.get_biome" => {
+                let (x, y, z) = (int("x")?, int("y")?, int("z")?);
+                Ok(json!({ "biome": self.world.biome_at(x, y, z) }))
+            }
+            // `World::setBiomeId()`: persists a per-column override that the
+            // next chunk payload carries.
+            "world.set_biome" => {
+                let (x, y, z) = (int("x")?, int("y")?, int("z")?);
+                let biome = params
+                    .get("biome")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "missing biome".to_string())?;
+                let changed = self.world.set_biome(x, y, z, biome as u8);
+                Ok(json!({ "ok": true, "changed": changed }))
             }
             "world.set_block" => {
                 let (x, y, z) = (int("x")?, int("y")?, int("z")?);
@@ -416,6 +1025,26 @@ impl PluginHost for ServerPluginHost {
                 let (x, y, z) = self.world.spawn();
                 let (px, py, pz) = self.world.player_position();
                 Ok(json!({ "x": x, "y": y, "z": z, "world": self.world.name, "player": [px, py, pz] }))
+            }
+            // `World::setSpawnLocation()`: the world queues `SpawnChangeEvent`
+            // (dispatched by the tick) and answers with the block-level spawn it
+            // stored, which PHP mirrors locally.
+            "world.set_spawn" => {
+                let number = |key: &str, fallback: i32| {
+                    params
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .map(|value| value.round() as i32)
+                        .unwrap_or(fallback)
+                };
+                let (x, y, z) = self.world.spawn();
+                self.world.set_spawn(
+                    number("x", x),
+                    number("y", y),
+                    number("z", z),
+                );
+                let (x, y, z) = self.world.spawn();
+                Ok(json!({ "ok": true, "x": x, "y": y, "z": z }))
             }
             // ---- Fase A3 (World/Block/Item): solo `world.*` ----
             "world.get_time" => Ok(json!({ "time": self.world.time(), "running": self.world.is_time_running() })),
@@ -486,6 +1115,711 @@ impl PluginHost for ServerPluginHost {
                 let (subchunks, payload) = self.world.chunk_payload(chunk_x, chunk_z);
                 let hex: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
                 Ok(json!({ "subchunks": subchunks, "data": hex }))
+            }
+            // ---- Fase 1 (API de plugins): entidades ----
+            // `EntityFactory::create()` + `Entity::spawnToAll()` en PHP. El alta
+            // en el mundo es `World::addEntity()`; la difusión a los clientes
+            // la hace `SessionManager::sync_entities()` por chunks
+            // (`Entity::spawnTo`), igual que en PocketMine.
+            "entity.spawn" => {
+                let type_id = params
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing entity type".to_string())?;
+                let name_tag = params
+                    .get("name_tag")
+                    .and_then(Value::as_str)
+                    .filter(|tag| !tag.is_empty());
+                match self.world.spawn_mob_configured(
+                    type_id,
+                    Vector3f::new(
+                        float_param(params, "x", 0.0),
+                        float_param(params, "y", 64.0),
+                        float_param(params, "z", 0.0),
+                    ),
+                    float_param(params, "yaw", 0.0),
+                    float_param(params, "pitch", 0.0),
+                    name_tag,
+                ) {
+                    Some(unique_id) => match self.world.entity_by_id(unique_id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false, "error": "entity vanished after spawn" })),
+                    },
+                    None => Ok(json!({
+                        "ok": false,
+                        "error": format!(
+                            "unknown or unspawnable entity type '{type_id}' (or entity cap reached)"
+                        ),
+                        "type": type_id,
+                    })),
+                }
+            }
+            "entity.get" => {
+                // Acepta `unique_id` (`Entity::getId()`) o el runtime id Bedrock.
+                let entity = if let Some(unique_id) =
+                    params.get("unique_id").and_then(Value::as_i64)
+                {
+                    self.world.entity_by_id(unique_id)
+                } else if let Some(runtime_id) = params.get("runtime_id").and_then(Value::as_u64) {
+                    self.world.entity_by_runtime(runtime_id)
+                } else {
+                    return Err("missing unique_id or runtime_id".to_string());
+                };
+                Ok(match entity {
+                    Some(entity) => json!({ "ok": true, "entity": entity_json(&entity) }),
+                    None => json!({ "ok": false, "entity": Value::Null }),
+                })
+            }
+            "entity.list" => {
+                let entities: Vec<Value> = self
+                    .world
+                    .entities_snapshot()
+                    .iter()
+                    .map(entity_json)
+                    .collect();
+                Ok(json!({ "entities": entities, "count": entities.len() }))
+            }
+            "entity.despawn" | "entity.remove" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                Ok(json!({ "ok": self.world.remove_entity(unique_id) }))
+            }
+            // `World::dropItem()`: an `ItemEntity` with the stack the plugin
+            // built (`item.toArray()` on the PHP side).
+            "entity.spawn_item" => {
+                let item = parse_item_stack(params.get("item").unwrap_or(&Value::Null))
+                    .ok_or_else(|| "invalid item".to_string())?;
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 64.0),
+                    float_param(params, "z", 0.0),
+                );
+                let motion = match (
+                    params.get("motion_x").and_then(Value::as_f64),
+                    params.get("motion_y").and_then(Value::as_f64),
+                    params.get("motion_z").and_then(Value::as_f64),
+                ) {
+                    (Some(x), Some(y), Some(z)) => {
+                        Some(Vector3f::new(x as f32, y as f32, z as f32))
+                    }
+                    _ => None,
+                };
+                let owner = params.get("owner").and_then(Value::as_str).unwrap_or("");
+                match self.world.spawn_item(position, item, motion, owner) {
+                    Some(id) => match self.world.entity_by_id(id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false })),
+                    },
+                    None => Ok(json!({ "ok": false, "error": "spawn failed" })),
+                }
+            }
+            // `new FallingBlock($location, $block)`.
+            "entity.spawn_falling_block" => {
+                let x = params.get("x").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let y = params.get("y").and_then(Value::as_i64).unwrap_or(64) as i32;
+                let z = params.get("z").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let block_id = params.get("block_id").and_then(Value::as_u64).unwrap_or(0) as u32;
+                match self.world.spawn_falling_block(x, y, z, block_id) {
+                    Some(id) => match self.world.entity_by_id(id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false })),
+                    },
+                    None => Ok(json!({ "ok": false, "error": "spawn failed" })),
+                }
+            }
+            // `new PrimedTNT($location, $fuse)`.
+            "entity.spawn_tnt" => {
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 64.0),
+                    float_param(params, "z", 0.0),
+                );
+                let fuse = params
+                    .get("fuse")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(80)
+                    .clamp(0, 32_767) as i32;
+                match self.world.spawn_primed_tnt(position, fuse) {
+                    Some(id) => match self.world.entity_by_id(id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false })),
+                    },
+                    None => Ok(json!({ "ok": false, "error": "spawn failed" })),
+                }
+            }
+            // `World::dropExperience($pos, $amount)`.
+            "entity.spawn_xp_orb" => {
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 64.0),
+                    float_param(params, "z", 0.0),
+                );
+                let value = params.get("value").and_then(Value::as_i64).unwrap_or(0) as i32;
+                match self.world.spawn_experience_orb(position, value) {
+                    Some(id) => match self.world.entity_by_id(id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false })),
+                    },
+                    None => Ok(json!({ "ok": false, "error": "spawn failed" })),
+                }
+            }
+            // `new Arrow($location, $shooter, $critical)` and the other
+            // `Projectile` subclasses (`Projectile::__construct`).
+            "entity.spawn_projectile" => {
+                let type_id = params
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing type".to_string())?;
+                let kind = crate::entity::ProjectileKind::from_network_type_id(type_id)
+                    .ok_or_else(|| format!("unsupported projectile '{}'", type_id))?;
+                let position = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 64.0),
+                    float_param(params, "z", 0.0),
+                );
+                let motion = Vector3f::new(
+                    float_param(params, "motion_x", 0.0),
+                    float_param(params, "motion_y", 0.0),
+                    float_param(params, "motion_z", 0.0),
+                );
+                let owner = params.get("owner").and_then(Value::as_str).unwrap_or("");
+                let owner_runtime_id = params
+                    .get("owner_runtime_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let damage = float_param(params, "damage", 0.0);
+                let critical = params
+                    .get("critical")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                match self.world.spawn_projectile(
+                    kind,
+                    position,
+                    motion,
+                    owner,
+                    owner_runtime_id,
+                    damage,
+                    critical,
+                ) {
+                    Some(id) => match self.world.entity_by_id(id) {
+                        Some(entity) => Ok(json!({ "ok": true, "entity": entity_json(&entity) })),
+                        None => Ok(json!({ "ok": false })),
+                    },
+                    None => Ok(json!({ "ok": false, "error": "spawn failed" })),
+                }
+            }
+            "entity.teleport" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let moved = self.world.set_entity_position(
+                    unique_id,
+                    Vector3f::new(
+                        float_param(params, "x", 0.0),
+                        float_param(params, "y", 64.0),
+                        float_param(params, "z", 0.0),
+                    ),
+                    params.get("yaw").and_then(Value::as_f64).map(|v| v as f32),
+                    params
+                        .get("pitch")
+                        .and_then(Value::as_f64)
+                        .map(|v| v as f32),
+                );
+                Ok(json!({
+                    "ok": moved,
+                    "entity": self.world.entity_by_id(unique_id).map(|entity| entity_json(&entity)),
+                }))
+            }
+            "entity.set_health" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let health = params
+                    .get("health")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "missing health".to_string())? as f32;
+                let applied = self.world.set_entity_health(unique_id, health);
+                Ok(match self.world.entity_by_id(unique_id) {
+                    Some(entity) => json!({
+                        "ok": applied.is_some(),
+                        "entity": entity_json(&entity),
+                    }),
+                    None => json!({ "ok": false, "error": "entity not found" }),
+                })
+            }
+            "entity.damage" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let damage = params
+                    .get("damage")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "missing damage".to_string())? as f32;
+                let Some(entity) = self.world.entity_by_id(unique_id) else {
+                    return Ok(json!({ "ok": false, "error": "entity not found" }));
+                };
+                Ok(match self.world.damage_entity(entity.runtime_id, damage) {
+                    // `Living::attack()`: the actor event (hurt / death
+                    // animation) is queued by `damage_entity()` itself and
+                    // goes out in `SessionManager::apply_entity_events()`.
+                    Some((_, outcome)) => json!({
+                        "ok": true,
+                        "killed": outcome == crate::entity::DamageOutcome::Killed,
+                        "entity": self.world.entity_by_id(unique_id).map(|entity| entity_json(&entity)),
+                    }),
+                    None => json!({
+                        "ok": false,
+                        "error": "damage ignored (not living, already dead or invulnerable)",
+                        "entity": entity_json(&entity),
+                    }),
+                })
+            }
+            "entity.set_motion" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let motion = Vector3f::new(
+                    float_param(params, "x", 0.0),
+                    float_param(params, "y", 0.0),
+                    float_param(params, "z", 0.0),
+                );
+                let applied = self.world.set_entity_motion(unique_id, motion);
+                Ok(json!({
+                    "ok": applied,
+                    "entity": self.world.entity_by_id(unique_id).map(|entity| entity_json(&entity)),
+                }))
+            }
+            "entity.knock_back" => {
+                // `Living::knockBack($x, $z, $force)`: the native pass needs the
+                // Bedrock runtime id, so it is resolved from the PocketMine id.
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let Some(entity) = self.world.entity_by_id(unique_id) else {
+                    return Ok(json!({ "ok": false, "error": "entity not found" }));
+                };
+                self.world.knock_back_entity(
+                    entity.runtime_id,
+                    float_param(params, "dx", 0.0),
+                    float_param(params, "dz", 0.0),
+                    float_param(params, "force", 0.4),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "entity": self.world.entity_by_id(unique_id).map(|entity| entity_json(&entity)),
+                }))
+            }
+            "entity.set_name_tag" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let name_tag = params
+                    .get("name_tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let ok = self.world.set_entity_name_tag(unique_id, name_tag);
+                Ok(json!({
+                    "ok": ok,
+                    "entity": self.world.entity_by_id(unique_id).map(|entity| entity_json(&entity)),
+                }))
+            }
+            // ---- Fase 4 (API de plugins): inventario del jugador ----
+            // `PlayerInventory` en PHP es un proxy: lee el snapshot que publica
+            // el tick (`inventory.get`) y escribe por `inventory.set_slot` /
+            // `inventory.clear`, que se aplican al inventario autoritativo en
+            // el tick siguiente y se resincronizan al cliente.
+            "inventory.get" => {
+                let name = params
+                    .get("player")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player".to_string())?;
+                Ok(json!({
+                    "ok": true,
+                    "player": name,
+                    "windows": self.players.inventory(name),
+                }))
+            }
+            "inventory.set_slot" => {
+                let name = params
+                    .get("player")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player".to_string())?;
+                let window = params
+                    .get("window")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(INV_WINDOW_INVENTORY as i64) as u32;
+                let slot = params
+                    .get("slot")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing slot".to_string())? as u32;
+                let Some(size) = inventory_window_size(window) else {
+                    return Ok(json!({
+                        "ok": false,
+                        "error": format!("unknown inventory window {window}"),
+                    }));
+                };
+                if slot >= size {
+                    return Ok(json!({
+                        "ok": false,
+                        "error": format!("slot {slot} out of range for window {window} (size {size})"),
+                    }));
+                }
+                let stack = match params.get("item") {
+                    Some(value) if !value.is_null() => {
+                        let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+                        if count == 0 {
+                            bedrock_protocol::ItemStack::empty()
+                        } else {
+                            bedrock_protocol::ItemStack {
+                                network_id: value
+                                    .get("id")
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or(0) as i16,
+                                count: count.min(u64::from(u16::MAX)) as u16,
+                                meta: value.get("meta").and_then(Value::as_u64).unwrap_or(0) as u32,
+                                nbt: value
+                                    .get("nbt")
+                                    .and_then(Value::as_str)
+                                    .and_then(decode_hex)
+                                    .unwrap_or_default(),
+                                ..bedrock_protocol::ItemStack::empty()
+                            }
+                        }
+                    }
+                    _ => bedrock_protocol::ItemStack::empty(),
+                };
+                self.players.push_inventory_edit(InventoryEdit::SetSlot {
+                    player: name.to_lowercase(),
+                    window,
+                    slot,
+                    item: stack,
+                });
+                // Se aplica en el tick siguiente: `setItem()` en PHP es void.
+                Ok(json!({ "ok": true, "applied": false }))
+            }
+            "inventory.clear" => {
+                let name = params
+                    .get("player")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing player".to_string())?;
+                self.players.push_inventory_edit(InventoryEdit::Clear {
+                    player: name.to_lowercase(),
+                });
+                Ok(json!({ "ok": true, "applied": false }))
+            }
+            // `ItemFactory::get($name)` / `fromString()` for namespaced ids
+            // (`minecraft:rotten_flesh`): `data/item_ids.txt` keeps the classic
+            // numeric id, which is what the PHP `Item` expects.
+            "item.id_by_name" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing item name".to_string())?;
+                let id = crate::inventory::item_network_id(name);
+                Ok(json!({ "id": id, "found": id.is_some() }))
+            }
+            "item.name_by_id" => {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing item id".to_string())?;
+                let name = crate::inventory::item_canonical_name(id as i16);
+                Ok(json!({ "name": name, "found": name.is_some() }))
+            }
+            // ---- Fase 7b (API de plugins): efectos de entidad ----
+            // `Living::getEffects()` / `EffectCollection`. El estado vive en
+            // `WorldState::entity_effects` y decae en `tick_entities()`; los
+            // paquetes de efecto del cliente (`MobEffectPacket`) todavía no
+            // existen en `bedrock-protocol`, así que el efecto es autoritativo
+            // en el servidor pero no se dibuja la burbuja (documentado en
+            // `docs/plugin-compatibility.md`).
+            "entity.effects" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                if self.world.entity_by_id(unique_id).is_none() {
+                    return Ok(json!({ "ok": false, "error": "entity not found" }));
+                }
+                let effects: Vec<Value> = self
+                    .world
+                    .entity_effects(unique_id)
+                    .iter()
+                    .map(effect_json)
+                    .collect();
+                Ok(json!({ "ok": true, "effects": effects }))
+            }
+            "entity.add_effect" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "missing effect id".to_string())? as u32;
+                let duration = params.get("duration").and_then(Value::as_i64).unwrap_or(600);
+                let mut effect = crate::world_state::ActiveEffect::new(
+                    id,
+                    duration as i32,
+                    params.get("amplifier").and_then(Value::as_u64).unwrap_or(0).min(255) as u8,
+                );
+                effect.visible = params.get("visible").and_then(Value::as_bool).unwrap_or(true);
+                effect.ambient = params.get("ambient").and_then(Value::as_bool).unwrap_or(false);
+                effect.infinite = params.get("infinite").and_then(Value::as_bool).unwrap_or(false);
+                let applied = self.world.add_entity_effect(unique_id, effect);
+                let effects: Vec<Value> = self
+                    .world
+                    .entity_effects(unique_id)
+                    .iter()
+                    .map(effect_json)
+                    .collect();
+                Ok(json!({ "ok": applied, "effects": effects }))
+            }
+            "entity.remove_effect" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "missing effect id".to_string())? as u32;
+                let removed = self.world.remove_entity_effect(unique_id, id);
+                let effects: Vec<Value> = self
+                    .world
+                    .entity_effects(unique_id)
+                    .iter()
+                    .map(effect_json)
+                    .collect();
+                Ok(json!({ "ok": removed, "effects": effects }))
+            }
+            "entity.clear_effects" => {
+                let unique_id = params
+                    .get("unique_id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "missing unique_id".to_string())?;
+                let removed = self.world.clear_entity_effects(unique_id);
+                Ok(json!({ "ok": true, "removed": removed, "effects": [] }))
+            }
+            // ---- Fase 9 (API de plugins): crafteo ----
+            // `CraftingManager` en PHP es un proxy del motor nativo: el índice
+            // de recetas (shaped, shapeless, horno y las registradas por
+            // plugins) sale de `crafting.recipes`, y `matchRecipe()` pregunta
+            // a `crafting.match` para que el resultado sea exactamente el que
+            // aplicará `ItemStackRequest`.
+            "crafting.recipes" => {
+                use crate::crafting::CraftingRecipeKind;
+                let manager = crate::crafting::manager();
+                let mut recipes = Vec::new();
+                let mut index = 0u32;
+                for recipe in manager.shaped_recipes() {
+                    recipes.push(crafting_recipe_json(
+                        index,
+                        &CraftingRecipeKind::Shaped(recipe.clone()),
+                    ));
+                    index += 1;
+                }
+                for recipe in manager.shapeless_recipes() {
+                    recipes.push(crafting_recipe_json(
+                        index,
+                        &CraftingRecipeKind::Shapeless(recipe.clone()),
+                    ));
+                    index += 1;
+                }
+                for recipe in manager.furnace_recipes() {
+                    recipes.push(crafting_recipe_json(
+                        index,
+                        &CraftingRecipeKind::Furnace(recipe.clone()),
+                    ));
+                    index += 1;
+                }
+                for kind in crate::crafting::dynamic_recipes() {
+                    recipes.push(crafting_recipe_json(index, &kind));
+                    index += 1;
+                }
+                Ok(json!({ "recipes": recipes, "count": recipes.len() }))
+            }
+            "crafting.match" => {
+                let size = params.get("size").and_then(Value::as_u64).unwrap_or(2) as usize;
+                if size != crate::crafting::SIZE_SMALL && size != crate::crafting::SIZE_BIG {
+                    return Ok(json!({
+                        "matched": false,
+                        "error": format!("unsupported grid size {size}"),
+                    }));
+                }
+                let mut grid = crate::crafting::CraftingGrid::new(size);
+                if let Some(items) = params.get("items").and_then(Value::as_array) {
+                    for (slot, item) in items.iter().take(size * size).enumerate() {
+                        if let Some(stack) = parse_item_stack(item) {
+                            grid.slots[slot] = stack;
+                        }
+                    }
+                }
+                Ok(
+                    match crate::crafting::manager().craft_from_grid_with_dynamic(&grid) {
+                        Some(outcome) => json!({
+                            "matched": true,
+                            "result": item_json(&outcome.result),
+                            "consume": outcome.consume,
+                        }),
+                        None => json!({ "matched": false }),
+                    },
+                )
+            }
+            "crafting.furnace" => {
+                let block = params
+                    .get("block")
+                    .and_then(Value::as_str)
+                    .unwrap_or("furnace");
+                let Some(item) = params.get("item").and_then(parse_item_stack) else {
+                    return Ok(json!({ "matched": false }));
+                };
+                Ok(
+                    match crate::crafting::manager().find_furnace_for(block, &item) {
+                        Some(recipe) => json!({
+                            "matched": true,
+                            "result": item_json(&recipe.output),
+                            "ticks": crate::crafting::CraftingManager::furnace_cook_ticks(block),
+                        }),
+                        None => json!({ "matched": false }),
+                    },
+                )
+            }
+            "crafting.brewing" => {
+                let input = params.get("input").and_then(parse_item_stack);
+                let ingredient = params.get("ingredient").and_then(parse_item_stack);
+                Ok(match (input, ingredient) {
+                    (Some(input), Some(ingredient)) => {
+                        match crate::crafting::manager().brewing_result(&input, &ingredient) {
+                            Some(result) => json!({ "matched": true, "result": item_json(&result) }),
+                            None => json!({ "matched": false }),
+                        }
+                    }
+                    _ => json!({ "matched": false }),
+                })
+            }
+            "crafting.register_shaped" => {
+                use crate::crafting::{RecipeIngredient, ShapedRecipe, CraftingRecipeKind};
+                let rows: Vec<String> = params
+                    .get("shape")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if rows.is_empty() || rows.len() > 3 {
+                    return Ok(json!({ "ok": false, "error": "shaped recipes need 1..3 rows" }));
+                }
+                let width = rows[0].chars().count();
+                if width == 0 || width > 3 || rows.iter().any(|row| row.chars().count() != width) {
+                    return Ok(json!({
+                        "ok": false,
+                        "error": "shaped recipe rows must share a 1..3 column width",
+                    }));
+                }
+                let symbols = params.get("ingredients").and_then(Value::as_object);
+                let mut shape: Vec<Vec<Option<RecipeIngredient>>> = Vec::new();
+                for row in &rows {
+                    let mut cells = Vec::new();
+                    for symbol in row.chars() {
+                        if symbol == ' ' {
+                            cells.push(None);
+                            continue;
+                        }
+                        let Some(ingredient) = symbols
+                            .and_then(|map| map.get(&symbol.to_string()))
+                            .and_then(parse_ingredient)
+                        else {
+                            return Ok(json!({
+                                "ok": false,
+                                "error": format!("missing ingredient for '{symbol}'"),
+                            }));
+                        };
+                        cells.push(Some(ingredient));
+                    }
+                    shape.push(cells);
+                }
+                let Some(result) = params
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .and_then(|results| results.first())
+                    .and_then(parse_item_stack)
+                else {
+                    return Ok(json!({ "ok": false, "error": "missing result item" }));
+                };
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "plugin:shaped#{}",
+                            crate::crafting::dynamic_recipes().len() + 1
+                        )
+                    });
+                let kind = CraftingRecipeKind::Shaped(ShapedRecipe {
+                    id,
+                    shape,
+                    result: result.clone(),
+                    priority: 0,
+                });
+                crate::crafting::register_dynamic_recipe(kind);
+                let index = dynamic_recipe_offset()
+                    + crate::crafting::dynamic_recipes().len() as u32
+                    - 1;
+                Ok(json!({ "ok": true, "index": index }))
+            }
+            "crafting.register_shapeless" => {
+                use crate::crafting::{CraftingRecipeKind, ShapelessRecipe};
+                let ingredients: Vec<crate::crafting::RecipeIngredient> = params
+                    .get("ingredients")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(parse_ingredient).collect())
+                    .unwrap_or_default();
+                if ingredients.is_empty() || ingredients.len() > 9 {
+                    return Ok(json!({ "ok": false, "error": "shapeless recipes need 1..9 ingredients" }));
+                }
+                let Some(result) = params
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .and_then(|results| results.first())
+                    .and_then(parse_item_stack)
+                else {
+                    return Ok(json!({ "ok": false, "error": "missing result item" }));
+                };
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "plugin:shapeless#{}",
+                            crate::crafting::dynamic_recipes().len() + 1
+                        )
+                    });
+                let kind = CraftingRecipeKind::Shapeless(ShapelessRecipe {
+                    id,
+                    ingredients,
+                    result,
+                    priority: 0,
+                });
+                crate::crafting::register_dynamic_recipe(kind);
+                let index = dynamic_recipe_offset()
+                    + crate::crafting::dynamic_recipes().len() as u32
+                    - 1;
+                Ok(json!({ "ok": true, "index": index }))
             }
             "player.get" => {
                 let name = params
@@ -975,6 +2309,660 @@ mod tests {
     }
 
     #[test]
+    fn world_set_spawn_moves_the_spawn_and_queues_spawn_change() {
+        let generator: Arc<dyn bedrock_world::WorldGenerator> =
+            Arc::new(bedrock_world::NormalGenerator::new(42));
+        let world = Arc::new(WorldState::new("world", generator));
+        let host = ServerPluginHost::new(
+            Arc::clone(&world),
+            Arc::new(PlayerRegistry::new()),
+            Arc::new(RwLock::new(HashSet::new())),
+            "test motd",
+            100,
+        );
+        let previous = world.spawn();
+        let spawn = host
+            .call(
+                "world.set_spawn",
+                &json!({ "x": 10.5, "y": 70.0, "z": -3.2 }),
+            )
+            .expect("world.set_spawn");
+        assert_eq!(spawn["x"], json!(11));
+        assert_eq!(spawn["y"], json!(70));
+        assert_eq!(spawn["z"], json!(-3));
+        assert_eq!(world.spawn(), (11, 70, -3));
+        assert_eq!(
+            world.take_world_events(),
+            vec![crate::world_state::PendingWorldEvent::SpawnChanged {
+                previous
+            }]
+        );
+    }
+
+    #[test]
+    fn world_collision_and_update_host_calls() {
+        let generator: Arc<dyn bedrock_world::WorldGenerator> =
+            Arc::new(bedrock_world::NormalGenerator::new(42));
+        let world = Arc::new(WorldState::new("world", generator));
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        world.set_block(2, 5, 2, stone);
+        let host = ServerPluginHost::new(
+            Arc::clone(&world),
+            Arc::new(PlayerRegistry::new()),
+            Arc::new(RwLock::new(HashSet::new())),
+            "test motd",
+            100,
+        );
+        let bb = json!({
+            "min_x": 1.5, "min_y": 4.5, "min_z": 1.5,
+            "max_x": 2.5, "max_y": 5.5, "max_z": 2.5
+        });
+
+        let blocks = host
+            .call("world.collision_blocks", &bb)
+            .expect("world.collision_blocks");
+        assert!(blocks["blocks"].as_array().expect("blocks").iter().any(
+            |block| block["x"] == 2
+                && block["y"] == 5
+                && block["z"] == 2
+                && block["state_id"] == stone
+        ));
+
+        let boxes = host
+            .call("world.collision_boxes", &bb)
+            .expect("world.collision_boxes");
+        let boxes = boxes["boxes"].as_array().expect("boxes");
+        assert!(boxes
+            .iter()
+            .any(|b| b["min_x"] == 2.0 && b["max_y"] == 6.0));
+
+        // `scheduleDelayedBlockUpdate()` keeps the block id at queue time and
+        // restores it after the delay (here the block is removed meanwhile).
+        host.call(
+            "world.schedule_block_update",
+            &json!({ "x": 2, "y": 5, "z": 2, "delay": 1 }),
+        )
+        .expect("world.schedule_block_update");
+        world.set_block(2, 5, 2, bedrock_world::block_id::AIR);
+        world.tick();
+        assert_eq!(world.block_at(2, 5, 2), stone);
+
+        host.call(
+            "world.notify_neighbour",
+            &json!({ "x": 2, "y": 5, "z": 2 }),
+        )
+        .expect("world.notify_neighbour");
+    }
+
+    #[test]
+    fn world_explosion_host_calls_queue_the_blast() {
+        let generator: Arc<dyn bedrock_world::WorldGenerator> =
+            Arc::new(bedrock_world::NormalGenerator::new(42));
+        let world = Arc::new(WorldState::new("world", generator));
+        let stone = bedrock_world::block_states::network_id("stone").unwrap();
+        world.set_block(3, 5, 3, stone);
+        let host = ServerPluginHost::new(
+            Arc::clone(&world),
+            Arc::new(PlayerRegistry::new()),
+            Arc::new(RwLock::new(HashSet::new())),
+            "test motd",
+            100,
+        );
+
+        // `Explosion::explodeA()` previews the blocks without touching them.
+        let preview = host
+            .call(
+                "world.explosion_blocks",
+                &json!({ "x": 3.0, "y": 5.0, "z": 3.0, "radius": 2.0 }),
+            )
+            .expect("world.explosion_blocks");
+        let blocks = preview["blocks"].as_array().expect("blocks").clone();
+        assert!(blocks.iter().any(|block| block["x"] == 3
+            && block["y"] == 5
+            && block["z"] == 3
+            && block["state_id"] == stone));
+        assert_eq!(world.block_at(3, 5, 3), stone);
+
+        // `Explosion::explodeB()` queues that list for the tick.
+        let queued = host
+            .call(
+                "world.explode",
+                &json!({
+                    "x": 3.0,
+                    "y": 5.0,
+                    "z": 3.0,
+                    "radius": 2.0,
+                    "blocks": blocks
+                }),
+            )
+            .expect("world.explode");
+        assert_eq!(queued["count"], blocks.len());
+        let explosions = world.take_explosions();
+        assert_eq!(explosions.len(), 1);
+        assert_eq!(explosions[0].radius, 2.0);
+        assert_eq!(explosions[0].entity, None);
+        assert_eq!(explosions[0].blocks.len(), blocks.len());
+
+        // PM rejects non-positive radii.
+        assert!(host
+            .call("world.explode", &json!({ "x": 0, "y": 0, "z": 0, "radius": 0 }))
+            .is_err());
+    }
+
+    #[test]
+    fn world_sound_particle_and_biome_host_calls_queue_values() {
+        let generator: Arc<dyn bedrock_world::WorldGenerator> =
+            Arc::new(bedrock_world::NormalGenerator::new(42));
+        let world = Arc::new(WorldState::new("world", generator));
+        let host = ServerPluginHost::new(
+            Arc::clone(&world),
+            Arc::new(PlayerRegistry::new()),
+            Arc::new(RwLock::new(HashSet::new())),
+            "test motd",
+            100,
+        );
+
+        // `World::addSound(new BlockPlaceSound($block))` with explicit players:
+        // the effect waits for `WorldSoundEvent` on the tick.
+        let sound = host
+            .call(
+                "world.add_sound",
+                &json!({
+                    "sound": "place",
+                    "extra_data": 42,
+                    "x": 1.5,
+                    "y": 64.0,
+                    "z": -2.5,
+                    "players": ["Steve"]
+                }),
+            )
+            .expect("world.add_sound");
+        assert_eq!(sound["kind"], json!("level_sound"));
+        let effects = world.take_world_effects();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            crate::world_state::PendingWorldEffect::Sound {
+                sound,
+                extra_data,
+                recipients,
+                ..
+            } if sound.as_deref() == Some("place")
+                && *extra_data == 42
+                && recipients == &vec!["steve".to_string()]
+        ));
+
+        // `World::addSound(new ClickSound(0.5))`: LevelEvent, pitch*1000.
+        let click = host
+            .call(
+                "world.add_sound",
+                &json!({ "event_id": 1000, "extra_data": 500, "x": 0.0, "y": 1.0, "z": 2.0 }),
+            )
+            .expect("world.add_sound (event_id)");
+        assert_eq!(click["kind"], json!("level_event"));
+        assert!(matches!(
+            &world.take_world_effects()[..],
+            [crate::world_state::PendingWorldEffect::Sound { event_id: Some(1000), .. }]
+        ));
+
+        // `World::addParticle(new FlameParticle())` (0x4000 | 8).
+        host.call(
+            "world.add_particle",
+            &json!({ "event_id": 16392, "event_data": 0, "x": 3.25, "y": 65.5, "z": 4.0 }),
+        )
+        .expect("world.add_particle");
+        assert!(matches!(
+            &world.take_world_effects()[..],
+            [crate::world_state::PendingWorldEffect::Particle { event_id: 16392, x, .. }]
+                if *x == 3.25
+        ));
+        // Las colas del core no se mezclan con los efectos de PHP.
+        assert!(world.take_pending_sounds_at().is_empty());
+        assert!(world.take_pending_level_events_at().is_empty());
+
+        // `World::getBiomeId()` / `setBiomeId()`.
+        let before = host
+            .call("world.get_biome", &json!({ "x": 0, "y": 64, "z": 0 }))
+            .expect("world.get_biome");
+        let changed = host
+            .call(
+                "world.set_biome",
+                &json!({ "x": 0, "y": 64, "z": 0, "biome": 2 }),
+            )
+            .expect("world.set_biome");
+        assert_eq!(changed["changed"], json!(true));
+        let after = host
+            .call("world.get_biome", &json!({ "x": 0, "y": 64, "z": 0 }))
+            .expect("world.get_biome");
+        assert_eq!(after["biome"], json!(2));
+        assert_ne!(before["biome"], json!(2));
+    }
+
+    #[test]
+    fn entity_effect_host_calls_roundtrip() {
+        let (host, _) = test_host();
+        let spawned = host
+            .call(
+                "entity.spawn",
+                &json!({ "type": "minecraft:zombie", "x": 0, "y": 64, "z": 0 }),
+            )
+            .expect("entity.spawn");
+        let id = spawned["entity"]["unique_id"].as_i64().expect("unique id");
+
+        assert_eq!(
+            host.call("entity.effects", &json!({ "unique_id": id }))
+                .expect("entity.effects")["effects"],
+            json!([])
+        );
+
+        let added = host
+            .call(
+                "entity.add_effect",
+                &json!({ "unique_id": id, "id": 1, "duration": 200, "amplifier": 1 }),
+            )
+            .expect("entity.add_effect");
+        assert_eq!(added["ok"], json!(true));
+        assert_eq!(added["effects"][0]["id"], json!(1));
+        assert_eq!(added["effects"][0]["amplifier"], json!(1));
+        assert_eq!(added["effects"][0]["duration"], json!(200));
+
+        let removed = host
+            .call("entity.remove_effect", &json!({ "unique_id": id, "id": 1 }))
+            .expect("entity.remove_effect");
+        assert_eq!(removed["ok"], json!(true));
+        assert_eq!(removed["effects"], json!([]));
+
+        host.call(
+            "entity.add_effect",
+            &json!({ "unique_id": id, "id": 20, "duration": 100 }),
+        )
+        .expect("entity.add_effect");
+        let cleared = host
+            .call("entity.clear_effects", &json!({ "unique_id": id }))
+            .expect("entity.clear_effects");
+        assert_eq!(cleared["removed"], json!(1));
+        assert_eq!(
+            host.call("entity.effects", &json!({ "unique_id": 999 }))
+                .expect("unknown entity")["ok"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn object_and_projectile_spawn_calls_round_trip() {
+        let (host, _players) = test_host();
+        let planks = crate::inventory::item_network_id("minecraft:oak_planks").expect("planks");
+
+        let item = host
+            .call(
+                "entity.spawn_item",
+                &json!({
+                    "x": 0.5, "y": 64.0, "z": 0.5,
+                    "item": { "id": planks, "meta": 0, "count": 3 },
+                }),
+            )
+            .expect("entity.spawn_item");
+        assert_eq!(item["ok"], json!(true));
+        assert_eq!(item["entity"]["type"], json!("minecraft:item"));
+
+        let falling = host
+            .call(
+                "entity.spawn_falling_block",
+                &json!({ "x": 1, "y": 70, "z": 2, "block_id": 1 }),
+            )
+            .expect("entity.spawn_falling_block");
+        assert_eq!(falling["ok"], json!(true));
+        assert_eq!(falling["entity"]["type"], json!("minecraft:falling_block"));
+
+        let tnt = host
+            .call("entity.spawn_tnt", &json!({ "x": 0.0, "y": 64.0, "z": 0.0 }))
+            .expect("entity.spawn_tnt");
+        assert_eq!(tnt["ok"], json!(true));
+        assert_eq!(tnt["entity"]["type"], json!("minecraft:tnt"));
+
+        let orb = host
+            .call(
+                "entity.spawn_xp_orb",
+                &json!({ "x": 0.0, "y": 64.0, "z": 0.0, "value": 5 }),
+            )
+            .expect("entity.spawn_xp_orb");
+        assert_eq!(orb["ok"], json!(true));
+        assert_eq!(orb["entity"]["type"], json!("minecraft:xp_orb"));
+        // `World::dropExperience()` ignores a non-positive amount.
+        assert_eq!(
+            host.call("entity.spawn_xp_orb", &json!({ "value": 0 }))
+                .expect("empty orb")["ok"],
+            json!(false)
+        );
+
+        let arrow = host
+            .call(
+                "entity.spawn_projectile",
+                &json!({
+                    "type": "minecraft:arrow",
+                    "x": 0.0, "y": 65.0, "z": 0.0,
+                    "motion_x": 0.0, "motion_y": 0.0, "motion_z": 3.0,
+                    "owner": "Steve", "owner_runtime_id": 9,
+                    "damage": 2.0, "critical": true,
+                }),
+            )
+            .expect("entity.spawn_projectile");
+        assert_eq!(arrow["ok"], json!(true));
+        assert_eq!(arrow["entity"]["type"], json!("minecraft:arrow"));
+        assert!(host
+            .call("entity.spawn_projectile", &json!({ "type": "minecraft:cow" }))
+            .is_err());
+    }
+
+    #[test]
+    fn crafting_host_calls_expose_and_match_recipes() {
+        let (host, _) = test_host();
+        let oak_log = crate::inventory::item_network_id("minecraft:oak_log").expect("oak_log");
+        let planks = crate::inventory::item_network_id("minecraft:oak_planks").expect("planks");
+
+        let recipes = host.call("crafting.recipes", &json!({})).expect("crafting.recipes");
+        assert!(recipes["count"].as_u64().unwrap() > 100, "recipe index looks empty");
+        assert_eq!(recipes["recipes"][0]["kind"], json!("shaped"));
+
+        let matched = host
+            .call(
+                "crafting.match",
+                &json!({ "size": 2, "items": [{ "id": oak_log, "meta": 0, "count": 1 }] }),
+            )
+            .expect("crafting.match");
+        assert_eq!(matched["matched"], json!(true));
+        assert_eq!(matched["result"]["id"], json!(planks));
+        assert_eq!(matched["result"]["count"], json!(4));
+
+        let empty = host
+            .call("crafting.match", &json!({ "size": 2, "items": [] }))
+            .expect("empty match");
+        assert_eq!(empty["matched"], json!(false));
+
+        let unsupported = host
+            .call("crafting.match", &json!({ "size": 5, "items": [] }))
+            .expect("bad size");
+        assert_eq!(unsupported["matched"], json!(false));
+
+        // A plugin recipe overrides the vanilla 2x2 planks->table recipe.
+        crate::crafting::clear_dynamic_recipes();
+        let registered = host
+            .call(
+                "crafting.register_shaped",
+                &json!({
+                    "shape": ["GG", "GG"],
+                    "ingredients": { "G": { "type": "exact", "id": planks, "meta": 0 } },
+                    "results": [{ "id": 1, "meta": 0, "count": 2 }],
+                }),
+            )
+            .expect("crafting.register_shaped");
+        assert_eq!(registered["ok"], json!(true));
+
+        let crafted = host
+            .call(
+                "crafting.match",
+                &json!({
+                    "size": 2,
+                    "items": [
+                        { "id": planks, "meta": 0, "count": 1 },
+                        { "id": planks, "meta": 0, "count": 1 },
+                        { "id": planks, "meta": 0, "count": 1 },
+                        { "id": planks, "meta": 0, "count": 1 },
+                    ],
+                }),
+            )
+            .expect("dynamic match");
+        assert_eq!(crafted["matched"], json!(true));
+        assert_eq!(crafted["result"]["count"], json!(2));
+        crate::crafting::clear_dynamic_recipes();
+    }
+
+    #[test]
+    fn inventory_reads_published_snapshots_and_queues_edits() {
+        let (host, players) = test_host();
+        // Nothing published yet: an empty window list, not an error.
+        let empty = host
+            .call("inventory.get", &json!({ "player": "Steve" }))
+            .expect("inventory.get");
+        assert_eq!(empty["ok"], json!(true));
+        assert_eq!(empty["windows"], json!([]));
+
+        // What the tick publishes is what PHP reads.
+        players.publish_inventory(
+            "Steve",
+            json!([{
+                "window": INV_WINDOW_INVENTORY,
+                "slots": [item_json(&bedrock_protocol::ItemStack::new(1, 5))],
+            }]),
+        );
+        let snapshot = host
+            .call("inventory.get", &json!({ "player": "steve" }))
+            .expect("inventory.get");
+        assert_eq!(snapshot["windows"][0]["window"], json!(INV_WINDOW_INVENTORY));
+        assert_eq!(snapshot["windows"][0]["slots"][0]["id"], json!(1));
+        assert_eq!(snapshot["windows"][0]["slots"][0]["count"], json!(5));
+
+        // Window and slot are validated before anything is queued.
+        let out_of_range = host
+            .call(
+                "inventory.set_slot",
+                &json!({ "player": "Steve", "window": 0, "slot": 36, "item": { "id": 1, "count": 1 } }),
+            )
+            .expect("inventory.set_slot");
+        assert_eq!(out_of_range["ok"], json!(false));
+        let bad_window = host
+            .call(
+                "inventory.set_slot",
+                &json!({ "player": "Steve", "window": 7, "slot": 0, "item": null }),
+            )
+            .expect("inventory.set_slot");
+        assert_eq!(bad_window["ok"], json!(false));
+        assert!(players.take_inventory_edits().is_empty());
+
+        let queued = host
+            .call(
+                "inventory.set_slot",
+                &json!({ "player": "Steve", "window": 0, "slot": 3, "item": { "id": 392, "meta": 0, "count": 2 } }),
+            )
+            .expect("inventory.set_slot");
+        assert_eq!(queued["ok"], json!(true));
+        let edits = players.take_inventory_edits();
+        match edits.as_slice() {
+            [InventoryEdit::SetSlot { player, window, slot, item }] => {
+                assert_eq!(player, "steve");
+                assert_eq!((*window, *slot), (0, 3));
+                assert_eq!((item.network_id, item.count), (392, 2));
+            }
+            other => panic!("unexpected edits: {other:?}"),
+        }
+
+        host.call("inventory.clear", &json!({ "player": "Steve" }))
+            .expect("inventory.clear");
+        let edits = players.take_inventory_edits();
+        assert!(matches!(edits.as_slice(), [InventoryEdit::Clear { player }] if player == "steve"));
+    }
+
+    #[test]
+    fn entity_spawn_get_teleport_damage_and_despawn() {
+        let (host, _players) = test_host();
+        let spawned = host
+            .call(
+                "entity.spawn",
+                &json!({
+                    "type": "zombie",
+                    "x": 1.5, "y": 64.0, "z": -2.5,
+                    "yaw": 90.0, "pitch": 0.0,
+                    "name_tag": "Guard",
+                }),
+            )
+            .expect("entity.spawn");
+        assert_eq!(spawned["ok"], json!(true));
+        let entity = &spawned["entity"];
+        assert_eq!(entity["type"], json!("minecraft:zombie"));
+        assert_eq!(entity["name_tag"], json!("Guard"));
+        assert_eq!(entity["health"], json!(20.0));
+        let unique_id = entity["unique_id"].as_i64().expect("unique id");
+        let runtime_id = entity["runtime_id"].as_u64().expect("runtime id");
+
+        // `entity.get` speaks both PocketMine and Bedrock ids.
+        let by_id = host
+            .call("entity.get", &json!({ "unique_id": unique_id }))
+            .expect("entity.get");
+        assert_eq!(by_id["entity"]["unique_id"], json!(unique_id));
+        let by_runtime = host
+            .call("entity.get", &json!({ "runtime_id": runtime_id }))
+            .expect("entity.get runtime");
+        assert_eq!(by_runtime["entity"]["unique_id"], json!(unique_id));
+
+        assert_eq!(
+            host.call("entity.list", &json!({})).expect("entity.list")["count"],
+            json!(1)
+        );
+
+        // The mutators act on the live world entity, not on a copy.
+        let moved = host
+            .call(
+                "entity.teleport",
+                &json!({ "unique_id": unique_id, "x": 10.5, "y": 70.0, "z": 3.5, "yaw": 180.0 }),
+            )
+            .expect("entity.teleport");
+        assert_eq!(moved["ok"], json!(true));
+        assert_eq!(moved["entity"]["x"], json!(10.5));
+        assert_eq!(moved["entity"]["yaw"], json!(180.0));
+
+        let healed = host
+            .call(
+                "entity.set_health",
+                &json!({ "unique_id": unique_id, "health": 7.0 }),
+            )
+            .expect("entity.set_health");
+        assert_eq!(healed["ok"], json!(true));
+        assert_eq!(healed["entity"]["health"], json!(7.0));
+
+        let renamed = host
+            .call(
+                "entity.set_name_tag",
+                &json!({ "unique_id": unique_id, "name_tag": "Boss" }),
+            )
+            .expect("entity.set_name_tag");
+        assert_eq!(renamed["entity"]["name_tag"], json!("Boss"));
+
+        // `Living::attack()`: the first hit lands, the second is swallowed by
+        // the invulnerability window, like in PocketMine.
+        let hit = host
+            .call(
+                "entity.damage",
+                &json!({ "unique_id": unique_id, "damage": 5.0 }),
+            )
+            .expect("entity.damage");
+        assert_eq!(hit["ok"], json!(true));
+        assert_eq!(hit["killed"], json!(false));
+        assert_eq!(host.call("entity.damage", &json!({ "unique_id": unique_id, "damage": 5.0 })).expect("second hit")["ok"], json!(false));
+
+        let despawned = host
+            .call("entity.despawn", &json!({ "unique_id": unique_id }))
+            .expect("entity.despawn");
+        assert_eq!(despawned["ok"], json!(true));
+        assert_eq!(
+            host.call("entity.list", &json!({})).expect("entity.list")["count"],
+            json!(0)
+        );
+        // Despawning twice reports false instead of erroring.
+        assert_eq!(
+            host.call("entity.despawn", &json!({ "unique_id": unique_id }))
+                .expect("entity.despawn twice")["ok"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn entity_motion_knock_back_and_size_round_trip() {
+        let (host, _players) = test_host();
+        let spawned = host
+            .call(
+                "entity.spawn",
+                &json!({ "type": "minecraft:zombie", "x": 0.5, "y": 64.0, "z": 0.5 }),
+            )
+            .expect("entity.spawn");
+        let entity = &spawned["entity"];
+        // `Entity::getInitialSizeInfo()` of `Zombie`. f32 rounds, so compare
+        // with a tolerance instead of exact JSON numbers.
+        let close = |value: &Value, expected: f64| {
+            value
+                .as_f64()
+                .is_some_and(|actual| (actual - expected).abs() < 0.001)
+        };
+        assert!(close(&entity["height"], 1.9));
+        assert!(close(&entity["width"], 0.6));
+        assert!(close(&entity["eye_height"], 1.05));
+        let unique_id = entity["unique_id"].as_i64().expect("unique id");
+
+        let moved = host
+            .call(
+                "entity.set_motion",
+                &json!({ "unique_id": unique_id, "x": 0.1, "y": 0.4, "z": -0.2 }),
+            )
+            .expect("entity.set_motion");
+        assert_eq!(moved["ok"], json!(true));
+        let motion = |value: &Value, expected: f64| {
+            value
+                .as_f64()
+                .is_some_and(|actual| (actual - expected).abs() < 0.001)
+        };
+        assert!(motion(&moved["entity"]["motion_y"], 0.4));
+        assert!(motion(&moved["entity"]["motion_z"], -0.2));
+
+        // `Living::knockBack()` halves the current motion and adds the push.
+        let knocked = host
+            .call(
+                "entity.knock_back",
+                &json!({ "unique_id": unique_id, "dx": 1.0, "dz": 0.0, "force": 0.4 }),
+            )
+            .expect("entity.knock_back");
+        assert_eq!(knocked["ok"], json!(true));
+        assert!(knocked["entity"]["motion_x"].as_f64().is_some_and(|v| v > 0.0));
+        // Dead / unknown ids are reported, not panicked on.
+        assert_eq!(
+            host.call("entity.knock_back", &json!({ "unique_id": 999 }))
+                .expect("knock_back missing")["ok"],
+            json!(false)
+        );
+        assert_eq!(
+            host.call("entity.set_motion", &json!({ "unique_id": 999, "x": 1.0 }))
+                .expect("set_motion missing")["ok"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn entity_spawn_rejects_unknown_and_non_mob_types() {
+        let (host, _players) = test_host();
+        let rejected = host
+            .call(
+                "entity.spawn",
+                &json!({ "type": "minecraft:not_a_mob", "x": 0.0, "y": 64.0, "z": 0.0 }),
+            )
+            .expect("entity.spawn");
+        assert_eq!(rejected["ok"], json!(false));
+        assert!(rejected["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("not_a_mob")));
+        // `minecraft:item` is a real type but not a mob: no silent spawn.
+        assert_eq!(
+            host.call(
+                "entity.spawn",
+                &json!({ "type": "minecraft:item", "x": 0.0, "y": 64.0, "z": 0.0 })
+            )
+            .expect("entity.spawn item")["ok"],
+            json!(false)
+        );
+        assert_eq!(
+            host.call("entity.list", &json!({})).expect("entity.list")["count"],
+            json!(0)
+        );
+    }
+
+    #[test]
     fn inbox_push_and_take_is_ordered_and_case_insensitive() {
         let registry = PlayerRegistry::new();
         registry.push_message("Steve", "first");
@@ -1179,5 +3167,31 @@ mod tests {
         host.call("player.unregister", &json!({ "name": "Steve" }))
             .expect("player.unregister (unknown)");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod block_state_tests {
+    use super::block_state_json;
+
+    /// `block.state` is what the PHP `BlockStateSerializer` falls back to, so it
+    /// must report the palette name and every property.
+    #[test]
+    fn block_state_json_reports_name_and_properties() {
+        let stone = bedrock_world::block_states::network_id("minecraft:stone").expect("stone state");
+        let state = block_state_json(stone).expect("stone json");
+        assert_eq!(state["name"], "minecraft:stone");
+
+        // Stone has no properties in the current palette (variants are their
+        // own blocks), so use the structure block for the property round-trip.
+        let structure = bedrock_world::block_states::network_id("minecraft:structure_block")
+            .expect("structure block state");
+        let data = bedrock_world::block_states::with_property(structure, "structure_block_type", "data")
+            .expect("structure block data state");
+        let state = block_state_json(data).expect("structure json");
+        assert_eq!(state["name"], "minecraft:structure_block");
+        assert_eq!(state["properties"]["structure_block_type"], "data");
+
+        assert!(block_state_json(0xdead_beef).is_none());
     }
 }

@@ -120,6 +120,21 @@ pub fn varint(value: i32) -> Vec<u8> {
     out
 }
 
+/// Byte length of `varint(value)` without encoding it.
+///
+/// Lets `send` pre-compute a frame's length prefix and write straight into the
+/// session buffer: the old path built a `body` `Vec` and a `frame` `Vec` for
+/// every packet, copying chunk payloads three times.
+pub fn varint_len(value: i32) -> usize {
+    match value as u32 {
+        0..=0x7F => 1,
+        0x80..=0x3FFF => 2,
+        0x4000..=0x1F_FFFF => 3,
+        0x20_0000..=0x0FFF_FFFF => 4,
+        _ => 5,
+    }
+}
+
 pub fn var_long(value: i64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut v = value;

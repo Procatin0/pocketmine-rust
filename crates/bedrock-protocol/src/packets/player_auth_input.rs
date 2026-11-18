@@ -1,5 +1,6 @@
 use crate::binary::{CodecError, Reader, Writer};
 use crate::packets::inventory_transaction::{ChangedSlots, NetworkInventoryAction, UseItemData};
+use crate::packets::item_stack_request::ItemStackRequest;
 use crate::types::Vector3f;
 use crate::Packet;
 
@@ -155,8 +156,8 @@ impl ItemInteractionData {
 /// actions wins.
 ///
 /// When the client embeds item payloads (`PERFORM_ITEM_INTERACTION` /
-/// `PERFORM_ITEM_STACK_REQUEST`) they are decoded/skipped byte-exactly per
-/// the reference instead of dropping every block action (a real client sets
+/// `PERFORM_ITEM_STACK_REQUEST`) they are decoded per the reference instead
+/// of dropping every block action (a real client sets
 /// `PERFORM_ITEM_INTERACTION` when interacting with a held item and still
 /// sends `blockActions` after it). Movement handling never depends on this
 /// succeeding.
@@ -165,14 +166,19 @@ pub fn parse_block_actions(input_data: &[u8]) -> Vec<PlayerBlockAction> {
 }
 
 /// Like [`parse_block_actions`] but also returns the embedded
-/// [`ItemInteractionData`] when the tail carries it. The server uses the
-/// transaction exactly like the legacy `InventoryTransactionPacket::TYPE_USE_ITEM`
-/// (`handleUseItemTransaction` runs before `blockActions`).
+/// [`ItemInteractionData`] and [`ItemStackRequest`] when the tail carries
+/// them. The server uses the transaction exactly like the legacy
+/// `InventoryTransactionPacket::TYPE_USE_ITEM` (`handleUseItemTransaction`
+/// runs before the `itemStackRequest`, which runs before `blockActions`).
 pub fn parse_block_actions_result(
     input_data: &[u8],
-) -> (Vec<PlayerBlockAction>, Option<ItemInteractionData>) {
+) -> (
+    Vec<PlayerBlockAction>,
+    Option<ItemInteractionData>,
+    Option<ItemStackRequest>,
+) {
     let Some((flags, _)) = split_auth_input_flags(input_data) else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     };
     let has = |bit: u32| (flags >> bit) & 1 == 1;
     // Movement-only tails never carry any of the three payload flags; skip
@@ -181,14 +187,14 @@ pub fn parse_block_actions_result(
         && !has(INPUT_FLAG_PERFORM_ITEM_INTERACTION)
         && !has(INPUT_FLAG_PERFORM_ITEM_STACK_REQUEST)
     {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     }
     for modern in [true, false] {
         if let Some(parsed) = parse_block_actions_with(input_data, modern) {
             return parsed;
         }
     }
-    (Vec::new(), None)
+    (Vec::new(), None, None)
 }
 
 /// Decodes the `PlayerAuthInputPacket` `inputFlags` field as a 128-bit
@@ -239,7 +245,11 @@ fn split_auth_input_flags(input_data: &[u8]) -> Option<(u128, usize)> {
 fn parse_block_actions_with(
     input_data: &[u8],
     modern: bool,
-) -> Option<(Vec<PlayerBlockAction>, Option<ItemInteractionData>)> {
+) -> Option<(
+    Vec<PlayerBlockAction>,
+    Option<ItemInteractionData>,
+    Option<ItemStackRequest>,
+)> {
     let mut reader = Reader::new(input_data);
     let (_, flags_len) = split_auth_input_flags(input_data)?;
     reader.read_bytes(flags_len).ok()?;
@@ -267,15 +277,21 @@ fn parse_block_actions_with(
             None
         };
 
-        // `itemStackRequest` optional — skipped byte-exactly
+        // `itemStackRequest` optional
         // (`CommonTypes::readOptional($in, ItemStackRequest::read(...))`):
-        // nothing on this server consumes the embedded request (GUI moves
-        // arrive as the standalone 0x93 packet), but skipping it correctly
-        // is what keeps the `blockActions` offset aligned.
+        // modern clients put an inventory action here when the GUI is closed
+        // (`PERFORM_ITEM_STACK_REQUEST`), above all the Q-key drop, so the
+        // request is decoded instead of only skipped. The skip still walks it
+        // first, which keeps the `blockActions` offset byte-exact.
         let request_present = reader.read_bool().ok()?;
-        if request_present {
+        let request = if request_present {
+            let start = reader.position();
             skip_item_stack_request(&mut reader).ok()?;
-        }
+            ItemStackRequest::decode(&mut Reader::new(&input_data[start..reader.position()]))
+                .ok()
+        } else {
+            None
+        };
 
         // `blockActions` optional — `CommonTypes::readOptional($in,
         // fn => readList(PlayerBlockAction::read))`: one `0x01` byte then
@@ -290,14 +306,14 @@ fn parse_block_actions_with(
             Vec::new()
         };
         skip_modern_trailing(&mut reader)?;
-        return Some((actions, item_interaction));
+        return Some((actions, item_interaction, request));
     }
 
     // Legacy (pre-interactionMode) shape: no item-payload optionals and the
     // same tolerance as before the item payloads were ported.
     let present = reader.read_byte().ok()?;
     if present == 0 {
-        return Some((Vec::new(), None));
+        return Some((Vec::new(), None, None));
     }
     if present != 1 {
         return None;
@@ -308,7 +324,7 @@ fn parse_block_actions_with(
     // cameraOrientation (12B) + rawMove (8B).
     let remaining = reader.remaining();
     if remaining == 0 || remaining >= 28 {
-        Some((actions, None))
+        Some((actions, None, None))
     } else {
         None
     }
@@ -986,7 +1002,8 @@ mod block_action_tests {
         write_modern_trailer(&mut writer);
         let tail = writer.into_bytes().to_vec();
 
-        let (actions, interaction) = parse_block_actions_result(&tail);
+        let (actions, interaction, request) = parse_block_actions_result(&tail);
+        assert!(request.is_none());
         assert_eq!(actions.len(), 1, "block actions must survive the payload");
         assert_eq!(actions[0].action_type, BLOCK_ACTION_PREDICT_DESTROY);
         assert_eq!(actions[0].position, Some((0, 65, 0)));
@@ -1013,7 +1030,7 @@ mod block_action_tests {
     }
 
     #[test]
-    fn item_stack_request_optional_is_skipped_byte_exact() {
+    fn item_stack_request_optional_is_decoded_byte_exact() {
         // Flags [36 (PERFORM_ITEM_STACK_REQUEST), 35 (block actions)].
         let mut writer = Writer::new();
         write_modern_head(&mut writer, &[36, 35]);
@@ -1023,11 +1040,73 @@ mod block_action_tests {
         write_modern_trailer(&mut writer);
         let tail = writer.into_bytes().to_vec();
 
-        let (actions, interaction) = parse_block_actions_result(&tail);
+        let (actions, interaction, request) = parse_block_actions_result(&tail);
         assert!(interaction.is_none());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_type, BLOCK_ACTION_START_BREAK);
         assert_eq!(actions[0].position, Some((10, 64, -20)));
+        // The reference request must come out decoded, not only skipped.
+        let request = request.expect("embedded item stack request decoded");
+        assert_eq!(request.request_id, -1);
+        match &request.actions[0] {
+            crate::packets::item_stack_request::ItemStackRequestAction::Take {
+                count,
+                source,
+                destination,
+            } => {
+                assert_eq!(*count, 1);
+                assert_eq!(source.container, 36);
+                assert_eq!(source.slot, 0);
+                assert_eq!(destination.container, 12);
+                assert_eq!(destination.slot, 1);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    /// The Q key with no window open arrives embedded in `PlayerAuthInput`
+    /// (`PERFORM_ITEM_STACK_REQUEST`); its `Drop` action must decode so the
+    /// server can throw the held block as an item entity.
+    #[test]
+    fn a_q_key_drop_request_is_decoded() {
+        let mut writer = Writer::new();
+        write_modern_head(&mut writer, &[36]);
+        writer.write_bool(false); // itemInteractionData absent
+        writer.write_bool(true); // itemStackRequest present
+        writer.write_var_i32(7); // requestId
+        writer.write_var_u32(1); // one action
+        writer.write_var_u32(3); // DROP (outer type id)
+        writer.write_byte(3); // INNER_TYPES[DROP] = 3
+        writer.write_byte(1); // count
+        writer.write_byte(36); // source container (hotbar)
+        writer.write_bool(false); // no dynamic id
+        writer.write_byte(4); // slot 4
+        writer.write_i32_le(9); // stack id
+        writer.write_byte(0); // randomly
+        writer.write_var_u32(0); // no filter strings
+        writer.write_i32_le(0); // filterStringCause
+        writer.write_byte(0); // no block actions
+        write_modern_trailer(&mut writer);
+        let tail = writer.into_bytes().to_vec();
+
+        let (actions, interaction, request) = parse_block_actions_result(&tail);
+        assert!(actions.is_empty());
+        assert!(interaction.is_none());
+        let request = request.expect("the Q drop decodes");
+        assert_eq!(request.request_id, 7);
+        match &request.actions[0] {
+            crate::packets::item_stack_request::ItemStackRequestAction::Drop {
+                count,
+                source,
+                randomly,
+            } => {
+                assert_eq!(*count, 1);
+                assert_eq!(source.container, 36);
+                assert_eq!(source.slot, 4);
+                assert!(!randomly);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[test]
@@ -1040,7 +1119,8 @@ mod block_action_tests {
         write_modern_trailer(&mut writer);
         let tail = writer.into_bytes().to_vec();
 
-        let (actions, interaction) = parse_block_actions_result(&tail);
+        let (actions, interaction, request) = parse_block_actions_result(&tail);
+        assert!(request.is_some());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_type, BLOCK_ACTION_STOP_BREAK);
         assert_eq!(actions[0].position, Some((1, 64, 1)));
@@ -1066,8 +1146,9 @@ mod block_action_tests {
         write_modern_trailer(&mut writer);
         let tail = writer.into_bytes().to_vec();
 
-        let (actions, interaction) = parse_block_actions_result(&tail);
+        let (actions, interaction, request) = parse_block_actions_result(&tail);
         assert!(interaction.is_none());
+        assert!(request.is_none());
         assert!(actions.is_empty());
     }
 }

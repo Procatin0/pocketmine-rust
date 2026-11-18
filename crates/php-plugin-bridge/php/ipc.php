@@ -214,7 +214,10 @@ namespace pocketmine\runtime {
                 'disable_plugin' => self::actionDisablePlugin($request),
                 'dispatch_event' => self::actionDispatchEvent($request),
                 'execute_command' => self::actionExecuteCommand($request),
+                'list_commands' => self::actionListCommands($request),
                 'tick' => self::actionTick($request),
+                // `ModalFormResponsePacket` (0x65): `Form::handleResponse()`.
+                'form_response' => self::actionFormResponse($request),
                 'stop_threads' => self::actionStopThreads($request),
                 'shutdown' => self::actionShutdown($request),
                 default => ['status' => 'error', 'message' => 'Unknown action: ' . $action],
@@ -605,6 +608,67 @@ namespace pocketmine\runtime {
             ];
         }
 
+        /**
+         * Commands currently registered in the PHP `CommandMap` (PM
+         * `SimpleCommandMap`). Plugins register commands from `onEnable()`
+         * (EasyEdit uses `easyedit` + `/set`, `/wand`, ...), so `plugin.yml`
+         * is not enough: the Rust side builds the client's
+         * `AvailableCommandsPacket` from this snapshot.
+         */
+        private static function actionListCommands(array $request): array
+        {
+            return ['status' => 'ok', 'data' => ['commands' => self::listCommands()]];
+        }
+
+        /**
+         * Unique commands in registration order. `CommandMap` stores every
+         * command under `prefix:label` plus its bare label and aliases, so
+         * prefixed keys are skipped and aliases are folded into the command
+         * they resolve to.
+         *
+         * @return list<array{name:string, description:string, usage:string, aliases:list<string>, permission:string}>
+         */
+        public static function listCommands(): array
+        {
+            $server = self::$server;
+            if (!$server instanceof \pocketmine\Server) {
+                $server = self::server();
+            }
+            if (!$server instanceof \pocketmine\Server) {
+                return [];
+            }
+
+            /** @var array<int, int> $seen spl_object_id => index in $commands */
+            $seen = [];
+            $commands = [];
+            foreach ($server->getCommandMap()->getCommands() as $label => $command) {
+                $label = (string)$label;
+                if ($label === '' || str_contains($label, ':')) {
+                    continue;
+                }
+                $cleanLabel = ltrim($label, '/');
+                if ($cleanLabel === '') {
+                    continue;
+                }
+                $id = spl_object_id($command);
+                if (!isset($seen[$id])) {
+                    $seen[$id] = count($commands);
+                    $commands[] = [
+                        'name' => $cleanLabel,
+                        'description' => (string)$command->getDescription(),
+                        'usage' => (string)$command->getUsage(),
+                        'aliases' => [],
+                        'permission' => (string)($command->getPermission() ?? ''),
+                    ];
+                } else {
+                    if ($cleanLabel !== $commands[$seen[$id]]['name'] && !in_array($cleanLabel, $commands[$seen[$id]]['aliases'], true)) {
+                        $commands[$seen[$id]]['aliases'][] = $cleanLabel;
+                    }
+                }
+            }
+            return $commands;
+        }
+
         private static function actionTick(array $request): array
         {
             self::$tick = (int)($request['tick'] ?? self::$tick + 1);
@@ -627,7 +691,55 @@ namespace pocketmine\runtime {
                 $pending = (int)$scheduler->getPendingTaskCount();
             }
 
-            return ['status' => 'ok', 'tick' => self::$tick, 'pending_tasks' => $pending];
+            return [
+                'status' => 'ok',
+                'tick' => self::$tick,
+                'pending_tasks' => $pending,
+                // Union of short event names with listeners: lets the Rust
+                // side gate `dispatch_event` on real listeners even when a
+                // plugin registered them after onEnable.
+                'listener_events' => self::getPluginManager()->getListenerEvents(),
+            ];
+        }
+
+        /**
+         * `Player::sendForm()` response: toma el formulario registrado por
+         * `FormRegistry` y llama a `Form::handleResponse($player, $data)`.
+         * `$data` llega como el JSON del cliente (o `null` si cerró la forma).
+         */
+        private static function actionFormResponse(array $request): array
+        {
+            $name = (string)($request['player'] ?? '');
+            $formId = (int)($request['form_id'] ?? -1);
+            if ($name === '' || $formId < 0) {
+                return ['status' => 'error', 'message' => 'form_response needs player and form_id'];
+            }
+            $form = \pocketmine\runtime\FormRegistry::take($name, $formId);
+            if ($form === null) {
+                // Already answered or the plugin was reloaded: not fatal.
+                return ['status' => 'ok', 'handled' => false];
+            }
+            $raw = $request['data'] ?? null;
+            $data = null;
+            if (is_string($raw)) {
+                $decoded = json_decode($raw, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    return ['status' => 'error', 'message' => 'Invalid form response JSON'];
+                }
+                $data = $decoded;
+            }
+            $server = self::server();
+            $player = $server instanceof \pocketmine\Server ? $server->getPlayerExact($name) : null;
+            if ($player === null) {
+                return ['status' => 'ok', 'handled' => false];
+            }
+            try {
+                $form->handleResponse($player, $data);
+            } catch (\Throwable $e) {
+                self::log('Form response handler failed: ' . $e->getMessage());
+                return ['status' => 'error', 'message' => $e->getMessage()];
+            }
+            return ['status' => 'ok', 'handled' => true];
         }
 
         private static function actionStopThreads(array $request): array

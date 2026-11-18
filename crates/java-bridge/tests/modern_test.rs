@@ -353,7 +353,7 @@ async fn modern_player_info_update_gamemode_and_update_time() {
         session.state = SessionState::Play;
         session.playing = true;
         session.set_gamemode(1);
-        session.send_time(6000, true);
+        session.send_time(7_000, 6000, true);
         let bytes = session.take_out();
         let mut frames = Vec::new();
         let mut rest = bytes.as_slice();
@@ -381,7 +381,7 @@ async fn modern_player_info_update_gamemode_and_update_time() {
             .find(|(id, _)| *id == profile::packet_id(protocol, "update_time").unwrap())
             .unwrap();
         let mut r = Reader::new(&time.1);
-        assert_eq!(r.read_i64(), Some(0), "age");
+        assert_eq!(r.read_i64(), Some(7_000), "world age (game time, not time of day)");
         if protocol >= 775 {
             // clockUpdates[]: count, id, totalTicks (varlong), partial, rate.
             assert_eq!(r.read_varint(), Some(1));

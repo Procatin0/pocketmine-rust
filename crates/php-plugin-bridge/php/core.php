@@ -304,7 +304,7 @@ namespace pocketmine {
         /**
          * PM `Server::getGamemode(): GameMode` como int (0 survival,
          * 1 creative, 2 adventure, 3 spectator). Lee `gamemode` del config;
-         * acepta string ("survival"/...) o int. Sin clase GameMode en bridge.
+         * acepta string ("survival"/...) o int; `Player::getGamemode()` ya devuelve `GameMode`.
          */
         public function getGamemode(): int
         {
@@ -349,10 +349,14 @@ namespace pocketmine {
             return null;
         }
 
-        /** TODO(A1): sin CraftingManager en bridge. Null documentado. */
-        public function getCraftingManager(): ?object
+        /**
+         * `Server::getCraftingManager()`: el motor nativo (`crafting.*`) visto
+         * a través de `pocketmine\crafting\CraftingManager`.
+         */
+        public function getCraftingManager(): \pocketmine\crafting\CraftingManager
         {
-            return null;
+            static $manager = null;
+            return $manager ??= new \pocketmine\crafting\CraftingManager();
         }
 
         /** TODO(A1): sin ResourcePackManager en bridge. Null documentado. */
@@ -1197,9 +1201,14 @@ namespace pocketmine {
             $this->saveAll();
         }
 
-        public function getLanguage(): string
+        /**
+         * PM `Server::getLanguage(): \pocketmine\lang\Language`. Plugins call
+         * `getLang()`/`translate*()` on it, so it must be an object.
+         */
+        public function getLanguage(): \pocketmine\lang\Language
         {
-            return 'eng';
+            static $language = null;
+            return $language ??= new \pocketmine\lang\Language('eng');
         }
 
         public function getResourcePath(): string

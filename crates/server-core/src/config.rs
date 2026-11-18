@@ -79,7 +79,13 @@ impl Default for ServerConfig {
             white_list: false,            // Whitelist disabled
             auto_save: true,
             allow_cheats: false,          // PM default: cheats off
-            level_type: "DEFAULT".to_string(),
+            // Rust-port divergence: PM defaults to `DEFAULT` (the classic
+            // PocketMine generator). This port's BDS-style terrain
+            // (`generator/bds_terrain.rs`, biomes/rivers/relief/sea floor)
+            // is only reachable through `level-type: bds`, so it is the
+            // default here. Set `level-type=DEFAULT` in `server.properties`
+            // to get the vanilla-PM generator back.
+            level_type: "bds".to_string(),
             level_name: "world".to_string(),
             level_seed: String::new(),
             default_world_generator: "DEFAULT".to_string(),
@@ -606,6 +612,26 @@ mod tests {
         assert_eq!(config.compression_level, 6);
         assert_eq!(config.level_name, "world");
         assert_eq!(config.transports, vec!["nethernet", "raknet"]);
+    }
+
+    /// The server's world must be the BDS-style terrain, not the classic
+    /// PocketMine generator: `level-type` defaults to `bds` and
+    /// `create_world_generator` routes it to `BDSTerrain`.
+    #[test]
+    fn default_level_type_selects_the_bds_generator() {
+        use bedrock_world::WorldGenerator as _;
+
+        let config = ServerConfig::default();
+        assert_eq!(config.level_type, "bds");
+        let generator = config.create_world_generator();
+        // An empty `level-seed` hashes to 0, the same seed `world.json` stores.
+        let bds = bedrock_world::generator::BDSTerrain::new(0);
+        assert_eq!(generator.spawn_position(), bds.spawn_position());
+        assert_eq!(generator.highest_block_at(0, 0), bds.highest_block_at(0, 0));
+        assert_eq!(
+            generator.highest_block_at(37, -91),
+            bds.highest_block_at(37, -91)
+        );
     }
 
     #[test]

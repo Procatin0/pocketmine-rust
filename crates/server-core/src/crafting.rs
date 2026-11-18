@@ -672,7 +672,47 @@ impl CraftingManager {
             .find(|recipe| grid.matches_shapeless(recipe, &self.tags).is_some())
     }
 
+    /// `CraftingManager::getShapedRecipes()`.
+    pub fn shaped_recipes(&self) -> &[ShapedRecipe] {
+        &self.shaped
+    }
+
+    /// `CraftingManager::getShapelessRecipes()`.
+    pub fn shapeless_recipes(&self) -> &[ShapelessRecipe] {
+        &self.shapeless
+    }
+
+    /// Furnace recipes, one per `FurnaceRecipeManager` entry.
+    pub fn furnace_recipes(&self) -> &[FurnaceRecipe] {
+        &self.furnace
+    }
+
     /// Crafts from a grid: shaped wins over shapeless, like BDS.
+    /// `CraftingManager::matchRecipe()` including the recipes plugins
+    /// registered at runtime (`register_shaped_recipe` /
+    /// `register_shapeless_recipe`). Plugin recipes are consulted newest
+    /// first, so a later registration wins over both vanilla data and an
+    /// earlier plugin recipe with the same shape, mirroring PocketMine's
+    /// "plugin recipes are appended to the same bucket" behaviour.
+    pub fn craft_from_grid_with_dynamic(&self, grid: &CraftingGrid) -> Option<CraftOutcome> {
+        for kind in dynamic_recipes().iter().rev() {
+            match kind {
+                CraftingRecipeKind::Shaped(recipe) => {
+                    if let Some(outcome) = grid.matches_shaped(recipe, &self.tags) {
+                        return Some(outcome);
+                    }
+                }
+                CraftingRecipeKind::Shapeless(recipe) => {
+                    if let Some(outcome) = grid.matches_shapeless(recipe, &self.tags) {
+                        return Some(outcome);
+                    }
+                }
+                CraftingRecipeKind::Furnace(_) => {}
+            }
+        }
+        self.craft_from_grid(grid)
+    }
+
     pub fn craft_from_grid(&self, grid: &CraftingGrid) -> Option<CraftOutcome> {
         if let Some(recipe) = self.find_shaped(grid) {
             return grid.matches_shaped(recipe, &self.tags);
@@ -842,6 +882,42 @@ pub fn ingredient_from_name(name: &str) -> Option<RecipeIngredient> {
 }
 
 /// Shared manager, built lazily on first use.
+/// Recipes registered by plugins at runtime (`CraftingManager::
+/// registerShapedRecipe` / `registerShapelessRecipe`), in registration order.
+///
+/// PocketMine keeps them in the same buckets as the data-driven recipes; this
+/// port keeps them apart so a plugin reload can clear them without rebuilding
+/// the (expensive) vanilla manager. [`CraftingManager::
+/// craft_from_grid_with_dynamic`] consults them first.
+fn dynamic_store() -> &'static std::sync::RwLock<Vec<CraftingRecipeKind>> {
+    static DYNAMIC: OnceLock<std::sync::RwLock<Vec<CraftingRecipeKind>>> = OnceLock::new();
+    DYNAMIC.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Copy of the runtime-registered recipes (newest last).
+pub fn dynamic_recipes() -> Vec<CraftingRecipeKind> {
+    dynamic_store()
+        .read()
+        .map(|recipes| recipes.clone())
+        .unwrap_or_default()
+}
+
+/// Appends a runtime recipe and returns it.
+pub fn register_dynamic_recipe(kind: CraftingRecipeKind) -> CraftingRecipeKind {
+    if let Ok(mut recipes) = dynamic_store().write() {
+        recipes.push(kind.clone());
+    }
+    kind
+}
+
+/// Drops every runtime recipe (`Server::getCraftingManager()` reset and
+/// tests).
+pub fn clear_dynamic_recipes() {
+    if let Ok(mut recipes) = dynamic_store().write() {
+        recipes.clear();
+    }
+}
+
 pub fn manager() -> &'static CraftingManager {
     static MANAGER: std::sync::OnceLock<CraftingManager> = std::sync::OnceLock::new();
     MANAGER.get_or_init(CraftingManager::build)
@@ -1074,9 +1150,12 @@ pub fn creative_groups() -> Vec<bedrock_protocol::packets::creative_content::Cre
 pub use bedrock_protocol::packets::item_stack_request::{
     ItemStackContainerSlot, ItemStackRequest, ItemStackRequestAction, ItemStackRequestPacket,
     ACTION_CREATIVE_CREATE, ACTION_DESTROY, ACTION_DROP, ACTION_PLACE, ACTION_SWAP, ACTION_TAKE,
-    CREATED_ITEM_SLOT, UI_ARMOR, UI_COMBINED_HOTBAR_AND_INVENTORY, UI_CRAFTING_INPUT,
-    UI_CRAFT_2X2_SLOT, UI_CRAFT_3X3_SLOT, UI_CREATED_OUTPUT, UI_CURSOR, UI_HOTBAR, UI_INVENTORY,
-    UI_OFFHAND,
+    CREATED_ITEM_SLOT, UI_ARMOR, UI_ARMOR_ALT, UI_BARREL, UI_BLAST_FURNACE_INGREDIENT,
+    UI_BREWING_STAND_FUEL, UI_BREWING_STAND_INPUT, UI_BREWING_STAND_RESULT,
+    UI_COMBINED_HOTBAR_AND_INVENTORY, UI_CRAFTING_INPUT, UI_CRAFT_2X2_SLOT, UI_CRAFT_3X3_SLOT,
+    UI_CREATED_OUTPUT, UI_CURSOR, UI_FURNACE_FUEL, UI_FURNACE_INGREDIENT, UI_FURNACE_RESULT,
+    UI_HOTBAR, UI_HOTBAR_ALT, UI_INVENTORY, UI_INVENTORY_ALT, UI_LEVEL_ENTITY, UI_OFFHAND,
+    UI_OFFHAND_ALT, UI_SHULKER_BOX, UI_SMOKER_INGREDIENT,
 };
 pub use bedrock_protocol::packets::item_stack_response::{
     ItemStackResponseContainer, ItemStackResponseEntry, ItemStackResponsePacket,
@@ -1093,13 +1172,21 @@ pub use bedrock_protocol::packets::item_stack_response::{
 /// id, see PocketMine's `ItemStackContainerIdTranslator`) and the crafting
 /// grid uses the `UIInventorySlotOffset` slots 28..=31 (2x2) and 32..=40
 /// (3x3).
-pub fn ui_container_window(container: u8, slot: u8) -> Option<(u32, u32)> {
+pub fn ui_container_window(
+    container: u8,
+    slot: u8,
+    block_container: Option<u32>,
+) -> Option<(u32, u32)> {
     match container {
-        UI_COMBINED_HOTBAR_AND_INVENTORY | UI_HOTBAR | UI_INVENTORY => {
+        UI_COMBINED_HOTBAR_AND_INVENTORY
+        | UI_HOTBAR
+        | UI_INVENTORY
+        | UI_INVENTORY_ALT
+        | UI_HOTBAR_ALT => {
             Some((WINDOW_ID_INVENTORY, slot as u32))
         }
-        UI_ARMOR => Some((WINDOW_ID_ARMOR, slot as u32)),
-        UI_OFFHAND => Some((WINDOW_ID_OFFHAND, 0)),
+        UI_ARMOR | UI_ARMOR_ALT => Some((WINDOW_ID_ARMOR, slot as u32)),
+        UI_OFFHAND | UI_OFFHAND_ALT => Some((WINDOW_ID_OFFHAND, 0)),
         UI_CURSOR => Some((WINDOW_ID_CURSOR, 0)),
         UI_CRAFTING_INPUT if (UI_CRAFT_2X2_SLOT..UI_CRAFT_2X2_SLOT + 4).contains(&slot) => {
             Some((WINDOW_ID_CRAFT_SMALL, (slot - UI_CRAFT_2X2_SLOT) as u32))
@@ -1107,8 +1194,40 @@ pub fn ui_container_window(container: u8, slot: u8) -> Option<(u32, u32)> {
         UI_CRAFTING_INPUT if (UI_CRAFT_3X3_SLOT..UI_CRAFT_3X3_SLOT + 9).contains(&slot) => {
             Some((WINDOW_ID_CRAFT_BIG, (slot - UI_CRAFT_3X3_SLOT) as u32))
         }
+        // Slots of the open block container. The client addresses them either
+        // with the window id it received in `ContainerOpenPacket` or with the
+        // `ContainerUIIds` id that window type carries (`LEVEL_ENTITY` for
+        // chests/dispensers/droppers/hoppers, `BARREL`, `SHULKER_BOX`, and the
+        // furnace/brewing slot ids). PocketMine's
+        // `ItemStackContainerIdTranslator` maps all of them to the current
+        // window with the slot unchanged, because the client sends absolute
+        // slot indices for block containers.
+        _ if block_container.is_some_and(|window| {
+            u32::from(container) == window || is_block_container_ui(container)
+        }) =>
+        {
+            Some((block_container?, slot as u32))
+        }
         _ => None,
     }
+}
+
+/// `ContainerUIIds` values used by the slots of a block container window.
+fn is_block_container_ui(container: u8) -> bool {
+    matches!(
+        container,
+        UI_LEVEL_ENTITY
+            | UI_BREWING_STAND_INPUT
+            | UI_BREWING_STAND_RESULT
+            | UI_BREWING_STAND_FUEL
+            | UI_FURNACE_FUEL
+            | UI_FURNACE_INGREDIENT
+            | UI_FURNACE_RESULT
+            | UI_SHULKER_BOX
+            | UI_BLAST_FURNACE_INGREDIENT
+            | UI_SMOKER_INGREDIENT
+            | UI_BARREL
+    )
 }
 
 /// Reads one slot of a modelled container (crafting grid slots included).
@@ -1116,7 +1235,8 @@ pub fn container_slot(
     inventory: &PlayerInventory,
     slot: &ItemStackContainerSlot,
 ) -> Option<ItemStack> {
-    let (window, index) = ui_container_window(slot.container, slot.slot)?;
+    let (window, index) =
+        ui_container_window(slot.container, slot.slot, inventory.block_container_window())?;
     match window {
         WINDOW_ID_CURSOR => Some(inventory.cursor_item()),
         WINDOW_ID_CRAFT_SMALL => inventory.craft_slot(true, index as usize),
@@ -1130,7 +1250,9 @@ fn set_container_slot(
     slot: &ItemStackContainerSlot,
     item: ItemStack,
 ) -> bool {
-    let Some((window, index)) = ui_container_window(slot.container, slot.slot) else {
+    let Some((window, index)) =
+        ui_container_window(slot.container, slot.slot, inventory.block_container_window())
+    else {
         return false;
     };
     match window {
@@ -1939,6 +2061,22 @@ mod tests {
             catalog.iter().filter(|item| !item.is_empty()).count() > 100,
             "the catalog must hold real stacks"
         );
+    }
+
+    /// Spawn eggs are ordinary entries of the catalog the client receives
+    /// (the BDS capture), so they can be dragged out like any other item and
+    /// `CreativeCreate` resolves their `creative_item_id` back to the egg.
+    #[test]
+    fn spawn_eggs_are_in_the_creative_catalog() {
+        let catalog = creative_catalog();
+        for name in ["zombie", "chicken", "creeper", "cow"] {
+            let egg = item_network_id(&format!("minecraft:{name}_spawn_egg"))
+                .unwrap_or_else(|| panic!("{name}_spawn_egg is in the item registry"));
+            assert!(
+                catalog.iter().any(|item| item.network_id == egg),
+                "{name}_spawn_egg is missing from the creative catalog"
+            );
+        }
     }
 
     /// A crafted result is staged in the created-item output and only appears

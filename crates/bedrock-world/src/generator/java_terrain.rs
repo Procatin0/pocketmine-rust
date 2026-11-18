@@ -516,7 +516,7 @@ fn create_land_spline(o: [f64; 6], depth: bool) -> Spline {
     Spline::Curve { ty: 1, points }
 }
 
-fn terrain_spline() -> Spline {
+pub fn terrain_spline() -> Spline {
     let sp1 = create_land_spline([-0.15, 0.0, 0.0, 0.1, 0.0, -0.03], false);
     let sp2 = create_land_spline([-0.1, 0.03, 0.1, 0.1, 0.01, -0.03], false);
     let sp3 = create_land_spline([-0.1, 0.03, 0.1, 0.7, 0.01, -0.03], true);

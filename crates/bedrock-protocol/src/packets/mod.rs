@@ -46,6 +46,7 @@ pub mod interact;
 pub mod item_stack_request;
 pub mod item_stack_response;
 pub mod mob_equipment;
+pub mod modal_form;
 pub mod remove_objective;
 pub mod set_display_objective;
 pub mod set_score;
@@ -123,6 +124,9 @@ pub use item_stack_response::{
     ItemStackResponseEntry, ItemStackResponsePacket, ItemStackResponseSlot,
 };
 pub use mob_equipment::{MobEquipmentPacket, HAND_MAIN, HAND_OFF};
+pub use modal_form::{
+    ModalFormRequestPacket, ModalFormResponsePacket, FORM_RESPONSE_NONE,
+};
 pub use remove_objective::RemoveObjectivePacket;
 pub use set_display_objective::{SetDisplayObjectivePacket, display_slot, sort_order};
 pub use set_score::{ScorePacketEntry, ScorePacketEntryAction, SetScorePacket};

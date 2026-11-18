@@ -1,0 +1,482 @@
+[
+    {
+        "name": "computeStateIdXorMask",
+        "visibility": "private",
+        "modifiers": "private static",
+        "signature": "computeStateIdXorMask(int $typeId) : int"
+    },
+    {
+        "name": "__construct",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "__construct(BlockIdentifier $idInfo, string $name, BlockTypeInfo $typeInfo)"
+    },
+    {
+        "name": "__clone",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "__clone()"
+    },
+    {
+        "name": "getIdInfo",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getIdInfo() : BlockIdentifier"
+    },
+    {
+        "name": "getName",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getName() : string"
+    },
+    {
+        "name": "getTypeId",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getTypeId() : int"
+    },
+    {
+        "name": "getStateId",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getStateId() : int"
+    },
+    {
+        "name": "hasSameTypeId",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "hasSameTypeId(Block $other) : bool"
+    },
+    {
+        "name": "isSameState",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isSameState(Block $other) : bool"
+    },
+    {
+        "name": "getTypeTags",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getTypeTags() : array"
+    },
+    {
+        "name": "hasTypeTag",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "hasTypeTag(string $tag) : bool"
+    },
+    {
+        "name": "asItem",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "asItem() : Item"
+    },
+    {
+        "name": "decodeBlockItemState",
+        "visibility": "private",
+        "modifiers": "private",
+        "signature": "decodeBlockItemState(int $data) : void"
+    },
+    {
+        "name": "decodeBlockOnlyState",
+        "visibility": "private",
+        "modifiers": "private",
+        "signature": "decodeBlockOnlyState(int $data) : void"
+    },
+    {
+        "name": "encodeBlockItemState",
+        "visibility": "private",
+        "modifiers": "private",
+        "signature": "encodeBlockItemState() : int"
+    },
+    {
+        "name": "encodeBlockOnlyState",
+        "visibility": "private",
+        "modifiers": "private",
+        "signature": "encodeBlockOnlyState() : int"
+    },
+    {
+        "name": "encodeFullState",
+        "visibility": "private",
+        "modifiers": "private",
+        "signature": "encodeFullState() : int"
+    },
+    {
+        "name": "describeBlockItemState",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "describeBlockItemState(RuntimeDataDescriber $w) : void"
+    },
+    {
+        "name": "describeBlockOnlyState",
+        "visibility": "protected",
+        "modifiers": "protected",
+        "signature": "describeBlockOnlyState(RuntimeDataDescriber $w) : void"
+    },
+    {
+        "name": "generateStatePermutations",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "generateStatePermutations() : \\Generator"
+    },
+    {
+        "name": "readStateFromWorld",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "readStateFromWorld() : Block"
+    },
+    {
+        "name": "writeStateToWorld",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "writeStateToWorld() : void"
+    },
+    {
+        "name": "canBePlaced",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "canBePlaced() : bool"
+    },
+    {
+        "name": "canBeReplaced",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "canBeReplaced() : bool"
+    },
+    {
+        "name": "canBePlacedAt",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "canBePlacedAt(Block $blockReplace, Vector3 $clickVector, int $face, bool $isClickedBlock) : bool"
+    },
+    {
+        "name": "place",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "place(BlockTransaction $tx, Item $item, Block $blockReplace, Block $blockClicked, int $face, Vector3 $clickVector, ?Player $player = null) : bool"
+    },
+    {
+        "name": "onPostPlace",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onPostPlace() : void"
+    },
+    {
+        "name": "getBreakInfo",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getBreakInfo() : BlockBreakInfo"
+    },
+    {
+        "name": "getEnchantmentTags",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getEnchantmentTags() : array"
+    },
+    {
+        "name": "onBreak",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onBreak(Item $item, ?Player $player = null, array &$returnedItems = []) : bool"
+    },
+    {
+        "name": "onNearbyBlockChange",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onNearbyBlockChange() : void"
+    },
+    {
+        "name": "ticksRandomly",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "ticksRandomly() : bool"
+    },
+    {
+        "name": "onRandomTick",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onRandomTick() : void"
+    },
+    {
+        "name": "onScheduledUpdate",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onScheduledUpdate() : void"
+    },
+    {
+        "name": "onInteract",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onInteract(Item $item, int $face, Vector3 $clickVector, ?Player $player = null, array &$returnedItems = []) : bool"
+    },
+    {
+        "name": "onAttack",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onAttack(Item $item, int $face, ?Player $player = null) : bool"
+    },
+    {
+        "name": "getFrictionFactor",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getFrictionFactor() : float"
+    },
+    {
+        "name": "getLightLevel",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getLightLevel() : int"
+    },
+    {
+        "name": "getLightFilter",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getLightFilter() : int"
+    },
+    {
+        "name": "blocksDirectSkyLight",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "blocksDirectSkyLight() : bool"
+    },
+    {
+        "name": "isTransparent",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isTransparent() : bool"
+    },
+    {
+        "name": "isSolid",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isSolid() : bool"
+    },
+    {
+        "name": "canBeFlowedInto",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "canBeFlowedInto() : bool"
+    },
+    {
+        "name": "canClimb",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "canClimb() : bool"
+    },
+    {
+        "name": "getPosition",
+        "visibility": "public",
+        "modifiers": "final public",
+        "signature": "getPosition() : Position"
+    },
+    {
+        "name": "position",
+        "visibility": "public",
+        "modifiers": "final public",
+        "signature": "position(World $world, int $x, int $y, int $z) : void"
+    },
+    {
+        "name": "getDrops",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getDrops(Item $item) : array"
+    },
+    {
+        "name": "getDropsForCompatibleTool",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getDropsForCompatibleTool(Item $item) : array"
+    },
+    {
+        "name": "getDropsForIncompatibleTool",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getDropsForIncompatibleTool(Item $item) : array"
+    },
+    {
+        "name": "getSilkTouchDrops",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getSilkTouchDrops(Item $item) : array"
+    },
+    {
+        "name": "getXpDropForTool",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getXpDropForTool(Item $item) : int"
+    },
+    {
+        "name": "getXpDropAmount",
+        "visibility": "protected",
+        "modifiers": "protected",
+        "signature": "getXpDropAmount() : int"
+    },
+    {
+        "name": "isAffectedBySilkTouch",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isAffectedBySilkTouch() : bool"
+    },
+    {
+        "name": "getPickedItem",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getPickedItem(bool $addUserData = false) : Item"
+    },
+    {
+        "name": "getFuelTime",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getFuelTime() : int"
+    },
+    {
+        "name": "getMaxStackSize",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getMaxStackSize() : int"
+    },
+    {
+        "name": "isFireProofAsItem",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isFireProofAsItem() : bool"
+    },
+    {
+        "name": "getFlameEncouragement",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getFlameEncouragement() : int"
+    },
+    {
+        "name": "getFlammability",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getFlammability() : int"
+    },
+    {
+        "name": "burnsForever",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "burnsForever() : bool"
+    },
+    {
+        "name": "isFlammable",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isFlammable() : bool"
+    },
+    {
+        "name": "onIncinerate",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onIncinerate() : void"
+    },
+    {
+        "name": "getSide",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getSide(int $side, int $step = 1)"
+    },
+    {
+        "name": "getHorizontalSides",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getHorizontalSides() : \\Generator"
+    },
+    {
+        "name": "getAllSides",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getAllSides() : \\Generator"
+    },
+    {
+        "name": "getAffectedBlocks",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getAffectedBlocks() : array"
+    },
+    {
+        "name": "__toString",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "__toString()"
+    },
+    {
+        "name": "collidesWithBB",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "collidesWithBB(AxisAlignedBB $bb) : bool"
+    },
+    {
+        "name": "hasEntityCollision",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "hasEntityCollision() : bool"
+    },
+    {
+        "name": "onEntityInside",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onEntityInside(Entity $entity) : bool"
+    },
+    {
+        "name": "addVelocityToEntity",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "addVelocityToEntity(Entity $entity) : ?Vector3"
+    },
+    {
+        "name": "onEntityLand",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onEntityLand(Entity $entity) : ?float"
+    },
+    {
+        "name": "onProjectileHit",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "onProjectileHit(Projectile $projectile, RayTraceResult $hitResult) : void"
+    },
+    {
+        "name": "getCollisionBoxes",
+        "visibility": "public",
+        "modifiers": "final public",
+        "signature": "getCollisionBoxes() : array"
+    },
+    {
+        "name": "getModelPositionOffset",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getModelPositionOffset() : ?Vector3"
+    },
+    {
+        "name": "recalculateCollisionBoxes",
+        "visibility": "protected",
+        "modifiers": "protected",
+        "signature": "recalculateCollisionBoxes() : array"
+    },
+    {
+        "name": "getSupportType",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "getSupportType(int $facing) : SupportType"
+    },
+    {
+        "name": "getAdjacentSupportType",
+        "visibility": "protected",
+        "modifiers": "protected",
+        "signature": "getAdjacentSupportType(int $facing) : SupportType"
+    },
+    {
+        "name": "isFullCube",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "isFullCube() : bool"
+    },
+    {
+        "name": "calculateIntercept",
+        "visibility": "public",
+        "modifiers": "public",
+        "signature": "calculateIntercept(Vector3 $pos1, Vector3 $pos2) : ?RayTraceResult"
+    }
+]
